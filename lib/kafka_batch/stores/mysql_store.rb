@@ -5,9 +5,8 @@ module KafkaBatch
   module Stores
     class MysqlStore < Base
       # ── Lazy model accessors ──────────────────────────────────────────────
-      # Models are built on first access so that ActiveRecord doesn't need to
-      # be fully booted at require-time (avoids issues during app boot and in
-      # non-Rails environments / tests).
+      # Built on first use so ActiveRecord doesn't need to be booted at
+      # require-time (avoids issues in tests and non-Rails environments).
 
       def batch_record_class
         @batch_record_class ||= begin
@@ -39,8 +38,7 @@ module KafkaBatch
           meta:             serialize(meta)
         )
       rescue ActiveRecord::RecordNotUnique
-        # Idempotent – batch already created (e.g. producer retried)
-        nil
+        nil  # idempotent – already created
       end
 
       def find_batch(id)
@@ -50,29 +48,25 @@ module KafkaBatch
       end
 
       def record_job_completion(batch_id:, job_id:, status:)
-        # ── Step 1: idempotent insert (dedup guard) ───────────────────────
+        # ── Step 1: dedup insert ──────────────────────────────────────────
         begin
           job_completion_class.create!(batch_id: batch_id, job_id: job_id, status: status)
         rescue ActiveRecord::RecordNotUnique
           return { status: :duplicate }
         end
 
-        # ── Step 2: atomic counter increment + completion check ───────────
-        # SELECT ... LOCK IN SHARE MODE: allows concurrent reads but blocks
-        # other writes, ensuring only one process fires the terminal callback.
+        # ── Step 2: atomic increment + completion check ───────────────────
+        # FOR UPDATE: exclusive row lock prevents two processes from both
+        # seeing completed+failed >= total and both firing the callback.
         result = nil
 
         batch_record_class.transaction do
-          record = batch_record_class.lock("LOCK IN SHARE MODE").find_by(id: batch_id)
+          record = batch_record_class.lock.find_by(id: batch_id)
 
           return { status: :not_found } unless record
-
-          # Guard against double-finalisation (e.g. from re-delivered events)
           return { status: :duplicate } if %w[success complete cancelled].include?(record.status)
 
           field = status == "success" ? "completed_count" : "failed_count"
-
-          # Single SQL UPDATE avoids a separate write round-trip
           batch_record_class.where(id: batch_id).update_all("#{field} = #{field} + 1")
           record.reload
 
@@ -88,6 +82,17 @@ module KafkaBatch
         result
       end
 
+      # Atomically claim callback dispatch rights.
+      # Uses a conditional UPDATE (WHERE callback_dispatched_at IS NULL) as a
+      # compare-and-swap.  Only the process whose UPDATE affected 1 row wins;
+      # all others receive false and must skip callback invocation.
+      def claim_callback(id)
+        rows = batch_record_class
+                 .where(id: id, callback_dispatched_at: nil)
+                 .update_all(callback_dispatched_at: Time.now)
+        rows > 0
+      end
+
       def update_batch_status(id, status)
         batch_record_class.where(id: id).update_all(status: status)
       end
@@ -99,20 +104,38 @@ module KafkaBatch
           .map { |r| record_to_hash(r) }
       end
 
+      # Batches that finished but whose callback was never dispatched.
+      # Identified by: terminal status + null callback_dispatched_at + finished_at is old.
+      def done_batches_without_callback(older_than:)
+        batch_record_class
+          .where(status: %w[success complete])
+          .where(callback_dispatched_at: nil)
+          .where("finished_at < ?", older_than)
+          .map { |r| record_to_hash(r) }
+      end
+
+      def delete_batch(id)
+        batch_record_class.transaction do
+          job_completion_class.where(batch_id: id).delete_all
+          batch_record_class.where(id: id).delete_all
+        end
+      end
+
       private
 
       def record_to_hash(r)
         {
-          id:               r.id,
-          total_jobs:       r.total_jobs,
-          completed_count:  r.completed_count,
-          failed_count:     r.failed_count,
-          status:           r.status,
-          on_success:       r.on_success,
-          on_complete:      r.on_complete,
-          meta:             deserialize(r.meta),
-          created_at:       r.created_at,
-          finished_at:      r.respond_to?(:finished_at) ? r.finished_at : nil
+          id:                     r.id,
+          total_jobs:             r.total_jobs,
+          completed_count:        r.completed_count,
+          failed_count:           r.failed_count,
+          status:                 r.status,
+          on_success:             r.on_success,
+          on_complete:            r.on_complete,
+          meta:                   deserialize(r.meta),
+          created_at:             r.created_at,
+          finished_at:            r.respond_to?(:finished_at)            ? r.finished_at            : nil,
+          callback_dispatched_at: r.respond_to?(:callback_dispatched_at) ? r.callback_dispatched_at : nil
         }
       end
 

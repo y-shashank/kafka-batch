@@ -5,54 +5,64 @@ module KafkaBatch
     # multiple processes / threads.
     class Base
       # Create a new batch record.
-      #
-      # @param id         [String]  UUID for the batch
-      # @param total_jobs [Integer] number of jobs that will be produced
-      # @param on_success [String, nil] worker class name called when ALL jobs succeed
-      # @param on_complete [String, nil] worker class name called when ALL jobs finish (any status)
-      # @param meta       [Hash]   arbitrary user data
-      # @return [void]
       def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {})
         raise NotImplementedError, "#{self.class}#create_batch"
       end
 
       # Fetch a batch by id.
-      # @return [Hash, nil] with keys :id, :total_jobs, :completed_count,
-      #                      :failed_count, :status, :on_success, :on_complete,
-      #                      :meta, :created_at, :finished_at
+      # @return [Hash, nil]
       def find_batch(id)
         raise NotImplementedError, "#{self.class}#find_batch"
       end
 
       # Atomically record that a single job finished.
-      # Must be idempotent – duplicate calls for the same job_id are no-ops.
+      # Idempotent – duplicate calls for the same job_id are no-ops.
       #
-      # @param batch_id [String]
-      # @param job_id   [String] unique per-job UUID (used for dedup)
-      # @param status   [String] "success" | "failed"
       # @return [Hash]
-      #   { status: :done,      outcome: "success"|"complete", batch: <batch_hash> }  – batch just finished
-      #   { status: :continue                                                       }  – still more jobs outstanding
-      #   { status: :duplicate                                                      }  – already recorded, skip
-      #   { status: :not_found                                                      }  – batch unknown
+      #   { status: :done,      outcome: "success"|"complete", batch: <hash> }
+      #   { status: :continue                                                 }
+      #   { status: :duplicate                                                }
+      #   { status: :not_found                                                }
       def record_job_completion(batch_id:, job_id:, status:)
         raise NotImplementedError, "#{self.class}#record_job_completion"
       end
 
+      # Atomically claim the right to dispatch the batch callback.
+      # Uses a compare-and-swap / conditional update so that only one consumer
+      # process can win the claim, preventing double-invocation of callbacks.
+      #
+      # @param id [String] batch ID
+      # @return [Boolean] true if this caller won the claim, false if already claimed
+      def claim_callback(id)
+        raise NotImplementedError, "#{self.class}#claim_callback"
+      end
+
       # Update the batch's top-level status field.
-      # @param id     [String]
-      # @param status [String] e.g. "cancelled", "reconciled"
-      # @return [void]
       def update_batch_status(id, status)
         raise NotImplementedError, "#{self.class}#update_batch_status"
       end
 
-      # Return batches in "running" state that were created before +older_than+.
-      # Used by the reconciler to detect stuck batches.
-      # @param older_than [Time]
+      # Return batches in "running" state created before +older_than+.
+      # Used by the reconciler to detect stuck (never-completed) batches.
       # @return [Array<Hash>]
       def stale_batches(older_than:)
         raise NotImplementedError, "#{self.class}#stale_batches"
+      end
+
+      # Return batches in terminal state (success/complete) whose callback was
+      # never dispatched (callback_dispatched_at IS NULL) and that finished
+      # before +older_than+.  Used by the reconciler to detect lost callbacks.
+      # @return [Array<Hash>]
+      def done_batches_without_callback(older_than:)
+        raise NotImplementedError, "#{self.class}#done_batches_without_callback"
+      end
+
+      # Hard-delete a batch and all associated job completion records.
+      # Called by Batch#create on a partial Kafka produce failure to prevent
+      # the batch from being permanently stuck in "running".
+      # @param id [String]
+      def delete_batch(id)
+        raise NotImplementedError, "#{self.class}#delete_batch"
       end
     end
   end

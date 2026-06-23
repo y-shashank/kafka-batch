@@ -14,6 +14,13 @@ module KafkaBatch
     attr_accessor :callbacks_topic  # String  default: "kafka_batch.callbacks"
     attr_accessor :dead_letter_topic # String  default: "kafka_batch.dead_letter"
 
+    # ── Retry topic ──────────────────────────────────────────────────────────
+    # Failed jobs are forwarded here with a retry_after timestamp instead of
+    # sleeping inside the job consumer (which would block the Kafka partition).
+    # The RetryConsumer waits via Karafka pause() then re-enqueues to the
+    # original topic.
+    attr_accessor :retry_topic       # String  default: "kafka_batch.jobs.retry"
+
     # ── Consumer ─────────────────────────────────────────────────────────────
     attr_accessor :consumer_group   # String
 
@@ -49,6 +56,7 @@ module KafkaBatch
       @events_topic             = "kafka_batch.events"
       @callbacks_topic          = "kafka_batch.callbacks"
       @dead_letter_topic        = "kafka_batch.dead_letter"
+      @retry_topic              = "kafka_batch.jobs.retry"
       @consumer_group           = "kafka-batch"
       @max_retries              = 3
       @retry_backoff            = 5

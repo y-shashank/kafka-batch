@@ -104,7 +104,9 @@ module KafkaBatch
         return
       end
 
-      # Write batch record with the exact job count BEFORE producing.
+      # Write batch record with the exact job count BEFORE producing any
+      # messages.  This prevents a fast consumer from marking the batch
+      # complete before all messages are enqueued.
       KafkaBatch.store.create_batch(
         id:          @id,
         total_jobs:  @pending.size,
@@ -113,20 +115,41 @@ module KafkaBatch
         meta:        @meta
       )
 
-      @pending.each do |entry|
-        message = self.class.build_message(
-          worker_class: entry[:worker_class],
-          payload:      entry[:payload],
-          job_id:       entry[:job_id],
-          batch_id:     @id,
-          attempt:      0
-        )
+      # Produce all job messages.  If Kafka fails mid-way, roll back the
+      # store record so the batch doesn't hang in "running" forever with
+      # fewer jobs than total_jobs.
+      produced = 0
+      begin
+        @pending.each do |entry|
+          message = self.class.build_message(
+            worker_class: entry[:worker_class],
+            payload:      entry[:payload],
+            job_id:       entry[:job_id],
+            batch_id:     @id,
+            attempt:      0
+          )
 
-        KafkaBatch::Producer.produce_sync(
-          topic:   entry[:worker_class].kafka_topic,
-          payload: message,
-          key:     entry[:job_id]
+          KafkaBatch::Producer.produce_sync(
+            topic:   entry[:worker_class].kafka_topic,
+            payload: message,
+            key:     entry[:job_id]
+          )
+          produced += 1
+        end
+      rescue KafkaBatch::ProducerError => e
+        KafkaBatch.logger.error(
+          "[KafkaBatch] Batch #{@id} produce failed after #{produced}/#{@pending.size} jobs – " \
+          "rolling back store record"
         )
+        begin
+          KafkaBatch.store.delete_batch(@id)
+        rescue => store_err
+          KafkaBatch.logger.error(
+            "[KafkaBatch] Batch #{@id} store rollback also failed: #{store_err.message}. " \
+            "Batch is stuck – run rake kafka_batch:reconcile to clean up."
+          )
+        end
+        raise  # re-raise so the caller knows the batch wasn't created
       end
 
       KafkaBatch.logger.info("[KafkaBatch] Batch #{@id} created with #{@pending.size} jobs")

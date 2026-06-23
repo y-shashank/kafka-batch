@@ -22,6 +22,8 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
 - [Dead Letter Topic](#dead-letter-topic)
 - [Reconciler](#reconciler)
 - [Rake tasks](#rake-tasks)
+- [Reliability guarantees](#reliability-guarantees)
+- [Known limitations](#known-limitations)
 - [Migrating from Sidekiq Pro Batches](#migrating-from-sidekiq-pro-batches)
 - [Architecture deep-dive](#architecture-deep-dive)
 - [Topic reference](#topic-reference)
@@ -32,49 +34,57 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
 ## How it works
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Your application                          │
-│                                                                  │
-│  Batch.create do |b|                                             │
-│    b.push(MyWorker, { id: 1 })   ──┐                            │
-│    b.push(MyWorker, { id: 2 })   ──┤──► Kafka: jobs topic       │
-│    b.push(MyWorker, { id: 3 })   ──┘                            │
-│                         ▲                                        │
-│  BatchRecord created in │                                        │
-│  MySQL / Redis with     │                                        │
-│  total_jobs = 3         │                                        │
-└─────────────────────────┼────────────────────────────────────────┘
-                          │
-        ┌─────────────────▼────────────────────┐
-        │         Karafka: JobConsumer          │
-        │                                       │
-        │  worker.perform(payload)              │
-        │    ├─ success ──► events topic        │
-        │    └─ failure ──► retry / DLT         │
-        └─────────────────┬────────────────────┘
-                          │
-        ┌─────────────────▼────────────────────┐
-        │        Karafka: EventConsumer         │
-        │                                       │
-        │  store.record_job_completion(...)     │
-        │    ├─ still running ──► continue      │
-        │    └─ all done ──────► callbacks topic│
-        └─────────────────┬────────────────────┘
-                          │
-        ┌─────────────────▼────────────────────┐
-        │       Karafka: CallbackConsumer       │
-        │                                       │
-        │  MySuccessCallback.new.on_success(b)  │
-        │  MyCompleteCallback.new.on_complete(b)│
-        └──────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        Your application                           │
+│                                                                   │
+│  Batch.create do |b|                                              │
+│    b.push(MyWorker, { id: 1 })  ──┐                              │
+│    b.push(MyWorker, { id: 2 })  ──┤──► Kafka: worker topic       │
+│    b.push(MyWorker, { id: 3 })  ──┘                              │
+│                                                                   │
+│  BatchRecord written to MySQL/Redis BEFORE first produce          │
+└──────────────────────────────────────────────────────────────────┘
+                │ (jobs topic)
+   ┌────────────▼────────────┐
+   │    Karafka: JobConsumer  │
+   │                         │
+   │  worker.perform(payload) │
+   │    ├─ success ──────────┼──► kafka_batch.events
+   │    │                    │
+   │    └─ failure           │
+   │        ├─ retriable ────┼──► kafka_batch.jobs.retry
+   │        └─ exhausted ────┼──► kafka_batch.dead_letter
+   └─────────────────────────┘         +events (failed)
+                │ (events topic)
+   ┌────────────▼────────────┐
+   │  Karafka: EventConsumer  │
+   │                         │
+   │  store.record_job_       │
+   │  completion(...)         │
+   │    ├─ running ──► skip  │
+   │    └─ done ─────────────┼──► kafka_batch.callbacks
+   └─────────────────────────┘
+                │ (callbacks topic)
+   ┌────────────▼────────────┐
+   │ Karafka: CallbackConsumer│
+   │                         │
+   │  store.claim_callback() ─┼── atomic CAS; only one
+   │    ├─ won ──────────────┼──  process fires callbacks
+   │    │  on_success(batch)  │
+   │    │  on_complete(batch) │
+   │    └─ lost ──► skip     │
+   └─────────────────────────┘
+
+   ┌─────────────────────────┐
+   │  Karafka: RetryConsumer  │  ◄── kafka_batch.jobs.retry
+   │                         │
+   │  retry_after in future? │
+   │    ├─ yes ──► pause()   │  (Karafka partition pause –
+   │    │         then retry  │   zero thread blocking)
+   │    └─ no  ──► produce   │
+   │              to retry_to │──► original worker topic
+   └─────────────────────────┘
 ```
-
-**Reliability guarantees:**
-
-- The batch record is written with the exact job count *before* any Kafka messages are produced — a batch can never be marked complete prematurely.
-- Job completion is idempotent: duplicate `events` messages (Kafka at-least-once) are detected and silently dropped via a unique constraint (MySQL) or `SADD` (Redis).
-- Counter increments are atomic at the database level — `SELECT FOR UPDATE` + `UPDATE field = field + 1` (MySQL) or a single Lua script (Redis) — so only one process ever fires the terminal callback.
-- A periodic [reconciler](#reconciler) catches batches where the completion event was lost.
 
 ---
 
@@ -96,12 +106,22 @@ bundle exec rails generate kafka_batch:install --store redis
 
 This creates:
 - `config/initializers/kafka_batch.rb`
-- database migrations (MySQL store only)
+- Database migrations (MySQL store only)
 
 Run migrations if using the MySQL store:
 
 ```bash
 bundle exec rails db:migrate
+```
+
+Create the required Kafka topics (adjust partitions to your throughput):
+
+```bash
+kafka-topics.sh --create --topic kafka_batch.jobs       --partitions 6
+kafka-topics.sh --create --topic kafka_batch.events     --partitions 3
+kafka-topics.sh --create --topic kafka_batch.callbacks  --partitions 1
+kafka-topics.sh --create --topic kafka_batch.jobs.retry --partitions 3
+kafka-topics.sh --create --topic kafka_batch.dead_letter --partitions 1
 ```
 
 ---
@@ -112,36 +132,37 @@ Edit `config/initializers/kafka_batch.rb`:
 
 ```ruby
 KafkaBatch.configure do |config|
-  # ── Store ────────────────────────────────────────────────────────
+  # ── State store ────────────────────────────────────────────────────
   # :mysql  – persistent, survives Redis restarts, queryable via SQL
   # :redis  – lower latency, no schema migration needed
   config.store = :mysql
 
-  # ── Kafka brokers ────────────────────────────────────────────────
+  # ── Kafka brokers ───────────────────────────────────────────────────
   config.brokers = ENV.fetch("KAFKA_BROKERS", "localhost:9092").split(",")
 
-  # ── Topic names ──────────────────────────────────────────────────
+  # ── Topic names ─────────────────────────────────────────────────────
   config.jobs_topic        = "kafka_batch.jobs"
   config.events_topic      = "kafka_batch.events"
   config.callbacks_topic   = "kafka_batch.callbacks"
+  config.retry_topic       = "kafka_batch.jobs.retry"   # dedicated retry topic
   config.dead_letter_topic = "kafka_batch.dead_letter"
 
-  # ── Consumer group ───────────────────────────────────────────────
+  # ── Consumer group ──────────────────────────────────────────────────
   config.consumer_group = "kafka-batch"
 
-  # ── Retry behaviour (global defaults; override per Worker class) ─
-  config.max_retries   = 3   # max attempts before DLT
-  config.retry_backoff = 5   # seconds; sleep = attempt * retry_backoff
+  # ── Retry behaviour (global defaults; override per Worker class) ────
+  config.max_retries   = 3   # max attempts before dead letter
+  config.retry_backoff = 5   # seconds; sleep = attempt × retry_backoff
 
-  # ── Redis (only when store: :redis) ─────────────────────────────
+  # ── Redis (only when store: :redis) ─────────────────────────────────
   config.redis_url       = ENV.fetch("REDIS_URL", "redis://localhost:6379/0")
   config.redis_pool_size = 5
-  config.batch_ttl       = 7 * 24 * 3600  # seconds; 7 days
+  config.batch_ttl       = 7 * 24 * 3600  # seconds until Redis keys expire
 
-  # ── Reconciliation ───────────────────────────────────────────────
+  # ── Reconciliation ───────────────────────────────────────────────────
   config.reconciliation_interval = 300  # seconds
 
-  # ── Advanced rdkafka/WaterDrop overrides ─────────────────────────
+  # ── Advanced rdkafka / WaterDrop config overrides ───────────────────
   # config.producer_config = { "compression.type" => "snappy" }
   # config.consumer_config = { "fetch.min.bytes"  => "1024"   }
 end
@@ -149,14 +170,13 @@ end
 
 ### MySQL store
 
-Requires two tables added by the bundled migrations:
+Requires three migrations (two tables + one column addition):
 
-| Table | Purpose |
+| Migration | What it creates |
 |---|---|
-| `kafka_batch_records` | One row per batch; holds counters and status |
-| `kafka_batch_job_completions` | One row per completed job; provides the dedup unique constraint |
-
-Run migrations:
+| `create_kafka_batch_records` | Batch state table with counters and status |
+| `create_kafka_batch_job_completions` | Per-job completion dedup table (unique constraint on `batch_id, job_id`) |
+| `add_callback_tracking_to_kafka_batch_records` | `callback_dispatched_at` column for at-most-once callback enforcement |
 
 ```bash
 bundle exec rails db:migrate
@@ -164,41 +184,39 @@ bundle exec rails db:migrate
 
 ### Redis store
 
-No migrations needed. Batch state is stored as a Redis Hash under the key `kafka_batch:b:{batch_id}`. Completed job IDs are tracked in a Set at `kafka_batch:b:{batch_id}:done_jobs`. Both keys expire after `config.batch_ttl` seconds.
+No migrations needed. Batch state is stored as a Redis Hash at `kafka_batch:b:{batch_id}`. Completed job IDs are tracked in a Set at `kafka_batch:b:{batch_id}:done_jobs`. Both keys expire after `config.batch_ttl` seconds and are refreshed on every job completion event.
 
-> **Note:** Because Redis has no native range-scan on hash fields, the reconciler is a no-op with the Redis store. If you need reconciliation, keep a separate sorted set of batch IDs by `created_at` score and implement a custom sweep.
+> **Note:** The Redis store's reconciler methods (`stale_batches`, `done_batches_without_callback`) are no-ops. Maintain a separate sorted set of batch IDs keyed by `created_at` / `finished_at` score if you need reconciliation on Redis.
 
 ### Karafka routing
 
-Add KafkaBatch routes inside your `karafka.rb`. Call `KafkaBatch.draw_routes` **after** all your worker classes have been loaded so the worker registry is populated:
+Wire up KafkaBatch routes inside your `karafka.rb`. Call `KafkaBatch.draw_routes` **after** all worker classes are loaded so the registry is fully populated:
 
 ```ruby
-# karafka.rb
 class KarafkaApp < Karafka::App
   setup do |config|
     config.kafka = { "bootstrap.servers" => ENV["KAFKA_BROKERS"] }
     config.client_id = "my-app"
-    # ...
   end
 
   routes.draw do
-    # Your own routes first
+    # Your own routes
     topic "my_app.events" do
       consumer MyEventsConsumer
     end
 
-    # KafkaBatch internal routes (events, callbacks) +
-    # one route per registered KafkaBatch::Worker
+    # KafkaBatch: registers internal topics + one job route per worker
     KafkaBatch.draw_routes(self)
   end
 end
 ```
 
-`draw_routes` registers three consumer groups:
+`draw_routes` registers four consumer groups:
 
-| Group | Topic | Consumer |
+| Group | Topic(s) | Consumer |
 |---|---|---|
-| `kafka-batch-jobs` | each worker's `kafka_topic` | `JobConsumer` |
+| `kafka-batch-jobs` | Each worker's `kafka_topic` | `JobConsumer` |
+| `kafka-batch-retry` | `kafka_batch.jobs.retry` | `RetryConsumer` |
 | `kafka-batch-events` | `kafka_batch.events` | `EventConsumer` |
 | `kafka-batch-callbacks` | `kafka_batch.callbacks` | `CallbackConsumer` |
 
@@ -212,36 +230,19 @@ Include `KafkaBatch::Worker` and implement `#perform`:
 class ProcessOrderWorker
   include KafkaBatch::Worker
 
-  kafka_topic  "orders.process"   # required – Kafka topic to consume from
-  max_retries  5                  # optional – overrides config.max_retries
-  retry_backoff 10                # optional – overrides config.retry_backoff (seconds)
+  kafka_topic   "orders.process"   # required – Kafka topic to consume from
+  max_retries   5                  # optional – overrides config.max_retries
+  retry_backoff 10                 # optional – overrides config.retry_backoff (seconds)
 
-  # payload is the Hash you passed to Batch#push
+  # payload is the Hash passed to Batch#push or Batch.enqueue
   def perform(payload)
     order = Order.find(payload["order_id"])
     order.process!
-    NotificationService.send_receipt(order)
   end
 end
 ```
 
-```ruby
-class GenerateReportWorker
-  include KafkaBatch::Worker
-
-  kafka_topic "reports.generate"
-  # max_retries and retry_backoff fall back to global config values
-
-  def perform(payload)
-    Report.generate(
-      user_id:    payload["user_id"],
-      date_range: payload["date_range"]
-    )
-  end
-end
-```
-
-Workers are auto-registered when the class is loaded. Make sure your worker files are required/autoloaded before `KafkaBatch.draw_routes` is called (Rails autoloading handles this automatically).
+> **Workers must be idempotent.** If `perform` succeeds but the subsequent event-emission fails, the job message is redelivered and `perform` runs again. Design your workers so running twice produces the same result (upsert, check-before-write, etc.).
 
 ---
 
@@ -251,7 +252,7 @@ Workers are auto-registered when the class is loaded. Make sure your worker file
 batch_id = KafkaBatch::Batch.create(
   on_success:  "BatchSuccessCallback",   # called if ALL jobs succeed
   on_complete: "BatchCompleteCallback",  # called when ALL jobs finish (any status)
-  meta: { report_id: 42, user_id: 99 }  # arbitrary data passed to callbacks
+  meta: { report_id: 42, user_id: 99 }  # arbitrary data forwarded to callbacks
 ) do |b|
   Order.find_each do |order|
     b.push(ProcessOrderWorker, order_id: order.id)
@@ -261,53 +262,46 @@ end
 puts batch_id  # => "550e8400-e29b-41d4-a716-446655440000"
 ```
 
-You can `push` as many jobs as needed inside the block. All jobs are buffered until the block returns; the batch record is written with the exact count before the first Kafka message is produced.
+The batch record is written to the store with the exact job count **before** the first Kafka message is produced. If `produce_sync` fails mid-way through, the store record is rolled back via `delete_batch` so the batch doesn't linger in "running" with an unreachable total.
 
-An optional explicit `job_id` can be supplied for tracing:
+An optional explicit `job_id` can be passed for tracing:
 
 ```ruby
-b.push(ProcessOrderWorker, { order_id: 1 }, job_id: "order-1-process")
+b.push(ProcessOrderWorker, { order_id: 1 }, job_id: "order-1-#{Time.now.to_i}")
 ```
 
 ### Standalone jobs (no batch)
-
-Enqueue a single job without batch context:
 
 ```ruby
 KafkaBatch::Batch.enqueue(ProcessOrderWorker, order_id: 99)
 ```
 
-The job goes through the same `JobConsumer` retry / DLT flow, but no batch completion tracking occurs.
+The job goes through the same retry / DLT flow but no batch completion tracking occurs.
 
 ---
 
 ## Callbacks
 
-Callbacks are plain Ruby classes. Define the method matching the callback type:
+Callbacks are plain Ruby classes with a method matching the callback type:
 
 ```ruby
 class BatchSuccessCallback
-  # Called only when every job in the batch succeeded.
-  # batch is a Hash with all batch fields.
+  # Called only when every job in the batch succeeded (failed_count == 0).
   def on_success(batch)
-    puts "Batch #{batch['batch_id']} finished perfectly!"
-    puts "Processed #{batch['completed_count']} orders"
-
-    AdminMailer.batch_complete(batch).deliver_later
+    AdminMailer.batch_complete(
+      id:        batch["batch_id"],
+      count:     batch["total_jobs"],
+      meta:      batch["meta"]
+    ).deliver_later
   end
 end
 
 class BatchCompleteCallback
-  # Called when all jobs are done regardless of individual failures.
+  # Called when all jobs finish regardless of individual failure count.
   def on_complete(batch)
     if batch["failed_count"].positive?
-      Sentry.capture_message(
-        "Batch #{batch['batch_id']} had #{batch['failed_count']} failures",
-        extra: batch
-      )
+      Sentry.capture_message("Batch #{batch['batch_id']} had failures", extra: batch)
     end
-
-    # Always clean up
     TempStorage.delete(batch.dig("meta", "temp_dir"))
   end
 end
@@ -320,32 +314,45 @@ The `batch` hash passed to callbacks:
   "batch_id"        => "uuid",
   "outcome"         => "success",   # "success" | "complete"
   "total_jobs"      => 1000,
-  "completed_count" => 1000,
-  "failed_count"    => 0,
+  "completed_count" => 998,
+  "failed_count"    => 2,
   "on_success"      => "BatchSuccessCallback",
   "on_complete"     => "BatchCompleteCallback",
   "meta"            => { "report_id" => 42 },
-  "finished_at"     => "2024-01-15T10:30:00Z"
+  "finished_at"     => "2024-01-15T10:30:00Z",
+  "reconciled"      => false        # true if fired by the reconciler
 }
 ```
 
 | Callback | When it fires |
 |---|---|
 | `on_success` | All jobs succeeded (`failed_count == 0`) |
-| `on_complete` | All jobs finished, regardless of failures |
+| `on_complete` | All jobs finished regardless of failures |
 
-Both callbacks can be set on the same batch. If `on_complete` is set, it always fires. `on_success` only fires on a clean run.
+**At-most-once guarantee:** Before invoking any callback, `CallbackConsumer` performs an atomic compare-and-swap on `callback_dispatched_at` in the store. Whichever consumer process wins the claim is the only one that fires the callbacks — even if the callback message is redelivered due to a consumer crash.
+
+**Unresolvable class names:** If the callback class doesn't exist (typo, rename after deploy), the message is forwarded to `dead_letter_topic` with `dlt_type: "callback"` instead of being silently dropped.
 
 ---
 
 ## Retry behaviour
 
-When a job raises an exception, the `JobConsumer` catches it and:
+When a job raises an exception, `JobConsumer` catches it and takes one of two paths based on the current attempt count:
 
-1. If `attempt < max_retries`: sleeps `attempt * retry_backoff` seconds, then re-enqueues the message to the same Kafka topic with `attempt + 1`. The message is committed so the consumer moves on immediately after re-enqueueing.
-2. If `attempt >= max_retries`: emits a `failed` event to the events topic (which decrements the batch "OK" counter and increments "failed") and publishes the original message to the [Dead Letter Topic](#dead-letter-topic).
+**Retriable (attempt < max_retries):**
+The message is produced to `kafka_batch.jobs.retry` with two extra fields:
+- `retry_after` — ISO8601 timestamp of when to re-enqueue (now + `attempt × retry_backoff` seconds)
+- `retry_to` — the original worker topic to re-enqueue to
 
-Backoff is linear: attempt 1 → 5s, attempt 2 → 10s, attempt 3 → 15s (with `retry_backoff: 5`).
+The `JobConsumer` partition is immediately freed for the next message. No thread blocking occurs.
+
+**RetryConsumer** picks up the message. If `retry_after` is still in the future, it calls Karafka's `pause(offset, ms)` to suspend that partition for up to `MAX_PAUSE_SECONDS` (30s) at a time, then checks again. When the message is due it re-enqueues to `retry_to` and commits.
+
+**Exhausted (attempt == max_retries):**
+A `failed` event is emitted to the events topic (so the batch counter is updated) and the message is forwarded to the dead-letter topic.
+
+Backoff is linear: `sleep = attempt × retry_backoff`.
+With `max_retries: 3, retry_backoff: 5` — delays are 5s, 10s, 15s.
 
 Override per worker:
 
@@ -358,14 +365,17 @@ class CriticalWorker
 end
 ```
 
+**Event emission retries:** If `perform` succeeds but the subsequent produce to `kafka_batch.events` fails (transient Kafka issue), the gem retries emission up to `EVENT_EMIT_RETRIES` (3) times with a short backoff. If all retries fail, the offset is left uncommitted so Karafka redelivers the job message and `perform` runs again. This is why workers must be idempotent.
+
 ---
 
 ## Dead Letter Topic
 
-Jobs that exhaust all retries are forwarded to `kafka_batch.dead_letter` (configurable via `config.dead_letter_topic`). The DLT payload is the original job message augmented with:
+Jobs that exhaust all retries, and callback classes that cannot be resolved, are forwarded to `kafka_batch.dead_letter`. The payload is the original message augmented with:
 
 ```json
 {
+  "dlt_type":          "job",
   "dlt_source_topic":  "orders.process",
   "dlt_error_class":   "ActiveRecord::RecordNotFound",
   "dlt_error_message": "Couldn't find Order with id=99",
@@ -373,7 +383,21 @@ Jobs that exhaust all retries are forwarded to `kafka_batch.dead_letter` (config
 }
 ```
 
-Subscribe a separate consumer to `kafka_batch.dead_letter` in your `karafka.rb` to alert, log, or requeue manually:
+For unresolvable callback classes:
+
+```json
+{
+  "dlt_type":            "callback",
+  "dlt_callback_class":  "MySuccessCallback",
+  "dlt_callback_method": "on_success",
+  "dlt_error_class":     "NameError",
+  "dlt_error_message":   "uninitialized constant MySuccessCallback",
+  "dlt_source_topic":    "kafka_batch.callbacks",
+  "dlt_at":              "2024-01-15T10:30:00Z"
+}
+```
+
+Subscribe a consumer in your `karafka.rb` to alert, log, or trigger manual replay:
 
 ```ruby
 topic KafkaBatch.config.dead_letter_topic do
@@ -385,24 +409,36 @@ end
 
 ## Reconciler
 
-The reconciler detects batches stuck in `running` state (e.g. because a completion event was produced but the broker was unavailable before it was consumed). It re-checks the counters and re-fires the callback if the batch is actually complete.
+The reconciler detects and recovers two classes of stuck batches:
 
-Run it periodically:
+### 1. Stuck-running batches
+
+**Cause:** `EventConsumer` lag or message loss — all jobs completed but the counter never reached `total_jobs` because event messages were never produced or consumed.
+
+**Detection:** `status = "running"` and `created_at < now - reconciliation_interval`.
+
+**Recovery:** Compares `completed_count + failed_count` against `total_jobs`. If equal, transitions status and re-produces the callback message.
+
+### 2. Lost-callback batches
+
+**Cause:** `EventConsumer` updated the store to `success`/`complete` but crashed before or during the produce to `kafka_batch.callbacks`. The batch is "done" in the store but the callback was never fired.
+
+**Detection:** `status IN (success, complete)` AND `callback_dispatched_at IS NULL` AND `finished_at < now - reconciliation_interval`.
+
+**Recovery:** Re-produces the callback message to `kafka_batch.callbacks`. The `CallbackConsumer`'s atomic claim (`callback_dispatched_at` CAS) ensures the actual callback fires exactly once even if this runs multiple times.
 
 ```bash
 bundle exec rake kafka_batch:reconcile
 ```
 
-Schedule with cron, Whenever, or Karafka's scheduled messages:
+Schedule with cron or Whenever:
 
 ```ruby
-# config/schedule.rb (Whenever)
+# config/schedule.rb
 every 5.minutes do
   rake "kafka_batch:reconcile"
 end
 ```
-
-Or inside a Karafka scheduled consumer if you prefer to keep everything in Kafka.
 
 ---
 
@@ -410,15 +446,46 @@ Or inside a Karafka scheduled consumer if you prefer to keep everything in Kafka
 
 | Task | Description |
 |---|---|
-| `kafka_batch:reconcile` | Run the stuck-batch reconciler |
-| `kafka_batch:install_migrations` | Copy migrations to `db/migrate/` |
-| `kafka_batch:workers` | Print all registered workers and their topics |
+| `kafka_batch:reconcile` | Run both reconciler sweeps (stuck-running + lost-callback) |
+| `kafka_batch:install_migrations` | Copy all migrations to `db/migrate/` |
+| `kafka_batch:workers` | Print all registered workers, topics, and retry config |
 
 ```bash
 bundle exec rake kafka_batch:workers
-#  ProcessOrderWorker   → topic: orders.process   retries: 5
-#  GenerateReportWorker → topic: reports.generate retries: 3
+#  ProcessOrderWorker   → topic: orders.process   retries: 5  backoff: 10s
+#  GenerateReportWorker → topic: reports.generate retries: 3  backoff: 5s
 ```
+
+---
+
+## Reliability guarantees
+
+| Guarantee | How it's achieved |
+|---|---|
+| **Batch never prematurely completes** | Store record (with exact `total_jobs`) is written before the first message is produced |
+| **Partial produce is cleaned up** | If `produce_sync` fails mid-batch, `delete_batch` rolls back the store record |
+| **Job completion is idempotent** | Unique constraint on `(batch_id, job_id)` (MySQL) or `SADD` (Redis) deduplicates event messages |
+| **Counter increment is atomic** | MySQL `SELECT FOR UPDATE` + `UPDATE field = field + 1`; Redis Lua script |
+| **Callback fires at most once** | `claim_callback` does `UPDATE WHERE callback_dispatched_at IS NULL` — only the winner invokes |
+| **Lost callbacks are recovered** | Reconciler scans for `status IN (success,complete) AND callback_dispatched_at IS NULL` |
+| **Retries don't block partitions** | Failed jobs go to `kafka_batch.jobs.retry`; `RetryConsumer` uses Karafka `pause()` |
+| **Event emission failure ≠ job failure** | Separate rescue blocks; emission retried independently before leaving offset uncommitted |
+| **Unresolvable callbacks are not silently dropped** | Forwarded to `dead_letter_topic` with `dlt_type: "callback"` |
+| **Consumer crash after callback but before commit** | `claim_callback` CAS prevents double-invocation on redelivery |
+
+---
+
+## Known limitations
+
+**Workers must be idempotent.** If event emission fails after a successful `perform`, Karafka redelivers the job and `perform` runs again. Design workers to tolerate duplicate execution (upsert, guard clauses, etc.).
+
+**Redis reconciliation is a no-op.** The Redis store cannot range-scan hash field values. For Redis-backed reconciliation, maintain a sorted set of batch IDs by `created_at`/`finished_at` in your application and pass them to a custom sweep.
+
+**Redis TTL.** Batch keys expire after `batch_ttl` seconds. The TTL is refreshed on every job completion event, but a batch with no activity for longer than `batch_ttl` will lose its state. Set `batch_ttl` well above your longest expected batch duration.
+
+**Worker class renames after deploy.** In-flight messages carry the original class name. After removing or renaming a worker, those jobs will retry until exhausted and land in the DLT. Perform a rolling deploy or drain the topic before removing the class.
+
+**No built-in metrics.** There is no Prometheus/StatsD instrumentation. Query the store directly or subscribe to `ActiveSupport::Notifications` if you add your own instrumentation hooks.
 
 ---
 
@@ -428,21 +495,17 @@ bundle exec rake kafka_batch:workers
 |---|---|
 | `Sidekiq::Batch.new` | `KafkaBatch::Batch.create` |
 | `batch.jobs { MyWorker.perform_async(...) }` | `b.push(MyWorker, ...)` inside block |
-| `batch.on(:success, MyCallback, ...)` | `on_success: "MyCallback"` parameter |
-| `batch.on(:complete, MyCallback, ...)` | `on_complete: "MyCallback"` parameter |
-| Callback class `#on_success(status)` | `#on_success(batch_hash)` |
-| Callback class `#on_complete(status)` | `#on_complete(batch_hash)` |
+| `batch.on(:success, MyCallback)` | `on_success: "MyCallback"` parameter |
+| `batch.on(:complete, MyCallback)` | `on_complete: "MyCallback"` parameter |
+| Callback `#on_success(status)` | `#on_success(batch_hash)` |
+| Callback `#on_complete(status)` | `#on_complete(batch_hash)` |
 | `status.bid` | `batch["batch_id"]` |
 | `status.total` | `batch["total_jobs"]` |
 | `status.failures` | `batch["failed_count"]` |
 
-**What you don't need to change:**
+**What you don't need to change:** Callback class names and method signatures are structurally the same.
 
-- Callback class names and method names are the same (`on_success`, `on_complete`)
-- Retry semantics are equivalent
-- Batch metadata (`meta:` replaces Sidekiq batch description)
-
-**Key difference:** Workers must `include KafkaBatch::Worker` and define a `kafka_topic`. They are consumed by Karafka rather than Sidekiq threads.
+**Key difference:** Workers must `include KafkaBatch::Worker`, define a `kafka_topic`, and be **idempotent**. They are consumed by Karafka rather than Sidekiq threads.
 
 ---
 
@@ -450,34 +513,44 @@ bundle exec rake kafka_batch:workers
 
 ### Why write the batch record before producing?
 
-If we produced N messages and then wrote the batch record with `total_jobs: N`, a fast consumer could complete all N jobs and try to check completion before the record even exists — resulting in `not_found` and a lost callback. By writing the record first with the exact count, we guarantee the store is ready before any job can complete.
+If the store record were written after producing, a fast consumer could complete all N jobs and find no batch record — resulting in `not_found` and a permanently lost callback. Writing first with the exact count guarantees the store is ready before any completion event can arrive.
 
-### Why use `SELECT FOR UPDATE` / Lua for the counter?
+### Why roll back on partial produce failure?
 
-Without a lock, two EventConsumer threads could both read `completed = 99, total = 100`, both increment locally to 100, both conclude "we're done", and both publish the callback — firing it twice. The database-level lock ensures only one thread performs the final increment and observes the terminal state.
+If only M of N messages reach Kafka, the store has `total_jobs: N` but only M jobs will ever complete. Without rollback, the batch hangs in "running" indefinitely. With `delete_batch`, the caller receives a `ProducerError` and can retry the entire `Batch.create` call.
 
-### Why is dedup separate from the counter?
+### Why `FOR UPDATE` and not `LOCK IN SHARE MODE`?
 
-The dedup table (MySQL) / Set (Redis) handles Kafka's at-least-once delivery. Without it, a re-delivered event message would increment the counter a second time and potentially push it past `total_jobs`, making the batch appear done when jobs are still running.
+Share locks (`LOCK IN SHARE MODE`) allow concurrent readers. Two `EventConsumer` threads processing the last two jobs can both enter the transaction simultaneously, both increment, both reload and see `completed >= total`, and both publish the callback — double-firing `on_success`. `FOR UPDATE` (`.lock`) serialises access: the second thread blocks until the first commits, sees the already-finalised status, and returns `:duplicate`.
+
+### Why separate `perform` and event-emission rescue blocks?
+
+With a single `rescue`, a transient Kafka error on `emit_event` looks identical to a job failure and triggers a job retry. The work was already done — retrying the job runs it again (possibly corrupting state) and eventually sends a false "failed" event to the DLT. Separate rescue blocks mean event-emission failures are retried independently, and only a worker-raised exception triggers the job retry path.
+
+### Why a dedicated retry topic instead of `sleep`?
+
+A `sleep` inside `JobConsumer` blocks the entire Kafka partition for the duration. With `max_retries: 3, retry_backoff: 5`, a single exhausted job stalls its partition for 30 seconds. Under load, multiple failing jobs on the same partition compound this. The retry topic approach forwards the message immediately and suspends only the *retry partition* (via Karafka `pause()`) — the job partition is fully unblocked.
+
+### Why `claim_callback` as a CAS instead of checking first?
+
+A read-before-write ("check if claimed, then claim") has a race: two `CallbackConsumer` processes read `callback_dispatched_at = nil` simultaneously, both conclude they should proceed, both claim, and both fire. A conditional `UPDATE WHERE callback_dispatched_at IS NULL` is atomic at the database level — exactly one process gets `rows_affected = 1`.
 
 ### Message flow (numbered)
 
 ```
-1.  App            →  MySQL/Redis     CREATE batch record (total_jobs = N)
-2.  App            →  Kafka jobs      PRODUCE N job messages
-3.  JobConsumer    →  worker          CALL perform(payload)
-4.  JobConsumer    →  Kafka events    PRODUCE {batch_id, job_id, status}
-5.  EventConsumer  →  MySQL/Redis     ATOMIC increment + check
-6.  EventConsumer  →  Kafka callbacks PRODUCE callback message (if done)
-7.  CallbackConsumer → callback class CALL on_success / on_complete
-```
-
-### Consumer group topology
-
-```
-kafka-batch-jobs      ← all worker topics multiplexed into one group
-kafka-batch-events    ← single topic, single group
-kafka-batch-callbacks ← single topic, single group
+1.  App             → MySQL/Redis       CREATE batch record (total_jobs = N)
+2.  App             → Kafka jobs topic  PRODUCE N job messages
+3.  JobConsumer     → worker            CALL perform(payload)
+4a. (success)       → Kafka events      PRODUCE {batch_id, job_id, status: success}
+4b. (failure)       → Kafka retry       PRODUCE {retry_after, retry_to, attempt+1}
+4c. (exhausted)     → Kafka events      PRODUCE {batch_id, job_id, status: failed}
+                    → Kafka DLT         PRODUCE original message + error context
+5.  RetryConsumer   pauses partition    WAIT until retry_after via Karafka pause()
+                    → Kafka jobs topic  PRODUCE message back to original topic
+6.  EventConsumer   → MySQL/Redis       ATOMIC increment + check (FOR UPDATE / Lua)
+7.  EventConsumer   → Kafka callbacks  PRODUCE callback message (if batch done)
+8.  CallbackConsumer → MySQL/Redis      CLAIM via callback_dispatched_at CAS
+                    → callback class    CALL on_success / on_complete
 ```
 
 ---
@@ -486,12 +559,11 @@ kafka-batch-callbacks ← single topic, single group
 
 | Topic (default name) | Produced by | Consumed by | Purpose |
 |---|---|---|---|
-| `kafka_batch.jobs` | `Batch.create` / `Batch.enqueue` | `JobConsumer` | Individual job messages |
+| `kafka_batch.jobs` (per worker) | `Batch.create` / `Batch.enqueue` | `JobConsumer` | Individual job messages |
+| `kafka_batch.jobs.retry` | `JobConsumer` | `RetryConsumer` | Failed jobs awaiting backoff |
 | `kafka_batch.events` | `JobConsumer` | `EventConsumer` | Job completion signals |
-| `kafka_batch.callbacks` | `EventConsumer` | `CallbackConsumer` | Batch-complete triggers |
-| `kafka_batch.dead_letter` | `JobConsumer` | Your consumer | Exhausted-retry jobs |
-
-Worker topics are defined per-worker via `kafka_topic` and are also consumed by `JobConsumer`.
+| `kafka_batch.callbacks` | `EventConsumer` / `Reconciler` | `CallbackConsumer` | Batch-complete triggers |
+| `kafka_batch.dead_letter` | `JobConsumer` / `CallbackConsumer` / `RetryConsumer` | Your consumer | Exhausted jobs + unresolvable callbacks |
 
 ---
 
@@ -502,7 +574,7 @@ Worker topics are defined per-worker via `kafka_topic` and are also consumed by 
 3. `bundle exec rspec`
 4. Submit a PR
 
-Please add tests for any new behaviour and keep the store interface (see `lib/kafka_batch/stores/base.rb`) in sync if you add a new store backend.
+Please add tests for new behaviour and keep the store interface (`lib/kafka_batch/stores/base.rb`) in sync if you add a new store backend.
 
 ---
 

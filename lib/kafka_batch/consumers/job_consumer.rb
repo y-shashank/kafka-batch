@@ -6,26 +6,26 @@ module KafkaBatch
   module Consumers
     # Karafka consumer that processes individual batch jobs.
     #
-    # One instance of this consumer is routed to every worker topic registered
-    # via KafkaBatch::Worker.  The routing is wired up by KafkaBatch.draw_routes.
+    # Retry strategy – dedicated retry topic (non-blocking):
+    #   On failure, the message is forwarded to KafkaBatch.config.retry_topic
+    #   with a `retry_after` timestamp and `retry_to` (original topic) embedded.
+    #   A separate RetryConsumer handles the wait and re-enqueue, so this
+    #   consumer's partition is never blocked during backoff.
     #
-    # Message payload schema (JSON):
-    #   {
-    #     "job_id"        => "uuid",
-    #     "batch_id"      => "uuid | null",
-    #     "worker_class"  => "FullyQualifiedWorkerClassName",
-    #     "payload"       => { ... },
-    #     "attempt"       => 0,
-    #     "max_retries"   => 3,
-    #     "retry_backoff" => 5,
-    #     "enqueued_at"   => "2024-01-01T00:00:00Z"
-    #   }
+    # Rescue scope separation:
+    #   worker#perform errors and event-emission errors are caught in separate
+    #   rescue blocks.  A Kafka produce failure after a successful job does NOT
+    #   trigger a job retry – instead the offset is left uncommitted so Karafka
+    #   redelivers the message, allowing the worker to run again (workers must
+    #   be idempotent) and try event emission once more.
     class JobConsumer < Karafka::BaseConsumer
-      # Karafka calls this method once per polled batch.
+      # Number of times to retry event emission before giving up and leaving
+      # the offset uncommitted (causing message redelivery).
+      EVENT_EMIT_RETRIES = 3
+      EVENT_EMIT_BACKOFF = 2  # seconds
+
       def consume
-        messages.each do |message|
-          process_message(message)
-        end
+        messages.each { |msg| process_message(msg) }
       end
 
       private
@@ -33,107 +33,177 @@ module KafkaBatch
       def process_message(message)
         data = decode(message.raw_payload)
 
-        job_id       = data["job_id"]
-        batch_id     = data["batch_id"]
-        worker_class = resolve_worker(data["worker_class"])
-        payload      = data["payload"] || {}
-        attempt      = data["attempt"].to_i
-        max_retries  = data.fetch("max_retries",  KafkaBatch.config.max_retries).to_i
-        backoff      = data.fetch("retry_backoff", KafkaBatch.config.retry_backoff).to_i
+        job_id        = data["job_id"]
+        batch_id      = data["batch_id"]
+        worker_class  = resolve_worker(data["worker_class"])
+        payload       = data["payload"] || {}
+        attempt       = data["attempt"].to_i
+        max_retries   = data.fetch("max_retries",   KafkaBatch.config.max_retries).to_i
+        backoff       = data.fetch("retry_backoff",  KafkaBatch.config.retry_backoff).to_i
 
         KafkaBatch.logger.debug(
-          "[KafkaBatch][JobConsumer] #{worker_class}#perform job_id=#{job_id} " \
-          "batch_id=#{batch_id} attempt=#{attempt}"
+          "[KafkaBatch][JobConsumer] #{worker_class}#perform " \
+          "job_id=#{job_id} batch_id=#{batch_id} attempt=#{attempt}"
         )
 
-        worker_class.new.perform(payload)
+        # ── Step 1: execute the job ──────────────────────────────────────
+        # Only job-raised errors are caught here.  A successful perform
+        # that subsequently fails at event emission is handled separately.
+        begin
+          worker_class.new.perform(payload)
+        rescue StandardError => e
+          handle_failure(
+            message:      message,
+            data:         data,
+            error:        e,
+            job_id:       job_id,
+            batch_id:     batch_id,
+            worker_class: worker_class,
+            attempt:      attempt,
+            max_retries:  max_retries,
+            backoff:      backoff
+          )
+          return  # offset committed inside handle_failure
+        end
 
-        # ── Success ────────────────────────────────────────────────────────
-        emit_event(batch_id: batch_id, job_id: job_id, status: "success", worker_class: worker_class)
-        mark_as_consumed!(message)
-
-      rescue StandardError => e
-        handle_failure(
-          message:      message,
-          data:         data,
-          error:        e,
-          job_id:       job_id,
+        # ── Step 2: emit completion event ────────────────────────────────
+        # Separate rescue: a Kafka error here must NOT be treated as a job
+        # failure.  We retry emission a few times; if it keeps failing we
+        # raise so the offset is NOT committed → Karafka redelivers the
+        # message → worker runs again (idempotency required) → tries again.
+        emit_event_with_retry(
           batch_id:     batch_id,
-          worker_class: worker_class,
-          attempt:      attempt,
-          max_retries:  max_retries,
-          backoff:      backoff
+          job_id:       job_id,
+          status:       "success",
+          worker_class: worker_class
         )
+
+        mark_as_consumed!(message)
       end
+
+      # ── Failure handling ─────────────────────────────────────────────────
 
       def handle_failure(message:, data:, error:, job_id:, batch_id:,
                          worker_class:, attempt:, max_retries:, backoff:)
         KafkaBatch.logger.error(
           "[KafkaBatch][JobConsumer] job_id=#{job_id} attempt=#{attempt} " \
-          "error=#{error.class}: #{error.message}"
+          "#{error.class}: #{error.message}"
         )
 
         if attempt < max_retries
-          next_attempt = attempt + 1
-          sleep_for    = backoff * next_attempt  # linear backoff
-
-          KafkaBatch.logger.info(
-            "[KafkaBatch][JobConsumer] Retrying job_id=#{job_id} " \
-            "attempt=#{next_attempt} after #{sleep_for}s"
-          )
-
-          sleep(sleep_for)
-
-          KafkaBatch::Batch.reenqueue(
-            topic:        message.topic,
-            message:      data,
-            next_attempt: next_attempt
+          schedule_retry(
+            message:      message,
+            data:         data,
+            job_id:       job_id,
+            next_attempt: attempt + 1,
+            backoff:      backoff
           )
         else
-          # Exhausted – record failure and optionally send to DLT
-          KafkaBatch.logger.error(
-            "[KafkaBatch][JobConsumer] job_id=#{job_id} exhausted #{max_retries} retries – failing"
+          exhaust_job(
+            message:      message,
+            data:         data,
+            job_id:       job_id,
+            batch_id:     batch_id,
+            worker_class: worker_class,
+            error:        error
           )
-
-          emit_event(batch_id: batch_id, job_id: job_id, status: "failed", worker_class: worker_class)
-
-          publish_to_dlt(data: data, error: error, topic: message.topic)
         end
+      end
 
-        # Acknowledge regardless of outcome – we've handled the message
-        # (either re-enqueued it or moved it to the DLT).
+      # Forward the message to the retry topic with a `retry_after` timestamp.
+      # The RetryConsumer uses Karafka pause to wait until retry_after, then
+      # re-enqueues back to the original topic – zero blocking here.
+      def schedule_retry(message:, data:, job_id:, next_attempt:, backoff:)
+        retry_after = Time.now + (backoff * next_attempt)
+
+        KafkaBatch.logger.info(
+          "[KafkaBatch][JobConsumer] Scheduling retry for job_id=#{job_id} " \
+          "attempt=#{next_attempt} at #{retry_after.iso8601}"
+        )
+
+        KafkaBatch::Producer.produce_sync(
+          topic:   KafkaBatch.config.retry_topic,
+          payload: data.merge(
+            "attempt"      => next_attempt,
+            "retry_after"  => retry_after.iso8601,
+            "retry_to"     => message.topic
+          ),
+          key: job_id
+        )
+
         mark_as_consumed!(message)
       end
 
-      def emit_event(batch_id:, job_id:, status:, worker_class:)
-        return unless batch_id  # standalone job – no batch to update
-
-        KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.events_topic,
-          payload: {
-            "batch_id"     => batch_id,
-            "job_id"       => job_id,
-            "status"       => status,
-            "worker_class" => worker_class.to_s,
-            "occurred_at"  => Time.now.iso8601
-          },
-          key: batch_id
+      # Job has exhausted all retries.  Emit a failure event (so the batch
+      # counter is updated) and forward the raw message to the DLT.
+      def exhaust_job(message:, data:, job_id:, batch_id:, worker_class:, error:)
+        KafkaBatch.logger.error(
+          "[KafkaBatch][JobConsumer] job_id=#{job_id} exhausted retries – failing"
         )
+
+        emit_event_with_retry(
+          batch_id:     batch_id,
+          job_id:       job_id,
+          status:       "failed",
+          worker_class: worker_class
+        )
+
+        publish_to_dlt(data: data, error: error, topic: message.topic)
+        mark_as_consumed!(message)
       end
+
+      # ── Event emission ───────────────────────────────────────────────────
+
+      def emit_event_with_retry(batch_id:, job_id:, status:, worker_class:)
+        return unless batch_id  # standalone job – no batch tracking
+
+        attempts = 0
+        begin
+          KafkaBatch::Producer.produce_sync(
+            topic:   KafkaBatch.config.events_topic,
+            payload: {
+              "batch_id"     => batch_id,
+              "job_id"       => job_id,
+              "status"       => status,
+              "worker_class" => worker_class.to_s,
+              "occurred_at"  => Time.now.iso8601
+            },
+            key: batch_id
+          )
+        rescue KafkaBatch::ProducerError => e
+          attempts += 1
+          if attempts <= EVENT_EMIT_RETRIES
+            KafkaBatch.logger.warn(
+              "[KafkaBatch][JobConsumer] Event emit failed (attempt #{attempts}) – retrying: #{e.message}"
+            )
+            sleep(attempts * EVENT_EMIT_BACKOFF)
+            retry
+          end
+          # All retries exhausted: re-raise so offset is NOT committed.
+          # Karafka will redeliver the original job message.
+          KafkaBatch.logger.error(
+            "[KafkaBatch][JobConsumer] Event emit failed after #{EVENT_EMIT_RETRIES} attempts – " \
+            "leaving offset uncommitted for redelivery (worker must be idempotent)"
+          )
+          raise
+        end
+      end
+
+      # ── Helpers ──────────────────────────────────────────────────────────
 
       def publish_to_dlt(data:, error:, topic:)
         KafkaBatch::Producer.produce_sync(
           topic:   KafkaBatch.config.dead_letter_topic,
           payload: data.merge(
-            "dlt_source_topic" => topic,
-            "dlt_error_class"  => error.class.name,
-            "dlt_error_message"=> error.message,
-            "dlt_at"           => Time.now.iso8601
+            "dlt_type"          => "job",
+            "dlt_source_topic"  => topic,
+            "dlt_error_class"   => error.class.name,
+            "dlt_error_message" => error.message,
+            "dlt_at"            => Time.now.iso8601
           ),
           key: data["job_id"]
         )
       rescue KafkaBatch::ProducerError => e
-        # DLT failure must not mask the original error
         KafkaBatch.logger.error("[KafkaBatch][JobConsumer] DLT publish failed: #{e.message}")
       end
 

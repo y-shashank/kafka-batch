@@ -12,6 +12,7 @@ require_relative "kafka_batch/worker"
 require_relative "kafka_batch/batch"
 require_relative "kafka_batch/reconciler"
 require_relative "kafka_batch/consumers/job_consumer"
+require_relative "kafka_batch/consumers/retry_consumer"
 require_relative "kafka_batch/consumers/event_consumer"
 require_relative "kafka_batch/consumers/callback_consumer"
 
@@ -78,14 +79,20 @@ module KafkaBatch
         # ── Internal topics ────────────────────────────────────────────────
         topic cfg.events_topic do
           consumer KafkaBatch::Consumers::EventConsumer
-          # Single partition ensures ordered processing per batch key,
-          # but the store's atomic operations are safe with multiple partitions too.
           group_id "#{cfg.consumer_group}-events"
         end
 
         topic cfg.callbacks_topic do
           consumer KafkaBatch::Consumers::CallbackConsumer
           group_id "#{cfg.consumer_group}-callbacks"
+        end
+
+        # Dedicated retry topic: RetryConsumer waits via Karafka pause()
+        # then re-enqueues to the original job topic, keeping JobConsumer
+        # partitions fully unblocked during backoff.
+        topic cfg.retry_topic do
+          consumer KafkaBatch::Consumers::RetryConsumer
+          group_id "#{cfg.consumer_group}-retry"
         end
 
         # ── One consumer route per registered worker ────────────────────────

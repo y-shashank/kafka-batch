@@ -14,6 +14,7 @@ KafkaBatch.configure do |config|
   config.events_topic      = "kafka_batch.events"
   config.callbacks_topic   = "kafka_batch.callbacks"
   config.dead_letter_topic = "kafka_batch.dead_letter"
+  config.retry_topic       = "kafka_batch.jobs.retry"
 
   # ── Consumer group ─────────────────────────────────────────────────────────
   config.consumer_group = "kafka-batch"

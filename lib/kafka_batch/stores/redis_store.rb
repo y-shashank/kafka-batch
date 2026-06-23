@@ -6,28 +6,33 @@ module KafkaBatch
   module Stores
     class RedisStore < Base
       # Redis key layout:
-      #   kafka_batch:b:{id}            – Hash of batch fields
-      #   kafka_batch:b:{id}:done_jobs  – Set of "job_id:status" strings (dedup)
+      #   kafka_batch:b:{id}            – Hash of all batch fields
+      #   kafka_batch:b:{id}:done_jobs  – Set of "job_id:status" (dedup)
       #
-      # All keys expire after KafkaBatch.config.batch_ttl seconds.
+      # Both keys expire after KafkaBatch.config.batch_ttl seconds.
+      # The TTL is refreshed on every event so truly long-running batches
+      # don't expire mid-flight.
 
       KEY_PREFIX = "kafka_batch:b"
+
+      # Atomically increment job counter, extend TTL, and check for completion.
+      # Returns [code, payload]:
+      #   [0, "duplicate"]  – job_id already recorded (dedup)
+      #   [0, "not_found"]  – batch hash does not exist
+      #   [1, outcome]      – batch just completed; outcome = "success"|"complete"
+      #   [2, "continue"]   – still jobs outstanding
       BATCH_DONE_LUA = <<~LUA.freeze
-        -- KEYS[1] = batch hash key
-        -- KEYS[2] = done_jobs set key
-        -- ARGV[1] = job_id:status  (dedup member)
-        -- ARGV[2] = field to increment ("completed_count" or "failed_count")
-        -- ARGV[3] = ttl in seconds
-
-        -- Dedup check: SADD returns 1 if added, 0 if already present
         local added = redis.call('SADD', KEYS[2], ARGV[1])
-        if added == 0 then
-          return {0, 'duplicate'}
-        end
+        if added == 0 then return {0, 'duplicate'} end
 
+        -- Refresh TTLs on every completion so long batches don't expire
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
         redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
 
-        -- Increment counter
+        -- Guard: batch must exist
+        local exists = redis.call('EXISTS', KEYS[1])
+        if exists == 0 then return {0, 'not_found'} end
+
         redis.call('HINCRBY', KEYS[1], ARGV[2], 1)
 
         local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))       or 0
@@ -35,20 +40,27 @@ module KafkaBatch
         local failed    = tonumber(redis.call('HGET', KEYS[1], 'failed_count'))     or 0
         local status    = redis.call('HGET', KEYS[1], 'status')
 
-        -- If already finalised (concurrent write race), treat as duplicate
+        -- Prevent double-finalisation on concurrent writes
         if status == 'success' or status == 'complete' or status == 'cancelled' then
           return {0, 'duplicate'}
         end
 
         if (completed + failed) >= total then
           local outcome = (failed > 0) and 'complete' or 'success'
-          redis.call('HSET',   KEYS[1], 'status', outcome)
-          redis.call('HSET',   KEYS[1], 'finished_at', tostring(ARGV[4] or ''))
+          redis.call('HSET', KEYS[1], 'status',      outcome)
+          redis.call('HSET', KEYS[1], 'finished_at', ARGV[4])
           redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
           return {1, outcome}
         end
 
         return {2, 'continue'}
+      LUA
+
+      # Atomically claim callback dispatch rights.
+      # HSETNX returns 1 if field was absent (we won the race), 0 if already set.
+      CLAIM_CALLBACK_LUA = <<~LUA.freeze
+        local set = redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
+        return set
       LUA
 
       def initialize
@@ -64,11 +76,8 @@ module KafkaBatch
       def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {})
         key = batch_key(id)
         with_redis do |r|
-          # NX: only set if not exists (idempotent)
-          r.hsetnx(key, "id",              id)
-          # If the key already existed, hsetnx on "id" returns false – we're done.
           existing = r.hget(key, "total_jobs")
-          return if existing # already created
+          return if existing  # idempotent
 
           r.hset(key,
             "id",              id,
@@ -94,11 +103,11 @@ module KafkaBatch
       end
 
       def record_job_completion(batch_id:, job_id:, status:)
-        field     = status == "success" ? "completed_count" : "failed_count"
-        member    = "#{job_id}:#{status}"
-        now       = Time.now.iso8601
-        bkey      = batch_key(batch_id)
-        done_key  = "#{bkey}:done_jobs"
+        field    = status == "success" ? "completed_count" : "failed_count"
+        member   = "#{job_id}:#{status}"
+        now      = Time.now.iso8601
+        bkey     = batch_key(batch_id)
+        done_key = "#{bkey}:done_jobs"
 
         result = with_redis do |r|
           r.eval(BATCH_DONE_LUA,
@@ -108,16 +117,22 @@ module KafkaBatch
         end
 
         code, payload = result
-
         case code
-        when 0
-          payload == "duplicate" ? { status: :duplicate } : { status: :not_found }
-        when 1
-          batch = find_batch(batch_id)
-          { status: :done, outcome: payload, batch: batch }
-        when 2
-          { status: :continue }
+        when 0 then { status: payload.to_sym }   # :duplicate or :not_found
+        when 1 then { status: :done, outcome: payload, batch: find_batch(batch_id) }
+        when 2 then { status: :continue }
         end
+      end
+
+      def claim_callback(id)
+        now = Time.now.iso8601
+        result = with_redis do |r|
+          r.eval(CLAIM_CALLBACK_LUA,
+            keys: [batch_key(id)],
+            argv: [now]
+          )
+        end
+        result == 1
       end
 
       def update_batch_status(id, status)
@@ -127,16 +142,29 @@ module KafkaBatch
       end
 
       def stale_batches(older_than:)
-        # Redis doesn't support scanning by field value efficiently.
-        # In practice, the reconciler is driven by a background rake task that
-        # stores batch IDs in a separate sorted set (by created_at score).
-        # This implementation requires that the host app uses the reconciler pattern.
-        # See KafkaBatch::Reconciler.
+        # Redis has no native range-scan on hash field values.
+        # Implement a batch-ID registry (sorted set keyed by created_at) in your
+        # app if you need Redis-side reconciliation of stuck running batches.
         KafkaBatch.logger.warn(
-          "[KafkaBatch] RedisStore#stale_batches is a no-op. " \
-          "Use the kafka_batch:reconcile Rake task with an external batch ID list."
+          "[KafkaBatch] RedisStore#stale_batches: no-op. " \
+          "Maintain a sorted set of batch IDs by created_at for Redis reconciliation."
         )
         []
+      end
+
+      def done_batches_without_callback(older_than:)
+        # Same limitation as stale_batches – Redis can't range-scan hash fields.
+        KafkaBatch.logger.warn(
+          "[KafkaBatch] RedisStore#done_batches_without_callback: no-op. " \
+          "Maintain a sorted set of batch IDs by finished_at for Redis reconciliation."
+        )
+        []
+      end
+
+      def delete_batch(id)
+        with_redis do |r|
+          r.del(batch_key(id), "#{batch_key(id)}:done_jobs")
+        end
       end
 
       private
@@ -153,16 +181,17 @@ module KafkaBatch
 
       def hash_to_batch(h)
         {
-          id:              h["id"],
-          total_jobs:      h["total_jobs"].to_i,
-          completed_count: h["completed_count"].to_i,
-          failed_count:    h["failed_count"].to_i,
-          status:          h["status"],
-          on_success:      presence(h["on_success"]),
-          on_complete:     presence(h["on_complete"]),
-          meta:            deserialize(h["meta"]),
-          created_at:      h["created_at"],
-          finished_at:     h["finished_at"]
+          id:                     h["id"],
+          total_jobs:             h["total_jobs"].to_i,
+          completed_count:        h["completed_count"].to_i,
+          failed_count:           h["failed_count"].to_i,
+          status:                 h["status"],
+          on_success:             presence(h["on_success"]),
+          on_complete:            presence(h["on_complete"]),
+          meta:                   deserialize(h["meta"]),
+          created_at:             h["created_at"],
+          finished_at:            h["finished_at"],
+          callback_dispatched_at: presence(h["callback_dispatched_at"])
         }
       end
 
