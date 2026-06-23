@@ -16,9 +16,35 @@ module KafkaBatch
       raise e
     end
 
-    # Gracefully close the WaterDrop producer on server shutdown
+    # Validate that all required Kafka topics exist at boot time.
+    # Opt-in via: config.validate_topics_on_boot = true in the initializer.
+    # Skipped when WaterDrop is not yet configured or the broker is unreachable.
+    initializer "kafka_batch.validate_topics", after: "kafka_batch.validate_config" do
+      if KafkaBatch.config.validate_topics_on_boot
+        begin
+          KafkaBatch.validate_topics!
+        rescue KafkaBatch::ConfigurationError => e
+          raise e
+        rescue => e
+          KafkaBatch.logger.warn(
+            "[KafkaBatch] Topic validation failed (non-fatal): #{e.message}"
+          )
+        end
+      end
+    end
+
+    # Gracefully close the WaterDrop producer when Karafka stops.
+    # Uses the Karafka monitor event "app.stopped" so the producer is flushed
+    # cleanly inside the Karafka lifecycle rather than relying on at_exit.
     config.after_initialize do
-      at_exit { KafkaBatch::Producer.reset! }
+      if defined?(Karafka::App)
+        Karafka::App.monitor.subscribe("app.stopped") do
+          KafkaBatch::Producer.reset!
+        end
+      else
+        # Fallback for non-Karafka environments (e.g. Sidekiq, plain Puma).
+        at_exit { KafkaBatch::Producer.reset! }
+      end
     end
 
     # ── Rake tasks ───────────────────────────────────────────────────────────

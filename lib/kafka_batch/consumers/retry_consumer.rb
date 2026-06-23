@@ -111,6 +111,7 @@ module KafkaBatch
         )
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error("[KafkaBatch][RetryConsumer] DLT publish failed: #{e.message}")
+        raise  # leave offset uncommitted → redelivery
       end
 
       def decode(raw)

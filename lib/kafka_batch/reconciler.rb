@@ -17,17 +17,29 @@ module KafkaBatch
   module Reconciler
     # @param older_than [Integer] seconds – only inspect batches older than this
     def self.run(older_than: KafkaBatch.config.reconciliation_interval)
-      threshold = Time.now - older_than
+      start_time = Time.now
 
-      # ── 1. Stuck-running batches ─────────────────────────────────────────
-      stale = KafkaBatch.store.stale_batches(older_than: threshold)
-      KafkaBatch.logger.info("[KafkaBatch][Reconciler] Found #{stale.size} stuck-running batch(es)")
-      stale.each { |b| reconcile_running(b) }
+      KafkaBatch.store.with_reconciler_lock(ttl: older_than) do
+        threshold = Time.now - older_than
 
-      # ── 2. Done batches with lost callbacks ──────────────────────────────
-      lost = KafkaBatch.store.done_batches_without_callback(older_than: threshold)
-      KafkaBatch.logger.info("[KafkaBatch][Reconciler] Found #{lost.size} lost-callback batch(es)")
-      lost.each { |b| refire_callback(b) }
+        # ── 1. Stuck-running batches ─────────────────────────────────────────
+        stale = KafkaBatch.store.stale_batches(older_than: threshold)
+        KafkaBatch.logger.info("[KafkaBatch][Reconciler] Found #{stale.size} stuck-running batch(es)")
+        stale.each { |b| reconcile_running(b) }
+
+        # ── 2. Done batches with lost callbacks ──────────────────────────────
+        lost = KafkaBatch.store.done_batches_without_callback(older_than: threshold)
+        KafkaBatch.logger.info("[KafkaBatch][Reconciler] Found #{lost.size} lost-callback batch(es)")
+        lost.each { |b| refire_callback(b) }
+
+        duration = Time.now - start_time
+        KafkaBatch::Instrumentation.reconciler_ran(
+          stale_count: stale.size,
+          lost_count:  lost.size,
+          duration:    duration
+        )
+        KafkaBatch.logger.info("[KafkaBatch][Reconciler] Done in #{duration.round(2)}s")
+      end
     end
 
     # Re-evaluates a batch that's been stuck in "running" too long.

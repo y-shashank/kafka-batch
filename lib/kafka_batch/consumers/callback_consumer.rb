@@ -1,5 +1,6 @@
 require "karafka"
 require "oj"
+require "securerandom"
 require "time"
 
 module KafkaBatch
@@ -14,6 +15,8 @@ module KafkaBatch
     #      and be skipped.
     #   2. Unresolvable callback classes are forwarded to the dead-letter topic
     #      instead of being silently dropped.
+    #   3. Callback exceptions are also forwarded to the DLT (dlt_type:
+    #      "callback_error") so they are not silently lost.
     class CallbackConsumer < Karafka::BaseConsumer
       def consume
         messages.each { |msg| process_callback(msg) }
@@ -22,7 +25,25 @@ module KafkaBatch
       private
 
       def process_callback(message)
-        data    = decode(message.raw_payload)
+        data = begin
+          decode(message.raw_payload)
+        rescue ArgumentError => e
+          # Unparseable JSON: forward to DLT so nothing is silently dropped.
+          KafkaBatch.logger.error(
+            "[KafkaBatch][CallbackConsumer] Malformed JSON – forwarding to DLT: #{e.message}"
+          )
+          publish_to_dlt(
+            original_message: message,
+            data:             { "dlt_raw_payload" => message.raw_payload.to_s },
+            error:            e,
+            callback_class:   nil,
+            callback_method:  nil,
+            dlt_type:         "malformed_callback"
+          )
+          mark_as_consumed!(message)
+          return
+        end
+
         batch_id = data["batch_id"]
         outcome  = data["outcome"]
 
@@ -73,47 +94,75 @@ module KafkaBatch
 
         klass.new.public_send(method_name, batch_summary)
 
+        KafkaBatch::Instrumentation.callback_invoked(
+          batch_id:        batch_summary["batch_id"],
+          callback_class:  class_name,
+          callback_method: method_name
+        )
+
       rescue NameError => e
         # Class doesn't exist – forward to DLT so it isn't silently lost.
         KafkaBatch.logger.error(
           "[KafkaBatch][CallbackConsumer] Cannot resolve '#{class_name}': #{e.message} – sending to DLT"
+        )
+        KafkaBatch::Instrumentation.callback_failed(
+          batch_id:        batch_summary["batch_id"],
+          callback_class:  class_name,
+          callback_method: method_name,
+          error:           e
         )
         publish_to_dlt(
           original_message: original_message,
           data:             batch_summary,
           error:            e,
           callback_class:   class_name,
-          callback_method:  method_name
+          callback_method:  method_name,
+          dlt_type:         "callback"
         )
       rescue StandardError => e
-        # Callback itself raised – log but do not re-raise.  The claim was
-        # already made so a retry would be a no-op anyway.  If you need
-        # retry semantics on callbacks, wire the callback class itself as a
-        # KafkaBatch::Worker.
+        # Callback itself raised – forward to DLT with dlt_type "callback_error".
+        # The claim was already made so a retry would not re-invoke the callback,
+        # but forwarding to DLT ensures the failure is visible and replayable.
         KafkaBatch.logger.error(
           "[KafkaBatch][CallbackConsumer] #{class_name}##{method_name} raised " \
           "#{e.class}: #{e.message}\n#{e.backtrace&.first(5)&.join("\n")}"
         )
+        KafkaBatch::Instrumentation.callback_failed(
+          batch_id:        batch_summary["batch_id"],
+          callback_class:  class_name,
+          callback_method: method_name,
+          error:           e
+        )
+        publish_to_dlt(
+          original_message: original_message,
+          data:             batch_summary,
+          error:            e,
+          callback_class:   class_name,
+          callback_method:  method_name,
+          dlt_type:         "callback_error"
+        )
       end
 
-      def publish_to_dlt(original_message:, data:, error:, callback_class:, callback_method:)
+      def publish_to_dlt(original_message:, data:, error:, callback_class:, callback_method:,
+                         dlt_type: "callback")
         KafkaBatch::Producer.produce_sync(
           topic:   KafkaBatch.config.dead_letter_topic,
           payload: data.merge(
-            "dlt_type"              => "callback",
-            "dlt_callback_class"    => callback_class,
+            "dlt_type"              => dlt_type,
+            "dlt_callback_class"    => callback_class.to_s,
             "dlt_callback_method"   => callback_method.to_s,
             "dlt_error_class"       => error.class.name,
             "dlt_error_message"     => error.message,
             "dlt_source_topic"      => original_message.topic,
             "dlt_at"                => Time.now.iso8601
           ),
-          key: data["batch_id"]
+          key: data["batch_id"] || SecureRandom.uuid
         )
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error(
           "[KafkaBatch][CallbackConsumer] DLT publish failed: #{e.message}"
         )
+        raise  # leave offset uncommitted → redelivery
       end
 
       def decode(raw)

@@ -17,10 +17,12 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
 - [Defining workers](#defining-workers)
 - [Creating batches](#creating-batches)
   - [Standalone jobs (no batch)](#standalone-jobs-no-batch)
+  - [Batch.find and Batch.cancel](#batchfind-and-batchcancel)
 - [Callbacks](#callbacks)
 - [Retry behaviour](#retry-behaviour)
 - [Dead Letter Topic](#dead-letter-topic)
 - [Reconciler](#reconciler)
+- [Instrumentation](#instrumentation)
 - [Rake tasks](#rake-tasks)
 - [Reliability guarantees](#reliability-guarantees)
 - [Known limitations](#known-limitations)
@@ -162,6 +164,11 @@ KafkaBatch.configure do |config|
   # ── Reconciliation ───────────────────────────────────────────────────
   config.reconciliation_interval = 300  # seconds
 
+  # ── Topic validation at boot ─────────────────────────────────────────
+  # When true, Rails boot raises if any required topics are missing in Kafka.
+  # Disable in CI / test environments where Kafka is not running.
+  config.validate_topics_on_boot = false
+
   # ── Advanced rdkafka / WaterDrop config overrides ───────────────────
   # config.producer_config = { "compression.type" => "snappy" }
   # config.consumer_config = { "fetch.min.bytes"  => "1024"   }
@@ -278,6 +285,19 @@ KafkaBatch::Batch.enqueue(ProcessOrderWorker, order_id: 99)
 
 The job goes through the same retry / DLT flow but no batch completion tracking occurs.
 
+### Batch.find and Batch.cancel
+
+```ruby
+# Look up the current state of a batch
+batch = KafkaBatch::Batch.find(batch_id)
+# => { id: "uuid", status: "running", completed_count: 42, total_jobs: 100, ... }
+
+# Cancel a batch (prevents callbacks from firing, does NOT stop in-flight jobs)
+KafkaBatch::Batch.cancel(batch_id)
+```
+
+`cancel` sets `status` to `"cancelled"` in the store. Any jobs already in-flight will still run but the `EventConsumer` treats a cancelled batch as a no-op — it skips the completion check and the callback is never triggered.
+
 ---
 
 ## Callbacks
@@ -333,6 +353,8 @@ The `batch` hash passed to callbacks:
 
 **Unresolvable class names:** If the callback class doesn't exist (typo, rename after deploy), the message is forwarded to `dead_letter_topic` with `dlt_type: "callback"` instead of being silently dropped.
 
+**Callback exceptions forwarded to DLT:** If a callback class raises `StandardError` at runtime, the error is forwarded to the DLT with `dlt_type: "callback_error"` so it is visible and replayable. The at-most-once claim is not reversed — if you need retry semantics on a callback, make the callback class a `KafkaBatch::Worker` itself.
+
 ---
 
 ## Retry behaviour
@@ -383,7 +405,7 @@ Jobs that exhaust all retries, and callback classes that cannot be resolved, are
 }
 ```
 
-For unresolvable callback classes:
+For unresolvable callback classes (`dlt_type: "callback"`) and callback runtime errors (`dlt_type: "callback_error"`):
 
 ```json
 {
@@ -394,6 +416,19 @@ For unresolvable callback classes:
   "dlt_error_message":   "uninitialized constant MySuccessCallback",
   "dlt_source_topic":    "kafka_batch.callbacks",
   "dlt_at":              "2024-01-15T10:30:00Z"
+}
+```
+
+For malformed JSON payloads (events or callbacks topics), the raw payload is forwarded as:
+
+```json
+{
+  "dlt_type":          "malformed_event",
+  "dlt_source_topic":  "kafka_batch.events",
+  "dlt_raw_payload":   "...",
+  "dlt_error_class":   "ArgumentError",
+  "dlt_error_message": "Invalid JSON in event: ...",
+  "dlt_at":            "2024-01-15T10:30:00Z"
 }
 ```
 
@@ -427,6 +462,8 @@ The reconciler detects and recovers two classes of stuck batches:
 
 **Recovery:** Re-produces the callback message to `kafka_batch.callbacks`. The `CallbackConsumer`'s atomic claim (`callback_dispatched_at` CAS) ensures the actual callback fires exactly once even if this runs multiple times.
 
+**Distributed lock:** `Reconciler.run` acquires a store-level distributed lock before sweeping, so running the rake task from multiple servers concurrently is safe — only one process runs the sweep at a time. MySQL uses `GET_LOCK`/`RELEASE_LOCK`; Redis uses `SET NX EX`.
+
 ```bash
 bundle exec rake kafka_batch:reconcile
 ```
@@ -439,6 +476,46 @@ every 5.minutes do
   rake "kafka_batch:reconcile"
 end
 ```
+
+---
+
+## Instrumentation
+
+KafkaBatch emits `ActiveSupport::Notifications` events at key lifecycle points so you can wire in metrics, logging, or alerting without modifying the gem.
+
+| Event | Payload |
+|---|---|
+| `job.processed.kafka_batch` | `job_id`, `batch_id`, `worker_class`, `duration` |
+| `job.retried.kafka_batch` | `job_id`, `batch_id`, `worker_class`, `attempt`, `next_attempt`, `retry_after` |
+| `job.failed.kafka_batch` | `job_id`, `batch_id`, `worker_class`, `attempt`, `error_class`, `error_message` |
+| `batch.completed.kafka_batch` | `batch_id`, `outcome`, `total_jobs`, `completed_count`, `failed_count` |
+| `callback.invoked.kafka_batch` | `batch_id`, `callback_class`, `callback_method` |
+| `callback.failed.kafka_batch` | `batch_id`, `callback_class`, `callback_method`, `error_class`, `error_message` |
+| `reconciler.ran.kafka_batch` | `stale_count`, `lost_count`, `duration` |
+
+Subscribe in an initializer:
+
+```ruby
+# config/initializers/kafka_batch_instrumentation.rb
+
+ActiveSupport::Notifications.subscribe("job.processed.kafka_batch") do |*args|
+  event = ActiveSupport::Notifications::Event.new(*args)
+  StatsD.increment("kafka_batch.job.processed", tags: ["worker:#{event.payload[:worker_class]}"])
+  StatsD.timing("kafka_batch.job.duration_ms", event.duration)
+end
+
+ActiveSupport::Notifications.subscribe("job.failed.kafka_batch") do |*args|
+  event = ActiveSupport::Notifications::Event.new(*args)
+  Sentry.capture_message("KafkaBatch job exhausted retries", extra: event.payload)
+end
+
+ActiveSupport::Notifications.subscribe("batch.completed.kafka_batch") do |*args|
+  event = ActiveSupport::Notifications::Event.new(*args)
+  StatsD.increment("kafka_batch.batch.completed", tags: ["outcome:#{event.payload[:outcome]}"])
+end
+```
+
+When `ActiveSupport` is not available (non-Rails environments), all instrumentation calls are no-ops — the gem works without it.
 
 ---
 
@@ -463,15 +540,22 @@ bundle exec rake kafka_batch:workers
 | Guarantee | How it's achieved |
 |---|---|
 | **Batch never prematurely completes** | Store record (with exact `total_jobs`) is written before the first message is produced |
-| **Partial produce is cleaned up** | If `produce_sync` fails mid-batch, `delete_batch` rolls back the store record |
+| **Partial produce is cleaned up** | Any `StandardError` in `flush!` calls `delete_batch` to roll back the store record |
 | **Job completion is idempotent** | Unique constraint on `(batch_id, job_id)` (MySQL) or `SADD` (Redis) deduplicates event messages |
 | **Counter increment is atomic** | MySQL `SELECT FOR UPDATE` + `UPDATE field = field + 1`; Redis Lua script |
+| **Redis `create_batch` is race-free** | Lua script uses `HSETNX` as existence sentinel — single atomic operation, no TOCTOU |
 | **Callback fires at most once** | `claim_callback` does `UPDATE WHERE callback_dispatched_at IS NULL` — only the winner invokes |
 | **Lost callbacks are recovered** | Reconciler scans for `status IN (success,complete) AND callback_dispatched_at IS NULL` |
+| **Reconciler runs once per cluster** | Distributed lock (MySQL `GET_LOCK`, Redis `SET NX EX`) prevents concurrent reconciler sweeps |
 | **Retries don't block partitions** | Failed jobs go to `kafka_batch.jobs.retry`; `RetryConsumer` uses Karafka `pause()` |
 | **Event emission failure ≠ job failure** | Separate rescue blocks; emission retried independently before leaving offset uncommitted |
+| **Malformed JSON is never silently dropped** | Unparseable messages in all consumers are forwarded to DLT before committing |
+| **Callback exceptions are not silently swallowed** | `StandardError` in callbacks → DLT with `dlt_type: "callback_error"` |
 | **Unresolvable callbacks are not silently dropped** | Forwarded to `dead_letter_topic` with `dlt_type: "callback"` |
+| **DLT publish failure causes redelivery** | If DLT produce fails, offset is left uncommitted so Karafka redelivers the message |
 | **Consumer crash after callback but before commit** | `claim_callback` CAS prevents double-invocation on redelivery |
+| **Worker resolution is fast** | `WORKER_CACHE` hash caches `const_get` lookups per class name; thread-safe via mutex |
+| **Store and worker registry are thread-safe** | Double-checked locking with `Mutex` on both `store` and `workers` singleton accessors |
 
 ---
 
@@ -485,7 +569,7 @@ bundle exec rake kafka_batch:workers
 
 **Worker class renames after deploy.** In-flight messages carry the original class name. After removing or renaming a worker, those jobs will retry until exhausted and land in the DLT. Perform a rolling deploy or drain the topic before removing the class.
 
-**No built-in metrics.** There is no Prometheus/StatsD instrumentation. Query the store directly or subscribe to `ActiveSupport::Notifications` if you add your own instrumentation hooks.
+**No automatic metrics sink.** Instrumentation events are emitted via `ActiveSupport::Notifications` (see [Instrumentation](#instrumentation)) but nothing is sent to Prometheus/StatsD by default. Subscribe to the events to forward them to your metrics backend.
 
 ---
 

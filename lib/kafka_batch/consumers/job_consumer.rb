@@ -24,6 +24,10 @@ module KafkaBatch
       EVENT_EMIT_RETRIES = 3
       EVENT_EMIT_BACKOFF = 2  # seconds
 
+      # Cache of worker class name → Class to avoid repeated const_get lookups.
+      WORKER_CACHE       = {}
+      WORKER_CACHE_MUTEX = Mutex.new
+
       def consume
         messages.each { |msg| process_message(msg) }
       end
@@ -31,7 +35,20 @@ module KafkaBatch
       private
 
       def process_message(message)
-        data = decode(message.raw_payload)
+        data = begin
+          decode(message.raw_payload)
+        rescue ArgumentError => e
+          KafkaBatch.logger.error(
+            "[KafkaBatch][JobConsumer] Malformed JSON payload – forwarding to DLT: #{e.message}"
+          )
+          publish_to_dlt(
+            data:  { "raw_payload" => message.raw_payload.to_s },
+            error: e,
+            topic: message.topic
+          )
+          mark_as_consumed!(message)
+          return
+        end
 
         job_id        = data["job_id"]
         batch_id      = data["batch_id"]
@@ -45,6 +62,8 @@ module KafkaBatch
           "[KafkaBatch][JobConsumer] #{worker_class}#perform " \
           "job_id=#{job_id} batch_id=#{batch_id} attempt=#{attempt}"
         )
+
+        started_at = Time.now
 
         # ── Step 1: execute the job ──────────────────────────────────────
         # Only job-raised errors are caught here.  A successful perform
@@ -78,6 +97,14 @@ module KafkaBatch
           worker_class: worker_class
         )
 
+        duration = Time.now - started_at
+        KafkaBatch::Instrumentation.job_processed(
+          job_id:       job_id,
+          batch_id:     batch_id,
+          worker_class: worker_class,
+          duration:     duration
+        )
+
         mark_as_consumed!(message)
       end
 
@@ -96,7 +123,9 @@ module KafkaBatch
             data:         data,
             job_id:       job_id,
             next_attempt: attempt + 1,
-            backoff:      backoff
+            backoff:      backoff,
+            worker_class: worker_class,
+            batch_id:     batch_id
           )
         else
           exhaust_job(
@@ -105,7 +134,8 @@ module KafkaBatch
             job_id:       job_id,
             batch_id:     batch_id,
             worker_class: worker_class,
-            error:        error
+            error:        error,
+            attempt:      attempt
           )
         end
       end
@@ -113,7 +143,8 @@ module KafkaBatch
       # Forward the message to the retry topic with a `retry_after` timestamp.
       # The RetryConsumer uses Karafka pause to wait until retry_after, then
       # re-enqueues back to the original topic – zero blocking here.
-      def schedule_retry(message:, data:, job_id:, next_attempt:, backoff:)
+      def schedule_retry(message:, data:, job_id:, next_attempt:, backoff:,
+                         worker_class: nil, batch_id: nil)
         retry_after = Time.now + (backoff * next_attempt)
 
         KafkaBatch.logger.info(
@@ -131,12 +162,21 @@ module KafkaBatch
           key: job_id
         )
 
+        KafkaBatch::Instrumentation.job_retried(
+          job_id:       job_id,
+          batch_id:     batch_id,
+          worker_class: worker_class || data["worker_class"],
+          attempt:      next_attempt - 1,
+          next_attempt: next_attempt,
+          retry_after:  retry_after
+        )
+
         mark_as_consumed!(message)
       end
 
       # Job has exhausted all retries.  Emit a failure event (so the batch
       # counter is updated) and forward the raw message to the DLT.
-      def exhaust_job(message:, data:, job_id:, batch_id:, worker_class:, error:)
+      def exhaust_job(message:, data:, job_id:, batch_id:, worker_class:, error:, attempt: nil)
         KafkaBatch.logger.error(
           "[KafkaBatch][JobConsumer] job_id=#{job_id} exhausted retries – failing"
         )
@@ -146,6 +186,14 @@ module KafkaBatch
           job_id:       job_id,
           status:       "failed",
           worker_class: worker_class
+        )
+
+        KafkaBatch::Instrumentation.job_failed(
+          job_id:       job_id,
+          batch_id:     batch_id,
+          worker_class: worker_class,
+          attempt:      attempt || data["attempt"].to_i,
+          error:        error
         )
 
         publish_to_dlt(data: data, error: error, topic: message.topic)
@@ -205,13 +253,24 @@ module KafkaBatch
         )
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error("[KafkaBatch][JobConsumer] DLT publish failed: #{e.message}")
+        raise  # re-raise so offset is NOT committed → redelivery
       end
 
       def resolve_worker(class_name)
-        klass = Object.const_get(class_name)
-        raise ArgumentError, "#{class_name} does not include KafkaBatch::Worker" \
-          unless klass.include?(KafkaBatch::Worker)
-        klass
+        # Fast path: already cached
+        cached = WORKER_CACHE_MUTEX.synchronize { WORKER_CACHE[class_name] }
+        return cached if cached
+
+        WORKER_CACHE_MUTEX.synchronize do
+          # Double-check after acquiring the lock
+          return WORKER_CACHE[class_name] if WORKER_CACHE[class_name]
+
+          klass = Object.const_get(class_name)
+          raise ArgumentError, "#{class_name} does not include KafkaBatch::Worker" \
+            unless klass.include?(KafkaBatch::Worker)
+
+          WORKER_CACHE[class_name] = klass
+        end
       rescue NameError
         raise ArgumentError, "Unknown worker class: #{class_name}"
       end

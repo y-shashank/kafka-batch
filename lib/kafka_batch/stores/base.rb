@@ -64,6 +64,14 @@ module KafkaBatch
       def delete_batch(id)
         raise NotImplementedError, "#{self.class}#delete_batch"
       end
+
+      # Acquire a distributed lock before running the reconciler body.
+      # Yields only if the lock was acquired; silently skips if another process
+      # already holds it.  Implementations must release the lock in an ensure block.
+      # @param ttl [Integer] lock expiry in seconds
+      def with_reconciler_lock(ttl: 300)
+        raise NotImplementedError, "#{self.class}#with_reconciler_lock"
+      end
     end
   end
 end

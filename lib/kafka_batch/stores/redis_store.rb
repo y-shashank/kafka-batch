@@ -1,5 +1,7 @@
 require "redis"
 require "connection_pool"
+require "securerandom"
+require "time"
 require_relative "base"
 
 module KafkaBatch
@@ -63,6 +65,40 @@ module KafkaBatch
         return set
       LUA
 
+      # Atomically create a batch record only if it does not already exist.
+      # Uses HSETNX on the 'id' field as an existence sentinel.
+      # Returns 1 if created, 0 if already existed.
+      CREATE_BATCH_LUA = <<~LUA.freeze
+        local created = redis.call('HSETNX', KEYS[1], 'id', ARGV[1])
+        if created == 0 then return 0 end
+        redis.call('HMSET', KEYS[1],
+          'total_jobs',      ARGV[2],
+          'completed_count', '0',
+          'failed_count',    '0',
+          'status',          'running',
+          'on_success',      ARGV[3],
+          'on_complete',     ARGV[4],
+          'meta',            ARGV[5],
+          'created_at',      ARGV[6]
+        )
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[7]))
+        return 1
+      LUA
+
+      # Distributed reconciler lock via SET NX EX.
+      # Returns 1 if lock acquired, 0 otherwise.
+      ACQUIRE_LOCK_LUA = <<~LUA.freeze
+        return redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2]))
+      LUA
+
+      RELEASE_LOCK_LUA = <<~LUA.freeze
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+          redis.call('DEL', KEYS[1])
+          return 1
+        end
+        return 0
+      LUA
+
       def initialize
         cfg = KafkaBatch.config
         @pool = ConnectionPool.new(size: cfg.redis_pool_size, timeout: 5) do
@@ -76,21 +112,19 @@ module KafkaBatch
       def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {})
         key = batch_key(id)
         with_redis do |r|
-          existing = r.hget(key, "total_jobs")
-          return if existing  # idempotent
-
-          r.hset(key,
-            "id",              id,
-            "total_jobs",      total_jobs.to_s,
-            "completed_count", "0",
-            "failed_count",    "0",
-            "status",          "running",
-            "on_success",      on_success.to_s,
-            "on_complete",     on_complete.to_s,
-            "meta",            serialize(meta),
-            "created_at",      Time.now.iso8601
+          r.eval(CREATE_BATCH_LUA,
+            keys: [key],
+            argv: [
+              id,
+              total_jobs.to_s,
+              on_success.to_s,
+              on_complete.to_s,
+              serialize(meta),
+              Time.now.iso8601,
+              @ttl.to_s
+            ]
           )
-          r.expire(key, @ttl)
+          # Returns 1 if created, 0 if already existed (idempotent).
         end
       end
 
@@ -165,6 +199,33 @@ module KafkaBatch
         with_redis do |r|
           r.del(batch_key(id), "#{batch_key(id)}:done_jobs")
         end
+      end
+
+      # Distributed lock using SET NX EX.
+      # Yields only if this process acquires the lock; silently skips otherwise.
+      # @param ttl [Integer] lock expiry in seconds
+      def with_reconciler_lock(ttl: 300)
+        lock_key   = "#{KEY_PREFIX}:reconciler_lock"
+        token      = SecureRandom.hex(16)
+
+        acquired = with_redis do |r|
+          r.eval(ACQUIRE_LOCK_LUA,
+            keys: [lock_key],
+            argv: [token, ttl.to_s]
+          )
+        end
+
+        return unless acquired == "OK"
+
+        begin
+          yield
+        ensure
+          with_redis do |r|
+            r.eval(RELEASE_LOCK_LUA, keys: [lock_key], argv: [token])
+          end
+        end
+      rescue StoreError => e
+        KafkaBatch.logger.error("[KafkaBatch][RedisStore] Reconciler lock error: #{e.message}")
       end
 
       private

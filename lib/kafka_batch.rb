@@ -4,6 +4,7 @@ require "oj"
 require_relative "kafka_batch/version"
 require_relative "kafka_batch/errors"
 require_relative "kafka_batch/configuration"
+require_relative "kafka_batch/instrumentation"
 require_relative "kafka_batch/stores/base"
 require_relative "kafka_batch/stores/mysql_store"
 require_relative "kafka_batch/stores/redis_store"
@@ -32,17 +33,21 @@ module KafkaBatch
     # ── Store ──────────────────────────────────────────────────────────────
 
     # Returns the configured store singleton.
+    # Thread-safe via double-checked locking.
     # @return [Stores::MysqlStore, Stores::RedisStore]
     def store
-      @store ||= begin
-        config.validate!
-        case config.store
-        when :mysql
-          Stores::MysqlStore.new
-        when :redis
-          Stores::RedisStore.new
-        else
-          raise ConfigurationError, "Unknown store: #{config.store}"
+      return @store if @store
+      store_mutex.synchronize do
+        @store ||= begin
+          config.validate!
+          case config.store
+          when :mysql
+            Stores::MysqlStore.new
+          when :redis
+            Stores::RedisStore.new
+          else
+            raise ConfigurationError, "Unknown store: #{config.store}"
+          end
         end
       end
     end
@@ -51,14 +56,16 @@ module KafkaBatch
 
     # Called automatically when a class includes KafkaBatch::Worker.
     def register_worker(klass)
-      @workers ||= []
-      @workers << klass unless @workers.include?(klass)
+      workers_mutex.synchronize do
+        @workers ||= []
+        @workers << klass unless @workers.include?(klass)
+      end
     end
 
     # All registered worker classes.
     # @return [Array<Class>]
     def workers
-      @workers || []
+      workers_mutex.synchronize { Array(@workers) }
     end
 
     # ── Karafka routing helper ─────────────────────────────────────────────
@@ -105,6 +112,46 @@ module KafkaBatch
       end
     end
 
+    # ── Topic validation ───────────────────────────────────────────────────
+
+    # Verify that all KafkaBatch topics exist in the Kafka cluster.
+    # Called at boot when config.validate_topics_on_boot = true.
+    # Raises ConfigurationError with a list of missing topics.
+    def validate_topics!
+      required = [
+        config.jobs_topic,
+        config.events_topic,
+        config.callbacks_topic,
+        config.retry_topic,
+        config.dead_letter_topic
+      ].compact.uniq
+
+      # Attempt to list topics via WaterDrop's internal Rdkafka handle
+      existing = begin
+        producer   = KafkaBatch::Producer.instance
+        rd_handle  = producer.respond_to?(:client) ? producer.client : nil
+        if rd_handle.respond_to?(:metadata)
+          rd_handle.metadata(true, nil, 5000).topics.map(&:topic)
+        else
+          nil  # can't introspect – skip
+        end
+      rescue => e
+        logger.warn("[KafkaBatch] validate_topics!: could not fetch topic list: #{e.message}")
+        nil
+      end
+
+      return if existing.nil?  # skip if we couldn't fetch
+
+      missing = required - existing
+      unless missing.empty?
+        raise ConfigurationError,
+          "The following Kafka topics do not exist: #{missing.join(', ')}. " \
+          "Create them or set config.validate_topics_on_boot = false to suppress this check."
+      end
+
+      logger.info("[KafkaBatch] All #{required.size} required topics verified.")
+    end
+
     # ── Logging ────────────────────────────────────────────────────────────
 
     def logger
@@ -117,7 +164,19 @@ module KafkaBatch
       @configuration = nil
       @store         = nil
       @workers       = []
+      @store_mutex   = nil
+      @workers_mutex = nil
       Producer.reset!
+    end
+
+    private
+
+    def store_mutex
+      @store_mutex ||= Mutex.new
+    end
+
+    def workers_mutex
+      @workers_mutex ||= Mutex.new
     end
   end
 end

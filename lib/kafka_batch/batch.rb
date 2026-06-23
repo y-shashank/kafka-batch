@@ -57,6 +57,22 @@ module KafkaBatch
       batch.id
     end
 
+    # Look up an existing batch by id.
+    # @param id [String] batch UUID
+    # @return [Hash, nil]
+    def self.find(id)
+      KafkaBatch.store.find_batch(id)
+    end
+
+    # Cancel a running batch.
+    # Sets status to "cancelled" in the store.  Any jobs already in-flight will
+    # still complete but callback dispatch will be skipped because the batch is
+    # no longer in a terminal-without-callback state.
+    # @param id [String] batch UUID
+    def self.cancel(id)
+      KafkaBatch.store.update_batch_status(id, "cancelled")
+    end
+
     # Enqueue a single job outside of any batch context.
     # @param worker_class [Class]
     # @param payload      [Hash]
@@ -136,10 +152,10 @@ module KafkaBatch
           )
           produced += 1
         end
-      rescue KafkaBatch::ProducerError => e
+      rescue StandardError => e
         KafkaBatch.logger.error(
           "[KafkaBatch] Batch #{@id} produce failed after #{produced}/#{@pending.size} jobs – " \
-          "rolling back store record"
+          "rolling back store record (#{e.class}: #{e.message})"
         )
         begin
           KafkaBatch.store.delete_batch(@id)

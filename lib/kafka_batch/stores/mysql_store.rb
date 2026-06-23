@@ -121,6 +121,25 @@ module KafkaBatch
         end
       end
 
+      # Distributed lock using MySQL advisory locks (GET_LOCK / RELEASE_LOCK).
+      # GET_LOCK(name, 0) returns 1 if acquired, 0 if another session holds it.
+      # Using timeout=0 so we don't block; the reconciler simply skips if locked.
+      def with_reconciler_lock(ttl: 300)
+        lock_name = "kafka_batch_reconciler"
+        conn      = batch_record_class.connection
+
+        acquired = conn.select_value("SELECT GET_LOCK(#{conn.quote(lock_name)}, 0)").to_i
+        return unless acquired == 1
+
+        begin
+          yield
+        ensure
+          conn.execute("SELECT RELEASE_LOCK(#{conn.quote(lock_name)})")
+        end
+      rescue => e
+        KafkaBatch.logger.error("[KafkaBatch][MysqlStore] Reconciler lock error: #{e.message}")
+      end
+
       private
 
       def record_to_hash(r)

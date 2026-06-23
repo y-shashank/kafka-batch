@@ -46,6 +46,12 @@ module KafkaBatch
     # Merged on top of defaults for every consumer.
     attr_accessor :consumer_config  # Hash<String, Object>
 
+    # ── Topic validation ─────────────────────────────────────────────────────
+    # When true, KafkaBatch verifies that all configured topics exist in Kafka
+    # during Rails boot (requires a working broker connection at startup).
+    # Disabled by default to avoid blocking startup in test/CI environments.
+    attr_accessor :validate_topics_on_boot  # Boolean  default: false
+
     # ── Logging ──────────────────────────────────────────────────────────────
     attr_accessor :logger
 
@@ -66,6 +72,7 @@ module KafkaBatch
       @reconciliation_interval  = 300
       @producer_config          = {}
       @consumer_config          = {}
+      @validate_topics_on_boot  = false
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
 

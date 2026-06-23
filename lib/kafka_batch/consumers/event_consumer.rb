@@ -1,5 +1,6 @@
 require "karafka"
 require "oj"
+require "securerandom"
 require "time"
 
 module KafkaBatch
@@ -25,7 +26,22 @@ module KafkaBatch
       private
 
       def process_event(message)
-        data     = decode(message.raw_payload)
+        data = begin
+          decode(message.raw_payload)
+        rescue ArgumentError => e
+          # Unparseable JSON: forward to DLT so nothing is silently dropped.
+          KafkaBatch.logger.error(
+            "[KafkaBatch][EventConsumer] Malformed JSON – forwarding to DLT: #{e.message}"
+          )
+          publish_to_dlt(
+            raw:   message.raw_payload.to_s,
+            error: e,
+            topic: message.topic
+          )
+          mark_as_consumed!(message)
+          return
+        end
+
         batch_id = data["batch_id"]
         job_id   = data["job_id"]
         status   = data["status"]
@@ -71,21 +87,47 @@ module KafkaBatch
           "ok=#{batch[:completed_count]} failed=#{batch[:failed_count]}"
         )
 
+        KafkaBatch::Instrumentation.batch_completed(
+          batch_id:        batch[:id],
+          outcome:         outcome,
+          total_jobs:      batch[:total_jobs],
+          completed_count: batch[:completed_count],
+          failed_count:    batch[:failed_count]
+        )
+
         KafkaBatch::Producer.produce_sync(
           topic:   KafkaBatch.config.callbacks_topic,
           payload: {
-            "batch_id"       => batch[:id],
-            "outcome"        => outcome,          # "success" | "complete"
-            "total_jobs"     => batch[:total_jobs],
-            "completed_count"=> batch[:completed_count],
-            "failed_count"   => batch[:failed_count],
-            "on_success"     => batch[:on_success],
-            "on_complete"    => batch[:on_complete],
-            "meta"           => batch[:meta],
-            "finished_at"    => Time.now.iso8601
+            "batch_id"        => batch[:id],
+            "outcome"         => outcome,          # "success" | "complete"
+            "total_jobs"      => batch[:total_jobs],
+            "completed_count" => batch[:completed_count],
+            "failed_count"    => batch[:failed_count],
+            "on_success"      => batch[:on_success],
+            "on_complete"     => batch[:on_complete],
+            "meta"            => batch[:meta],
+            "finished_at"     => Time.now.iso8601
           },
           key: batch[:id]
         )
+      end
+
+      def publish_to_dlt(raw:, error:, topic:)
+        KafkaBatch::Producer.produce_sync(
+          topic:   KafkaBatch.config.dead_letter_topic,
+          payload: {
+            "dlt_type"          => "malformed_event",
+            "dlt_source_topic"  => topic,
+            "dlt_raw_payload"   => raw,
+            "dlt_error_class"   => error.class.name,
+            "dlt_error_message" => error.message,
+            "dlt_at"            => Time.now.iso8601
+          },
+          key: SecureRandom.uuid
+        )
+      rescue KafkaBatch::ProducerError => e
+        KafkaBatch.logger.error("[KafkaBatch][EventConsumer] DLT publish failed: #{e.message}")
+        raise  # leave offset uncommitted → redelivery
       end
 
       def decode(raw)
