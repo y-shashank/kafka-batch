@@ -16,10 +16,10 @@ module KafkaBatch
         end
       end
 
-      def job_completion_class
-        @job_completion_class ||= begin
+      def consumer_offset_class
+        @consumer_offset_class ||= begin
           klass = Class.new(ActiveRecord::Base)
-          klass.table_name = "kafka_batch_job_completions"
+          klass.table_name = "kafka_batch_consumer_offsets"
           klass
         end
       end
@@ -47,42 +47,29 @@ module KafkaBatch
         record_to_hash(record)
       end
 
-      def record_job_completion(batch_id:, job_id:, status:)
-        # ── Step 1: dedup insert ──────────────────────────────────────────
-        begin
-          job_completion_class.create!(batch_id: batch_id, job_id: job_id, status: status)
-        rescue ActiveRecord::RecordNotUnique
-          return { status: :duplicate }
-        end
-
-        # ── Step 2: atomic increment + completion check ───────────────────
-        # FOR UPDATE: exclusive row lock prevents two processes from both
-        # seeing completed+failed >= total and both firing the callback.
-        #
-        # NOTE: we never `return` from inside the transaction block – a
-        # non-local return triggers a rollback (and a deprecation warning) in
-        # modern ActiveRecord. We assign +result+ and let the block fall through.
+      # Dedup by a monotonic per-partition cursor over the job message's source
+      # coordinates. One row per (topic, partition), independent of batch size.
+      def record_completion_by_offset(batch_id:, source_topic:, source_partition:, source_offset:, status:)
+        offset = source_offset.to_i
         result = nil
 
         batch_record_class.transaction do
-          record = batch_record_class.lock.find_by(id: batch_id)
+          cursor = consumer_offset_class.lock.find_by(
+            source_topic: source_topic, source_partition: source_partition
+          )
 
-          if record.nil?
-            result = { status: :not_found }
-          elsif %w[success complete cancelled].include?(record.status)
+          if cursor && offset <= cursor.last_offset
+            # Already applied (redelivered or re-produced) – skip.
             result = { status: :duplicate }
           else
-            field = status == "success" ? "completed_count" : "failed_count"
-            batch_record_class.where(id: batch_id).update_all("#{field} = #{field} + 1")
-            record.reload
-
-            if record.completed_count + record.failed_count >= record.total_jobs
-              outcome = record.failed_count.positive? ? "complete" : "success"
-              record.update!(status: outcome, finished_at: Time.now)
-              result = { status: :done, outcome: outcome, batch: record_to_hash(record) }
+            if cursor
+              cursor.update!(last_offset: offset)
             else
-              result = { status: :continue }
+              consumer_offset_class.create!(
+                source_topic: source_topic, source_partition: source_partition, last_offset: offset
+              )
             end
+            result = apply_completion(batch_id, status)
           end
         end
 
@@ -135,10 +122,7 @@ module KafkaBatch
       end
 
       def delete_batch(id)
-        batch_record_class.transaction do
-          job_completion_class.where(batch_id: id).delete_all
-          batch_record_class.where(id: id).delete_all
-        end
+        batch_record_class.where(id: id).delete_all
       end
 
       # Distributed lock using MySQL advisory locks (GET_LOCK / RELEASE_LOCK).
@@ -161,6 +145,29 @@ module KafkaBatch
       end
 
       private
+
+      # Increment the batch counter and detect completion. MUST be called from
+      # within a transaction. FOR UPDATE locks the row so two processes can't
+      # both observe completion and both fire the callback. Returning from this
+      # helper is a normal method return (not a non-local return out of the
+      # transaction block), so it does not roll the transaction back.
+      def apply_completion(batch_id, status)
+        record = batch_record_class.lock.find_by(id: batch_id)
+        return { status: :not_found } if record.nil?
+        return { status: :duplicate } if %w[success complete cancelled].include?(record.status)
+
+        field = status == "success" ? "completed_count" : "failed_count"
+        batch_record_class.where(id: batch_id).update_all("#{field} = #{field} + 1")
+        record.reload
+
+        if record.completed_count + record.failed_count >= record.total_jobs
+          outcome = record.failed_count.positive? ? "complete" : "success"
+          record.update!(status: outcome, finished_at: Time.now)
+          { status: :done, outcome: outcome, batch: record_to_hash(record) }
+        else
+          { status: :continue }
+        end
+      end
 
       def record_to_hash(r)
         {

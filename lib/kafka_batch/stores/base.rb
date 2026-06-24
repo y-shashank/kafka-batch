@@ -15,16 +15,19 @@ module KafkaBatch
         raise NotImplementedError, "#{self.class}#find_batch"
       end
 
-      # Atomically record that a single job finished.
-      # Idempotent – duplicate calls for the same job_id are no-ops.
+      # Atomically record that a single job finished, deduplicating by the job
+      # message's immutable source coordinates. A completion is applied only if
+      # +source_offset+ is strictly greater than the stored monotonic cursor for
+      # (source_topic, source_partition); this absorbs both redelivered and
+      # re-produced events with O(num_partitions) state regardless of batch size.
       #
       # @return [Hash]
       #   { status: :done,      outcome: "success"|"complete", batch: <hash> }
       #   { status: :continue                                                 }
       #   { status: :duplicate                                                }
       #   { status: :not_found                                                }
-      def record_job_completion(batch_id:, job_id:, status:)
-        raise NotImplementedError, "#{self.class}#record_job_completion"
+      def record_completion_by_offset(batch_id:, source_topic:, source_partition:, source_offset:, status:)
+        raise NotImplementedError, "#{self.class}#record_completion_by_offset"
       end
 
       # Atomically claim the right to dispatch the batch callback.

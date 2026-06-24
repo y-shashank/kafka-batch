@@ -37,14 +37,13 @@ module KafkaBatchSpec
         add_index :kafka_batch_records, %i[status created_at]
         add_index :kafka_batch_records, %i[status callback_dispatched_at finished_at]
 
-        create_table :kafka_batch_job_completions, force: true do |t|
-          t.string   :batch_id, null: false
-          t.string   :job_id,   null: false
-          t.string   :status,   null: false
-          t.datetime :created_at, null: false
+        create_table :kafka_batch_consumer_offsets, force: true do |t|
+          t.string   :source_topic,     null: false
+          t.integer  :source_partition, null: false
+          t.bigint   :last_offset,      null: false, default: 0
+          t.datetime :updated_at
         end
-        add_index :kafka_batch_job_completions, %i[batch_id job_id], unique: true
-        add_index :kafka_batch_job_completions, :batch_id
+        add_index :kafka_batch_consumer_offsets, %i[source_topic source_partition], unique: true
       end
     end
 
@@ -52,7 +51,7 @@ module KafkaBatchSpec
       establish!
       conn = ActiveRecord::Base.connection
       conn.execute("DELETE FROM kafka_batch_records")
-      conn.execute("DELETE FROM kafka_batch_job_completions")
+      conn.execute("DELETE FROM kafka_batch_consumer_offsets")
     end
   end
 end

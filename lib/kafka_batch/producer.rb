@@ -53,7 +53,11 @@ module KafkaBatch
         defaults = {
           :"bootstrap.servers"        => cfg.brokers.join(","),
           :"request.required.acks"    => "all",   # strongest durability guarantee
-          :"message.send.max.retries" => 3,
+          # Idempotent producer: dedups broker-side produce retries so the same
+          # message can never be appended twice (different offsets) on a topic.
+          # This is what makes offset-based completion counting safe – the worker
+          # topic itself is guaranteed free of produce-retry duplicates.
+          :"enable.idempotence"       => true,
           :"retry.backoff.ms"         => 200,
           :"socket.timeout.ms"        => 30_000,
           :"message.timeout.ms"       => 30_000

@@ -24,42 +24,48 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     end
   end
 
-  describe "#record_job_completion" do
-    it "returns :continue while jobs remain" do
+  describe "#record_completion_by_offset" do
+    it "counts continue -> done by monotonic source offset" do
       id = new_batch(total: 2)
-      result = store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
-      expect(result[:status]).to eq(:continue)
-    end
+      r1 = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 10, status: "success")
+      expect(r1[:status]).to eq(:continue)
 
-    it "dedups repeated completions for the same job" do
-      id = new_batch(total: 2)
-      store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
-      dup = store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
-      expect(dup[:status]).to eq(:duplicate)
-    end
-
-    it "marks the batch :done with outcome success when all jobs succeed" do
-      id = new_batch(total: 2)
-      store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
-      result = store.record_job_completion(batch_id: id, job_id: "j2", status: "success")
-
-      expect(result[:status]).to eq(:done)
-      expect(result[:outcome]).to eq("success")
+      r2 = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 11, status: "success")
+      expect(r2[:status]).to eq(:done)
+      expect(r2[:outcome]).to eq("success")
       expect(store.find_batch(id)[:status]).to eq("success")
     end
 
     it "marks the batch :done with outcome complete when any job fails" do
       id = new_batch(total: 2)
-      store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
-      result = store.record_job_completion(batch_id: id, job_id: "j2", status: "failed")
-
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 10, status: "success")
+      result = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 11, status: "failed")
       expect(result[:status]).to eq(:done)
       expect(result[:outcome]).to eq("complete")
     end
 
-    it "returns :not_found for an unknown batch" do
-      result = store.record_job_completion(batch_id: "nope", job_id: "j1", status: "success")
-      expect(result[:status]).to eq(:not_found)
+    it "dedups a replayed/re-produced source offset (<= cursor)" do
+      id = new_batch(total: 2)
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 10, status: "success")
+
+      # same offset again (redelivery) and a lower offset both dedup
+      expect(store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 10, status: "success")[:status]).to eq(:duplicate)
+      expect(store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 9,  status: "success")[:status]).to eq(:duplicate)
+
+      expect(store.find_batch(id)[:completed_count]).to eq(1)
+    end
+
+    it "tracks cursors independently per (topic, partition)" do
+      id = new_batch(total: 2)
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 5, status: "success")
+      # different partition, low offset still counts
+      r = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 1, source_offset: 1, status: "success")
+      expect(r[:status]).to eq(:done)
+    end
+
+    it "returns :not_found for an unknown batch (but still advances the cursor)" do
+      r = store.record_completion_by_offset(batch_id: "nope", source_topic: "wt", source_partition: 0, source_offset: 1, status: "success")
+      expect(r[:status]).to eq(:not_found)
     end
   end
 
@@ -82,7 +88,7 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
 
     it "#done_batches_without_callback finds finished, unclaimed batches" do
       id = new_batch(total: 1)
-      store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success")
 
       lost = store.done_batches_without_callback(older_than: Time.now + 60)
       expect(lost.map { |b| b[:id] }).to include(id)
@@ -94,13 +100,10 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
   end
 
   describe "#delete_batch" do
-    it "removes the batch and its job completions" do
+    it "removes the batch record" do
       id = new_batch(total: 2)
-      store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
       store.delete_batch(id)
-
       expect(store.find_batch(id)).to be_nil
-      expect(store.job_completion_class.where(batch_id: id).count).to eq(0)
     end
   end
 end

@@ -46,7 +46,7 @@ module KafkaBatch
         job_id   = data["job_id"]
         status   = data["status"]
 
-        unless batch_id && job_id && status
+        unless batch_id && status
           KafkaBatch.logger.warn("[KafkaBatch][EventConsumer] Malformed event – skipping: #{data.inspect}")
           mark_as_consumed!(message)
           return
@@ -56,10 +56,24 @@ module KafkaBatch
           "[KafkaBatch][EventConsumer] batch_id=#{batch_id} job_id=#{job_id} status=#{status}"
         )
 
-        result = KafkaBatch.store.record_job_completion(
-          batch_id: batch_id,
-          job_id:   job_id,
-          status:   status
+        src_topic     = data["src_topic"]
+        src_partition = data["src_partition"]
+        src_offset    = data["src_offset"]
+
+        if src_topic.nil? || src_partition.nil? || src_offset.nil?
+          KafkaBatch.logger.warn(
+            "[KafkaBatch][EventConsumer] Event missing source coords – skipping: #{data.inspect}"
+          )
+          mark_as_consumed!(message)
+          return
+        end
+
+        result = KafkaBatch.store.record_completion_by_offset(
+          batch_id:         batch_id,
+          source_topic:     src_topic,
+          source_partition: src_partition,
+          source_offset:    src_offset,
+          status:           status
         )
 
         case result[:status]

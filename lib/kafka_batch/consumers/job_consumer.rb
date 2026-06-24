@@ -67,7 +67,8 @@ module KafkaBatch
               batch_id:     batch_id,
               job_id:       job_id,
               status:       "failed",
-              worker_class: data["worker_class"].to_s
+              worker_class: data["worker_class"].to_s,
+              message:      message
             )
             publish_to_dlt(data: data, error: e, topic: message.topic)
             mark_as_consumed!(message)
@@ -114,7 +115,8 @@ module KafkaBatch
           batch_id:     batch_id,
           job_id:       job_id,
           status:       "success",
-          worker_class: worker_class
+          worker_class: worker_class,
+          message:      message
         )
 
         duration = Time.now - started_at
@@ -205,7 +207,8 @@ module KafkaBatch
           batch_id:     batch_id,
           job_id:       job_id,
           status:       "failed",
-          worker_class: worker_class
+          worker_class: worker_class,
+          message:      message
         )
 
         KafkaBatch::Instrumentation.job_failed(
@@ -222,24 +225,22 @@ module KafkaBatch
 
       # ── Event emission ───────────────────────────────────────────────────
 
-      def emit_event_with_retry(batch_id:, job_id:, status:, worker_class:)
+      def emit_event_with_retry(batch_id:, job_id:, status:, worker_class:, message:)
         return unless batch_id  # standalone job – no batch tracking
 
-        max_attempts = KafkaBatch.config.event_emit_retries.to_i
-        backoff      = KafkaBatch.config.event_emit_backoff.to_i
+        max_attempts        = KafkaBatch.config.event_emit_retries.to_i
+        backoff             = KafkaBatch.config.event_emit_backoff.to_i
+        payload, event_key  = build_event(
+          batch_id: batch_id, job_id: job_id, status: status,
+          worker_class: worker_class, message: message
+        )
 
         attempts = 0
         begin
           KafkaBatch::Producer.produce_sync(
             topic:   KafkaBatch.config.events_topic,
-            payload: {
-              "batch_id"     => batch_id,
-              "job_id"       => job_id,
-              "status"       => status,
-              "worker_class" => worker_class.to_s,
-              "occurred_at"  => Time.now.iso8601
-            },
-            key: batch_id
+            payload: payload,
+            key:     event_key
           )
         rescue KafkaBatch::ProducerError => e
           attempts += 1
@@ -261,6 +262,27 @@ module KafkaBatch
       end
 
       # ── Helpers ──────────────────────────────────────────────────────────
+
+      # Build the completion-event payload and its partition key.
+      #
+      # The event carries the job message's immutable source coordinates
+      # (topic/partition/offset) that the EventConsumer dedups on, and is keyed
+      # by the source partition so a batch's events spread across the event-topic
+      # partitions instead of funnelling through one. job_id is kept for logging.
+      def build_event(batch_id:, job_id:, status:, worker_class:, message:)
+        payload = {
+          "batch_id"      => batch_id,
+          "job_id"        => job_id,
+          "status"        => status,
+          "worker_class"  => worker_class.to_s,
+          "occurred_at"   => Time.now.iso8601,
+          "src_topic"     => message.topic,
+          "src_partition" => message.partition,
+          "src_offset"    => message.offset
+        }
+
+        [payload, "#{message.topic}/#{message.partition}"]
+      end
 
       def publish_to_dlt(data:, error:, topic:)
         KafkaBatch::Producer.produce_sync(

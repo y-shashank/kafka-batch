@@ -8,15 +8,14 @@ module KafkaBatch
   module Stores
     class RedisStore < Base
       # Redis key layout:
-      #   kafka_batch:b:{id}            – Hash of all batch fields
-      #   kafka_batch:b:{id}:done_jobs  – Set of "job_id:status" (dedup)
-      #   kafka_batch:index:running     – ZSET of batch ids, score = created_at epoch
-      #   kafka_batch:index:done        – ZSET of finished-but-uncallbacked ids,
-      #                                   score = finished_at epoch
-      #
-      # The two batch-scoped keys expire after KafkaBatch.config.batch_ttl
-      # seconds.  The TTL is refreshed on every event so truly long-running
-      # batches don't expire mid-flight.
+      #   kafka_batch:b:{id}         – Hash of all batch fields (expires after batch_ttl)
+      #   kafka_batch:offsets        – Hash of monotonic per-partition cursors;
+      #                                field = "source_topic/source_partition"
+      #                                → last applied source offset. O(num_partitions),
+      #                                never grows with job count, no TTL.
+      #   kafka_batch:index:running  – ZSET of batch ids, score = created_at epoch
+      #   kafka_batch:index:done     – ZSET of finished-but-uncallbacked ids,
+      #                                score = finished_at epoch
       #
       # The two index ZSETs power the reconciler (stale_batches /
       # done_batches_without_callback).  Members are pruned as batches advance
@@ -26,42 +25,44 @@ module KafkaBatch
       KEY_PREFIX    = "kafka_batch:b"
       RUNNING_INDEX = "kafka_batch:index:running"
       DONE_INDEX    = "kafka_batch:index:done"
+      OFFSETS_KEY   = "kafka_batch:offsets"
 
-      # Atomically increment job counter, extend TTL, and check for completion.
+      # Atomically apply a completion, deduplicating by a monotonic per-partition
+      # cursor over the job message's source offset, then check for completion.
+      #   KEYS[1] = batch hash, KEYS[2] = offsets hash
+      #   ARGV[1] = "topic/partition" field, ARGV[2] = source_offset,
+      #   ARGV[3] = counter field, ARGV[4] = ttl, ARGV[5] = now (iso8601)
       # Returns [code, payload]:
-      #   [0, "duplicate"]  – job_id already recorded (dedup)
+      #   [0, "duplicate"]  – source_offset already applied (dedup)
       #   [0, "not_found"]  – batch hash does not exist
       #   [1, outcome]      – batch just completed; outcome = "success"|"complete"
       #   [2, "continue"]   – still jobs outstanding
-      BATCH_DONE_LUA = <<~LUA.freeze
-        local added = redis.call('SADD', KEYS[2], ARGV[1])
-        if added == 0 then return {0, 'duplicate'} end
+      BATCH_DONE_OFFSET_LUA = <<~LUA.freeze
+        local last = redis.call('HGET', KEYS[2], ARGV[1])
+        if last and tonumber(ARGV[2]) <= tonumber(last) then return {0, 'duplicate'} end
 
-        -- Refresh TTLs on every completion so long batches don't expire
-        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
-        redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
+        -- Advance the monotonic cursor first; the event is now "applied".
+        redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
 
-        -- Guard: batch must exist
-        local exists = redis.call('EXISTS', KEYS[1])
-        if exists == 0 then return {0, 'not_found'} end
+        if redis.call('EXISTS', KEYS[1]) == 0 then return {0, 'not_found'} end
 
-        redis.call('HINCRBY', KEYS[1], ARGV[2], 1)
-
-        local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))       or 0
-        local completed = tonumber(redis.call('HGET', KEYS[1], 'completed_count'))  or 0
-        local failed    = tonumber(redis.call('HGET', KEYS[1], 'failed_count'))     or 0
-        local status    = redis.call('HGET', KEYS[1], 'status')
-
-        -- Prevent double-finalisation on concurrent writes
+        local status = redis.call('HGET', KEYS[1], 'status')
         if status == 'success' or status == 'complete' or status == 'cancelled' then
           return {0, 'duplicate'}
         end
 
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+        redis.call('HINCRBY', KEYS[1], ARGV[3], 1)
+
+        local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))      or 0
+        local completed = tonumber(redis.call('HGET', KEYS[1], 'completed_count')) or 0
+        local failed    = tonumber(redis.call('HGET', KEYS[1], 'failed_count'))    or 0
+
         if (completed + failed) >= total then
           local outcome = (failed > 0) and 'complete' or 'success'
           redis.call('HSET', KEYS[1], 'status',      outcome)
-          redis.call('HSET', KEYS[1], 'finished_at', ARGV[4])
-          redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+          redis.call('HSET', KEYS[1], 'finished_at', ARGV[5])
+          redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
           return {1, outcome}
         end
 
@@ -152,27 +153,23 @@ module KafkaBatch
         end
       end
 
-      def record_job_completion(batch_id:, job_id:, status:)
-        field    = status == "success" ? "completed_count" : "failed_count"
-        member   = "#{job_id}:#{status}"
-        now      = Time.now.iso8601
-        bkey     = batch_key(batch_id)
-        done_key = "#{bkey}:done_jobs"
+      def record_completion_by_offset(batch_id:, source_topic:, source_partition:, source_offset:, status:)
+        field        = status == "success" ? "completed_count" : "failed_count"
+        offset_field = "#{source_topic}/#{source_partition}"
+        bkey         = batch_key(batch_id)
+        now          = Time.now.iso8601
 
         result = with_redis do |r|
-          r.eval(BATCH_DONE_LUA,
-            keys: [bkey, done_key],
-            argv: [member, field, @ttl.to_s, now]
+          r.eval(BATCH_DONE_OFFSET_LUA,
+            keys: [bkey, OFFSETS_KEY],
+            argv: [offset_field, source_offset.to_s, field, @ttl.to_s, now]
           )
         end
 
         code, payload = result
         case code
-        when 0 then { status: payload.to_sym }   # :duplicate or :not_found
+        when 0 then { status: payload.to_sym }
         when 1
-          # Batch just finished: move it from the running index to the
-          # done index (pending callback dispatch) so the reconciler can
-          # recover a lost callback.
           with_redis do |r|
             r.zrem(RUNNING_INDEX, batch_id)
             r.zadd(DONE_INDEX, Time.now.to_f, batch_id)
@@ -264,7 +261,7 @@ module KafkaBatch
 
       def delete_batch(id)
         with_redis do |r|
-          r.del(batch_key(id), "#{batch_key(id)}:done_jobs")
+          r.del(batch_key(id))
           r.zrem(RUNNING_INDEX, id)
           r.zrem(DONE_INDEX, id)
         end

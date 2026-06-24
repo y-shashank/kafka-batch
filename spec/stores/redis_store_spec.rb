@@ -31,32 +31,41 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
     end
   end
 
-  describe "#record_job_completion" do
-    it "walks continue -> done(success)" do
+  describe "#record_completion_by_offset" do
+    it "counts continue -> done by monotonic source offset" do
       id = new_batch(total: 2)
-      expect(store.record_job_completion(batch_id: id, job_id: "j1", status: "success")[:status]).to eq(:continue)
-
-      result = store.record_job_completion(batch_id: id, job_id: "j2", status: "success")
-      expect(result[:status]).to eq(:done)
-      expect(result[:outcome]).to eq("success")
+      expect(store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 10, status: "success")[:status]).to eq(:continue)
+      r = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 11, status: "success")
+      expect(r[:status]).to eq(:done)
+      expect(r[:outcome]).to eq("success")
     end
 
     it "reports complete when a job failed" do
       id = new_batch(total: 2)
-      store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
-      result = store.record_job_completion(batch_id: id, job_id: "j2", status: "failed")
-      expect(result[:outcome]).to eq("complete")
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 10, status: "success")
+      r = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 11, status: "failed")
+      expect(r[:outcome]).to eq("complete")
     end
 
-    it "dedups duplicate job ids" do
+    it "dedups a replayed/re-produced source offset (<= cursor)" do
       id = new_batch(total: 2)
-      store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
-      dup = store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
-      expect(dup[:status]).to eq(:duplicate)
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 10, status: "success")
+      expect(store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 10, status: "success")[:status]).to eq(:duplicate)
+      expect(store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 9, status: "success")[:status]).to eq(:duplicate)
+      expect(store.find_batch(id)[:completed_count]).to eq(1)
     end
 
-    it "returns :not_found for an unknown batch" do
-      expect(store.record_job_completion(batch_id: "nope", job_id: "j", status: "success")[:status]).to eq(:not_found)
+    it "tracks cursors independently per (topic, partition)" do
+      id = new_batch(total: 2)
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 5, status: "success")
+      r = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 1, source_offset: 1, status: "success")
+      expect(r[:status]).to eq(:done)
+    end
+
+    it "moves the batch into the done index on completion" do
+      id = new_batch(total: 1)
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success")
+      expect(store.done_batches_without_callback(older_than: Time.now + 60).map { |b| b[:id] }).to include(id)
     end
   end
 
@@ -89,13 +98,13 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
 
     it "drops a batch from the running index once it completes" do
       id = new_batch(total: 1)
-      store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success")
       expect(store.stale_batches(older_than: Time.now + 60).map { |b| b[:id] }).not_to include(id)
     end
 
     it "#done_batches_without_callback finds finished, unclaimed batches and prunes after claim" do
       id = new_batch(total: 1)
-      store.record_job_completion(batch_id: id, job_id: "j1", status: "success")
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success")
 
       lost = store.done_batches_without_callback(older_than: Time.now + 60)
       expect(lost.map { |b| b[:id] }).to include(id)

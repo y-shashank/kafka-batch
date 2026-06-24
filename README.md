@@ -14,6 +14,7 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
   - [MySQL store](#mysql-store)
   - [Redis store](#redis-store)
   - [Karafka routing](#karafka-routing)
+- [Completion counting & scalability](#completion-counting--scalability)
 - [Defining workers](#defining-workers)
 - [Creating batches](#creating-batches)
   - [Standalone jobs (no batch)](#standalone-jobs-no-batch)
@@ -156,6 +157,10 @@ KafkaBatch.configure do |config|
   config.max_retries   = 3   # max attempts before dead letter
   config.retry_backoff = 5   # seconds; sleep = attempt × retry_backoff
 
+  # ── Completion-event emission retries (inline; blocks the worker thread) ─
+  config.event_emit_retries = 3
+  config.event_emit_backoff = 2  # seconds; sleep = attempt × backoff
+
   # ── Redis (only when store: :redis) ─────────────────────────────────
   config.redis_url       = ENV.fetch("REDIS_URL", "redis://localhost:6379/0")
   config.redis_pool_size = 5
@@ -177,13 +182,13 @@ end
 
 ### MySQL store
 
-Requires three migrations (two tables + one column addition):
+Requires three migrations:
 
 | Migration | What it creates |
 |---|---|
 | `create_kafka_batch_records` | Batch state table with counters and status |
-| `create_kafka_batch_job_completions` | Per-job completion dedup table (unique constraint on `batch_id, job_id`) |
 | `add_callback_tracking_to_kafka_batch_records` | `callback_dispatched_at` column for callback dispatch tracking (duplicate suppression + lost-callback reconciliation) |
+| `create_kafka_batch_consumer_offsets` | Per-partition monotonic completion cursor (one row per `source_topic, source_partition`) |
 
 ```bash
 bundle exec rails db:migrate
@@ -191,9 +196,9 @@ bundle exec rails db:migrate
 
 ### Redis store
 
-No migrations needed. Batch state is stored as a Redis Hash at `kafka_batch:b:{batch_id}`. Completed job IDs are tracked in a Set at `kafka_batch:b:{batch_id}:done_jobs`. Both keys expire after `config.batch_ttl` seconds and are refreshed on every job completion event.
+No migrations needed. Batch state is stored as a Redis Hash at `kafka_batch:b:{batch_id}` (expires after `config.batch_ttl` seconds, refreshed on every completion event). Per-partition completion cursors live in a single `kafka_batch:offsets` hash — O(num partitions), never growing with job count.
 
-> **Note:** The Redis store's reconciler methods (`stale_batches`, `done_batches_without_callback`) are no-ops. Maintain a separate sorted set of batch IDs keyed by `created_at` / `finished_at` score if you need reconciliation on Redis.
+> **Reconciler on Redis:** fully supported — the store maintains `kafka_batch:index:running` and `kafka_batch:index:done` sorted sets automatically, so `stale_batches` / `done_batches_without_callback` work without any app-side bookkeeping.
 
 ### Karafka routing
 
@@ -226,6 +231,35 @@ end
 | `kafka-batch-retry` | `kafka_batch.jobs.retry` | `RetryConsumer` |
 | `kafka-batch-events` | `kafka_batch.events` | `EventConsumer` |
 | `kafka-batch-callbacks` | `kafka_batch.callbacks` | `CallbackConsumer` |
+
+---
+
+## Completion counting & scalability
+
+Knowing when a batch is "done" requires idempotent counting over an at-least-once event stream. KafkaBatch does this with an **offset-inbox**: state stays **O(number of worker-topic partitions)**, independent of batch size, so a 10-job batch and a 50-million-job batch cost the same to track.
+
+Each completion event carries the **immutable source coordinates** of its job message — `src_topic`, `src_partition`, `src_offset` — and is keyed by `src_topic/src_partition`. The store keeps a **monotonic per-partition cursor** (one row in `kafka_batch_consumer_offsets`, or one field in the Redis `kafka_batch:offsets` hash) and applies a completion only when `src_offset` exceeds the cursor.
+
+Because the source offset is stable across reprocessing, this deduplicates **both**:
+
+- **redelivered** events (consumer redelivery / rebalance), and
+- **re-produced** events (the job message was redelivered and the worker re-ran) — the second copy carries the same source offset and is rejected.
+
+Keying events by source partition also spreads completion processing across the event-topic partitions instead of funnelling a whole batch through one, so completion throughput scales horizontally with partition count.
+
+**Guarantees**
+
+- ✅ Exact completion counting with flat, batch-size-independent state.
+- ✅ Horizontally scalable completion processing (per-partition, not per-batch).
+- ✅ Relies on the **idempotent producer** (enabled by default) so the worker topic itself can't contain produce-retry duplicates.
+
+**Trade-offs / what is *not* guaranteed**
+
+- ❌ No per-job audit — only aggregate counts (`completed_count` / `failed_count`). Failures are still visible in the dead-letter topic.
+- ❌ `perform` still runs **at-least-once** — workers must be idempotent (unchanged).
+- ⚠️ Slightly higher per-event latency than a naive counter; on Redis **Cluster** the two-key Lua requires same-slot placement.
+
+> **Why no Kafka transactions?** True exactly-once read-process-write with transactional offset commits is a Karafka **Pro** feature. The offset-inbox reaches the same *counting* guarantee on open-source Karafka by deduping on the job's immutable source offset plus the idempotent producer — no broker transactions required.
 
 ---
 
@@ -543,7 +577,7 @@ bundle exec rake kafka_batch:workers
 |---|---|
 | **Batch never prematurely completes** | Store record (with exact `total_jobs`) is written before the first message is produced |
 | **Partial produce is cleaned up** | Any `StandardError` in `flush!` calls `delete_batch` to roll back the store record |
-| **Job completion is idempotent** | Unique constraint on `(batch_id, job_id)` (MySQL) or `SADD` (Redis) deduplicates event messages |
+| **Job completion is idempotent** | Monotonic per-partition cursor over the job message's source offset deduplicates redelivered and re-produced events |
 | **Counter increment is atomic** | MySQL `SELECT FOR UPDATE` + `UPDATE field = field + 1`; Redis Lua script |
 | **Redis `create_batch` is race-free** | Lua script uses `HSETNX` as existence sentinel — single atomic operation, no TOCTOU |
 | **Callback fires at least once** | Callback is invoked, then `callback_dispatched_at` is set; duplicates are suppressed and crashes lead to safe re-invocation (callbacks must be idempotent) |
@@ -565,11 +599,11 @@ bundle exec rake kafka_batch:workers
 
 **Workers must be idempotent.** If event emission fails after a successful `perform`, Karafka redelivers the job and `perform` runs again. Design workers to tolerate duplicate execution (upsert, guard clauses, etc.).
 
-**Redis reconciliation is a no-op.** The Redis store cannot range-scan hash field values. For Redis-backed reconciliation, maintain a sorted set of batch IDs by `created_at`/`finished_at` in your application and pass them to a custom sweep.
+**No per-job audit.** Completion counting is offset-based (aggregate counts only), so the store cannot answer "did job X run / which jobs failed?". Failed jobs are still captured in the dead-letter topic for inspection/replay.
 
 **Redis TTL.** Batch keys expire after `batch_ttl` seconds. The TTL is refreshed on every job completion event, but a batch with no activity for longer than `batch_ttl` will lose its state. Set `batch_ttl` well above your longest expected batch duration.
 
-**Worker class renames after deploy.** In-flight messages carry the original class name. After removing or renaming a worker, those jobs will retry until exhausted and land in the DLT. Perform a rolling deploy or drain the topic before removing the class.
+**Worker class renames after deploy.** In-flight messages carry the original class name. After removing or renaming a worker, the consumer forwards those jobs straight to the DLT (and emits a `failed` event so the batch still completes) rather than blocking the partition. Perform a rolling deploy or drain the topic before removing the class.
 
 **No automatic metrics sink.** Instrumentation events are emitted via `ActiveSupport::Notifications` (see [Instrumentation](#instrumentation)) but nothing is sent to Prometheus/StatsD by default. Subscribe to the events to forward them to your metrics backend.
 
@@ -617,26 +651,25 @@ With a single `rescue`, a transient Kafka error on `emit_event` looks identical 
 
 A `sleep` inside `JobConsumer` blocks the entire Kafka partition for the duration. With `max_retries: 3, retry_backoff: 5`, a single exhausted job stalls its partition for 30 seconds. Under load, multiple failing jobs on the same partition compound this. The retry topic approach forwards the message immediately and suspends only the *retry partition* (via Karafka `pause()`) — the job partition is fully unblocked.
 
-### Why `claim_callback` as a CAS instead of checking first?
+### Why invoke the callback first, then claim?
 
-A read-before-write ("check if claimed, then claim") has a race: two `CallbackConsumer` processes read `callback_dispatched_at = nil` simultaneously, both conclude they should proceed, both claim, and both fire. A conditional `UPDATE WHERE callback_dispatched_at IS NULL` is atomic at the database level — exactly one process gets `rows_affected = 1`.
+Callbacks are **at-least-once**: the `CallbackConsumer` invokes the callback, then sets `callback_dispatched_at`. A crash between the two re-invokes on redelivery (never a lost callback) — matching Sidekiq Pro. Duplicates in the normal path are suppressed by a pre-invocation `callback_dispatched?` check, which is reliable because callback messages are keyed by `batch_id` (one partition → one consumer → sequential). Make callbacks idempotent.
 
 ### Message flow (numbered)
 
 ```
 1.  App             → MySQL/Redis       CREATE batch record (total_jobs = N)
-2.  App             → Kafka jobs topic  PRODUCE N job messages
+2.  App             → Kafka jobs topic  PRODUCE N job messages (idempotent producer)
 3.  JobConsumer     → worker            CALL perform(payload)
-4a. (success)       → Kafka events      PRODUCE {batch_id, job_id, status: success}
+4a. (success)       → Kafka events      PRODUCE {batch_id, status: success, src_topic/partition/offset}
 4b. (failure)       → Kafka retry       PRODUCE {retry_after, retry_to, attempt+1}
-4c. (exhausted)     → Kafka events      PRODUCE {batch_id, job_id, status: failed}
+4c. (exhausted)     → Kafka events      PRODUCE {batch_id, status: failed, src_*}
                     → Kafka DLT         PRODUCE original message + error context
 5.  RetryConsumer   pauses partition    WAIT until retry_after via Karafka pause()
                     → Kafka jobs topic  PRODUCE message back to original topic
-6.  EventConsumer   → MySQL/Redis       ATOMIC increment + check (FOR UPDATE / Lua)
+6.  EventConsumer   → MySQL/Redis       ATOMIC offset-cursor dedup + increment + check
 7.  EventConsumer   → Kafka callbacks  PRODUCE callback message (if batch done)
-8.  CallbackConsumer → MySQL/Redis      CLAIM via callback_dispatched_at CAS
-                    → callback class    CALL on_success / on_complete
+8.  CallbackConsumer → callback class   INVOKE on_success / on_complete, then CLAIM
 ```
 
 ---

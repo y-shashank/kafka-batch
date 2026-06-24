@@ -71,6 +71,28 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
     end
   end
 
+  describe "completion event shape" do
+    it "emits source coordinates and keys the event by source partition" do
+      msg = FakeMessage.new(
+        topic:     SuccessfulWorker.kafka_topic,
+        partition: 4,
+        offset:    99,
+        payload:   {
+          "job_id" => "j1", "batch_id" => "b1", "worker_class" => "SuccessfulWorker",
+          "payload" => {}, "attempt" => 0
+        }
+      )
+
+      consumer.send(:process_message, msg)
+
+      event = FakeProducer.for_topic(KafkaBatch.config.events_topic).first
+      expect(event.payload).to include(
+        "src_topic" => "test.success", "src_partition" => 4, "src_offset" => 99
+      )
+      expect(event.key).to eq("test.success/4")
+    end
+  end
+
   describe "configurable event-emission retries (fix #5)" do
     it "retries event emission config.event_emit_retries times, then re-raises" do
       KafkaBatch.config.event_emit_retries = 2
@@ -85,9 +107,10 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
         true
       end
 
+      msg = FakeMessage.new(topic: "test.success", payload: {}, partition: 0, offset: 1)
       expect {
         consumer.send(:emit_event_with_retry, batch_id: "b1", job_id: "j1",
-                                              status: "success", worker_class: SuccessfulWorker)
+                                              status: "success", worker_class: SuccessfulWorker, message: msg)
       }.to raise_error(KafkaBatch::ProducerError)
 
       # 1 initial attempt + 2 configured retries
@@ -98,8 +121,9 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       called = false
       allow(KafkaBatch::Producer).to receive(:produce_sync) { called = true }
 
+      msg = FakeMessage.new(topic: "test.success", payload: {}, partition: 0, offset: 1)
       consumer.send(:emit_event_with_retry, batch_id: nil, job_id: "j1",
-                                            status: "success", worker_class: SuccessfulWorker)
+                                            status: "success", worker_class: SuccessfulWorker, message: msg)
       expect(called).to be(false)
     end
   end
