@@ -54,6 +54,23 @@ module KafkaBatch
       end
     end
 
+    # Set by JobConsumer before #perform so a running job knows its batch.
+    attr_accessor :kafka_batch_id
+
+    # The batch this job belongs to, as a pushable Batch handle – or nil for a
+    # standalone job. Lets a running job add more jobs to its own (open) batch
+    # without threading the batch id around:
+    #
+    #   def perform(payload)
+    #     batch&.push(ChildWorker, "parent_id" => payload["id"])
+    #   end
+    #
+    # @return [KafkaBatch::Batch, nil]
+    def batch
+      return nil if kafka_batch_id.nil? || kafka_batch_id.to_s.empty?
+      @kafka_batch ||= KafkaBatch::Batch.new(id: kafka_batch_id)
+    end
+
     # Override this in your worker class.
     # @param payload [Hash] deserialized message payload
     def perform(payload)

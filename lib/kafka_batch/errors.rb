@@ -7,6 +7,9 @@ module KafkaBatch
   # Raised when a batch cannot be found in the store
   class BatchNotFoundError < Error; end
 
+  # Raised when pushing jobs into a batch that has already been locked
+  class BatchLockedError < Error; end
+
   # Raised when Kafka message production fails
   class ProducerError < Error; end
 

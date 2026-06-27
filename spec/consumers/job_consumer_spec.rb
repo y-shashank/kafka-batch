@@ -102,6 +102,31 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
     end
   end
 
+  describe "in-job batch context (batch.push without passing the id)" do
+    it "lets a running job add a child job to its own open batch" do
+      batch = KafkaBatch::Batch.create   # open batch
+      batch.push(FanoutWorker, { "id" => 1 }) # parent job (total -> 1)
+
+      msg = FakeMessage.new(
+        topic:     FanoutWorker.kafka_topic,
+        partition: 0, offset: 0,
+        payload: {
+          "job_id" => "j1", "batch_id" => batch.id, "worker_class" => "FanoutWorker",
+          "payload" => { "id" => 1 }, "attempt" => 0
+        }
+      )
+      consumer.send(:process_message, msg)
+
+      # The fanout job ran and pushed a child SuccessfulWorker into the same batch.
+      expect(KafkaBatchSpec::WorkerRuns.runs.map { |r| r[:name] }).to include(:fanout)
+      child = FakeProducer.for_topic("test.success").last
+      expect(child).not_to be_nil
+      expect(child.payload["batch_id"]).to eq(batch.id)
+      # total grew from 1 (parent) to 2 (parent + child)
+      expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(2)
+    end
+  end
+
   describe "completion event shape" do
     it "emits source coordinates and keys the event by source partition" do
       msg = FakeMessage.new(

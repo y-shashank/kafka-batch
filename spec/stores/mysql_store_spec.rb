@@ -24,6 +24,50 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     end
   end
 
+  describe "open batches (add_jobs / lock_batch)" do
+    it "add_jobs grows total_jobs while the batch is open" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 0, locked: false)
+      expect(store.add_jobs(id, 5)).to eq(:ok)
+      expect(store.find_batch(id)[:total_jobs]).to eq(5)
+      expect(store.find_batch(id)[:locked_at]).to be_nil
+    end
+
+    it "does not finalize an open batch even when complete" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 1, locked: false)
+      r = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success")
+      expect(r[:status]).to eq(:continue)
+      expect(store.find_batch(id)[:status]).to eq("running")
+    end
+
+    it "lock_batch finalizes an already-complete batch and blocks further add_jobs" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 1, locked: false)
+      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success")
+
+      res = store.lock_batch(id)
+      expect(res[:status]).to eq(:done)
+      expect(res[:outcome]).to eq("success")
+      expect(store.add_jobs(id, 1)).to eq(:locked)
+    end
+
+    it "lock_batch on an incomplete open batch just locks it" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 3, locked: false)
+      expect(store.lock_batch(id)[:status]).to eq(:locked)
+      expect(store.find_batch(id)[:locked_at]).not_to be_nil
+    end
+
+    it "add_jobs reports :not_found and :cancelled" do
+      expect(store.add_jobs("nope", 1)).to eq(:not_found)
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 0, locked: false)
+      store.update_batch_status(id, "cancelled")
+      expect(store.add_jobs(id, 1)).to eq(:cancelled)
+    end
+  end
+
   describe "#record_completion_by_offset" do
     it "counts continue -> done by monotonic source offset" do
       id = new_batch(total: 2)

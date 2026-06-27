@@ -55,6 +55,15 @@ module KafkaBatch
         "total=#{total} done=#{done}"
       )
 
+      # Open (never-locked) batches may still receive more jobs – they are not
+      # stuck, just not finalized yet. Leave them alone.
+      if batch[:locked_at].nil?
+        KafkaBatch.logger.info(
+          "[KafkaBatch][Reconciler] batch_id=#{id} is still open (unlocked) – skipping"
+        )
+        return
+      end
+
       unless done >= total && total.positive?
         KafkaBatch.logger.warn(
           "[KafkaBatch][Reconciler] batch_id=#{id} genuinely still running – skipping"

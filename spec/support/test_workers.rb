@@ -36,6 +36,17 @@ class FailingWorker
   end
 end
 
+# Pushes a child job into its own batch (exercises the in-job `batch` context).
+class FanoutWorker
+  include KafkaBatch::Worker
+  kafka_topic "test.fanout"
+
+  def perform(payload)
+    KafkaBatchSpec::WorkerRuns.record(:fanout, payload)
+    batch&.push(SuccessfulWorker, { "child_of" => payload["id"] })
+  end
+end
+
 # A plain class that is NOT a KafkaBatch::Worker (for negative validation).
 class NotAWorker
 end

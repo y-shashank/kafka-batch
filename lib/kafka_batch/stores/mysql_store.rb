@@ -26,7 +26,7 @@ module KafkaBatch
 
       # ── Public interface ──────────────────────────────────────────────────
 
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {})
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, locked: true)
         batch_record_class.create!(
           id:               id,
           total_jobs:       total_jobs,
@@ -35,10 +35,51 @@ module KafkaBatch
           status:           "running",
           on_success:       on_success,
           on_complete:      on_complete,
-          meta:             serialize(meta)
+          meta:             serialize(meta),
+          locked_at:        locked ? Time.now : nil
         )
       rescue ActiveRecord::RecordNotUnique
         nil  # idempotent – already created
+      end
+
+      def add_jobs(id, count)
+        result = nil
+        batch_record_class.transaction do
+          record = batch_record_class.lock.find_by(id: id)
+          if record.nil?
+            result = :not_found
+          elsif record.status == "cancelled"
+            result = :cancelled
+          elsif record.locked_at
+            result = :locked
+          else
+            batch_record_class.where(id: id).update_all("total_jobs = total_jobs + #{count.to_i}")
+            result = :ok
+          end
+        end
+        result
+      end
+
+      def lock_batch(id)
+        result = nil
+        batch_record_class.transaction do
+          record = batch_record_class.lock.find_by(id: id)
+          if record.nil?
+            result = :not_found
+          else
+            was_running = record.status == "running"
+            record.update!(locked_at: Time.now) if record.locked_at.nil?
+
+            if was_running && record.completed_count + record.failed_count >= record.total_jobs
+              outcome = record.failed_count.positive? ? "complete" : "success"
+              record.update!(status: outcome, finished_at: Time.now)
+              result = { status: :done, outcome: outcome, batch: record_to_hash(record) }
+            else
+              result = { status: :locked }
+            end
+          end
+        end
+        result.is_a?(Hash) ? result : { status: result }
       end
 
       def find_batch(id)
@@ -179,7 +220,9 @@ module KafkaBatch
         batch_record_class.where(id: batch_id).update_all("#{field} = #{field} + 1")
         record.reload
 
-        if record.completed_count + record.failed_count >= record.total_jobs
+        # Only finalize (and fire callbacks) once the batch is locked – an open
+        # batch may still receive more jobs even if currently at its total.
+        if record.locked_at && record.completed_count + record.failed_count >= record.total_jobs
           outcome = record.failed_count.positive? ? "complete" : "success"
           record.update!(status: outcome, finished_at: Time.now)
           { status: :done, outcome: outcome, batch: record_to_hash(record) }
@@ -200,7 +243,8 @@ module KafkaBatch
           meta:                   deserialize(r.meta),
           created_at:             r.created_at,
           finished_at:            r.respond_to?(:finished_at)            ? r.finished_at            : nil,
-          callback_dispatched_at: r.respond_to?(:callback_dispatched_at) ? r.callback_dispatched_at : nil
+          callback_dispatched_at: r.respond_to?(:callback_dispatched_at) ? r.callback_dispatched_at : nil,
+          locked_at:              r.respond_to?(:locked_at)              ? r.locked_at              : nil
         }
       end
 

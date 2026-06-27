@@ -201,13 +201,14 @@ end
 
 ### MySQL store
 
-Requires three migrations:
+Requires these migrations:
 
 | Migration | What it creates |
 |---|---|
 | `create_kafka_batch_records` | Batch state table with counters and status |
 | `add_callback_tracking_to_kafka_batch_records` | `callback_dispatched_at` column for callback dispatch tracking (duplicate suppression + lost-callback reconciliation) |
 | `create_kafka_batch_consumer_offsets` | Per-partition monotonic completion cursor (one row per `source_topic, source_partition`) |
+| `add_locked_at_to_kafka_batch_records` | `locked_at` column for open/streaming batches (callbacks gated until lock) |
 
 ```bash
 bundle exec rails db:migrate
@@ -322,13 +323,66 @@ end
 puts batch_id  # => "550e8400-e29b-41d4-a716-446655440000"
 ```
 
-The batch record is written to the store with the exact job count **before** the first Kafka message is produced. If `produce_sync` fails mid-way through, the store record is rolled back via `delete_batch` so the batch doesn't linger in "running" with an unreachable total.
+Batches are **open**: each `push` atomically grows the batch's `total_jobs` and produces the job immediately. The block form above auto-calls `lock` when the block returns, so callbacks fire once everything finishes.
 
 An optional explicit `job_id` can be passed for tracing:
 
 ```ruby
 b.push(ProcessOrderWorker, { order_id: 1 }, job_id: "order-1-#{Time.now.to_i}")
 ```
+
+### Open batches: add jobs over time, anywhere (and `lock`)
+
+You don't have to push all jobs at creation. Skip the block to get an **open** batch you can add to incrementally — from the same process or a different one — and `lock` it when you're done. **Callbacks never fire until the batch is locked**, and pushing after `lock` raises `KafkaBatch::BatchLockedError`.
+
+```ruby
+# 1) Create an open batch and remember its id
+batch = KafkaBatch::Batch.create(on_complete: "BatchCompleteCallback")
+batch_id = batch.id            # persist / enqueue this somewhere
+
+# 2) Add jobs whenever/wherever — total_jobs grows with each push.
+#    Re-attach to the batch by id with Batch.open:
+KafkaBatch::Batch.open(batch_id).tap do |b|
+  users.each_slice(1_000) do |slice|
+    slice.each { |u| b.push(ProcessUserWorker, "user_id" => u.id) }
+  end
+end
+
+# 3) When everything has been pushed, lock it. From then on callbacks can fire
+#    and no more jobs may be added.
+KafkaBatch::Batch.open(batch_id).lock
+```
+
+**Push many at once** — grows `total_jobs` with a single store write, then produces each job:
+
+```ruby
+batch.push_many(ProcessUserWorker, users.map { |u| { "user_id" => u.id } })
+# => ["job-uuid-1", "job-uuid-2", ...]
+```
+
+**Add jobs from inside a running job** — a worker can fan out into its *own* batch without threading the id around, via `batch` (nil for standalone jobs). Keep the batch open until the fan-out is done, then `lock`:
+
+```ruby
+class CrawlPageWorker
+  include KafkaBatch::Worker
+  kafka_topic "crawl.pages"
+
+  def perform(payload)
+    page = fetch(payload["url"])
+    page.links.each do |link|
+      batch&.push(CrawlPageWorker, "url" => link)   # add child jobs to the same batch
+    end
+  end
+end
+```
+
+- `Batch.create` **without a block** returns a `Batch` instance (open).
+- `Batch.open(id)` re-attaches to an existing batch so you can `push`/`push_many`/`lock` from anywhere (raises `BatchNotFoundError` if unknown).
+- `total_jobs` updates live as you push (visible in `Batch.find` and the [Web UI](#web-ui)).
+- While open, even if `completed + failed` reaches `total_jobs`, the batch will **not** complete — it waits for `lock` (which finalizes immediately if everything is already done).
+- If a `push` fails to produce, the job count is rolled back so the total stays accurate.
+
+> The reconciler skips open (never-locked) batches, so an in-progress open batch is never mistaken for a stuck one.
 
 ### Standalone jobs (no batch)
 

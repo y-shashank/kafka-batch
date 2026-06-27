@@ -102,7 +102,9 @@ module KafkaBatch
         # Only job-raised errors are caught here.  A successful perform
         # that subsequently fails at event emission is handled separately.
         begin
-          worker_class.new.perform(payload)
+          worker = worker_class.new
+          worker.kafka_batch_id = batch_id if worker.respond_to?(:kafka_batch_id=)
+          worker.perform(payload)
         rescue StandardError => e
           handle_failure(
             message:      message,

@@ -5,8 +5,27 @@ module KafkaBatch
     # multiple processes / threads.
     class Base
       # Create a new batch record.
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {})
+      # @param locked [Boolean] when false the batch is "open" – it accepts more
+      #   jobs (via #add_jobs) and will NOT finalize/fire callbacks until #lock_batch
+      #   is called. When true (default) the batch behaves as a fixed-size batch
+      #   that finalizes as soon as completed+failed reaches total_jobs.
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, locked: true)
         raise NotImplementedError, "#{self.class}#create_batch"
+      end
+
+      # Atomically grow an open batch's total_jobs by +count+.
+      # @return [Symbol] :ok | :locked | :cancelled | :not_found
+      def add_jobs(id, count)
+        raise NotImplementedError, "#{self.class}#add_jobs"
+      end
+
+      # Lock an open batch so no more jobs may be added, then evaluate completion.
+      # @return [Hash]
+      #   { status: :done, outcome: "success"|"complete", batch: <hash> } – just finalized
+      #   { status: :locked }     – locked, still has outstanding jobs
+      #   { status: :not_found }
+      def lock_batch(id)
+        raise NotImplementedError, "#{self.class}#lock_batch"
       end
 
       # Fetch a batch by id.

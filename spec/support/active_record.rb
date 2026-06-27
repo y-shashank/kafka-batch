@@ -32,6 +32,7 @@ module KafkaBatchSpec
           t.datetime :created_at,             null: false
           t.datetime :finished_at
           t.datetime :callback_dispatched_at
+          t.datetime :locked_at
         end
         add_index :kafka_batch_records, :status
         add_index :kafka_batch_records, %i[status created_at]
