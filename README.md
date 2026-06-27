@@ -326,7 +326,7 @@ batch_id = KafkaBatch::Batch.create(
   meta: { report_id: 42, user_id: 99 }  # arbitrary data forwarded to callbacks
 ) do |b|
   Order.find_each do |order|
-    b.push(ProcessOrderWorker, order_id: order.id)
+    b.push(ProcessOrderWorker, { order_id: order.id })
   end
 end
 
@@ -336,6 +336,11 @@ puts batch.id  # => "550e8400-e29b-41d4-a716-446655440000"
 There is **no lock step**. A batch stays **open** and accepts more jobs — from anywhere, including from jobs that belong to it — until it **completes** (all jobs done → callback fires) or is cancelled. The completion callback fires automatically the moment the batch drains (`completed + failed >= total_jobs`).
 
 The **block form is recommended** for one-shot population: the batch is held open for the duration of the block, so it cannot complete mid-population even if early jobs finish before later ones are pushed. When the block returns it is sealed and finalizes once everything is done.
+
+> **Wrap the payload in `{ }`.** Because `push`/`push_many`/`enqueue` accept a
+> `job_id:` keyword, a brace-less hash (e.g. `push(W, order_id: 1)`) is parsed by
+> Ruby 3 as keyword arguments and raises `ArgumentError: unknown keyword`. Always
+> pass the payload as an explicit Hash: `push(W, { order_id: 1 })`.
 
 An optional explicit `job_id` can be passed for tracing:
 
@@ -355,7 +360,7 @@ class CrawlPageWorker
   def perform(payload)
     page = fetch(payload["url"])
     page.links.each do |link|
-      batch&.push(CrawlPageWorker, "url" => link)   # add child jobs to the same batch
+      batch&.push(CrawlPageWorker, { "url" => link })   # add child jobs to the same batch
     end
   end
 end
@@ -371,7 +376,7 @@ batch.push_many(ProcessUserWorker, users.map { |u| { "user_id" => u.id } })
 **Re-attach from another process** with `Batch.open(id)`:
 
 ```ruby
-KafkaBatch::Batch.open(batch_id).push(ProcessUserWorker, "user_id" => 7)
+KafkaBatch::Batch.open(batch_id).push(ProcessUserWorker, { "user_id" => 7 })
 ```
 
 - `Batch.create` **without a block** returns a `Batch` that is sealed immediately, so it completes as soon as it drains. If every pushed job can finish before you push more, prefer the block form — otherwise the callback may fire early and further pushes raise `KafkaBatch::BatchClosedError`.
@@ -385,7 +390,7 @@ KafkaBatch::Batch.open(batch_id).push(ProcessUserWorker, "user_id" => 7)
 ### Standalone jobs (no batch)
 
 ```ruby
-KafkaBatch::Batch.enqueue(ProcessOrderWorker, order_id: 99)
+KafkaBatch::Batch.enqueue(ProcessOrderWorker, { order_id: 99 })
 ```
 
 The job goes through the same retry / DLT flow but no batch completion tracking occurs.
