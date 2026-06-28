@@ -76,6 +76,13 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("pod-xyz#99")
     end
 
+    it "shows the total pending-jobs counter" do
+      seed(total: 7)  # 7 pending (running, none completed)
+      html = get("/").last.join
+      expect(html).to include("Pending jobs")
+      expect(html).to include(">7<")
+    end
+
     it "filters by status" do
       running = seed
       cancelled = seed
@@ -116,6 +123,38 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("Pending by partition")
       expect(html).to include("demo")
       expect(html).to include("7") # the lag value
+    end
+  end
+
+  describe "GET /fairness" do
+    it "says fairness is disabled when it's off" do
+      KafkaBatch.config.fairness_enabled = false
+      html = get("/fairness").last.join
+      expect(html).to include("disabled")
+    end
+
+    it "renders lanes, buffer depth and dispatcher status when enabled" do
+      KafkaBatch.config.fairness_enabled  = true
+      KafkaBatch.config.fairness_ready_lag_high = 5000
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      ingest_group = "#{KafkaBatch.config.consumer_group}-dispatch"
+      jobs_group   = "#{KafkaBatch.config.consumer_group}-jobs"
+      allow(KafkaBatch::Lag).to receive(:read_group).with(ingest_group, [KafkaBatch.config.fairness_ingest_topic])
+        .and_return(ingest_group => { KafkaBatch.config.fairness_ingest_topic => { 8 => { offset: 0, lag: 40 }, 9 => { offset: 0, lag: 25 } } })
+      allow(KafkaBatch::Lag).to receive(:read_group).with(jobs_group, [KafkaBatch.config.fairness_ready_topic])
+        .and_return(jobs_group => { KafkaBatch.config.fairness_ready_topic => { 0 => { offset: 0, lag: 12 } } })
+
+      html = get("/fairness").last.join
+      expect(html).to include("Active lanes")
+      expect(html).to include(">2<")    # 2 active lanes
+      expect(html).to include(">65<")   # un-dispatched total 40+25
+      expect(html).to include(">12<")   # ready buffer total
+      expect(html).to include("Flowing")
+    end
+
+    it "links to /fairness from the dashboard when enabled" do
+      KafkaBatch.config.fairness_enabled = true
+      expect(get("/").last.join).to include("/kafka_batch/fairness")
     end
   end
 

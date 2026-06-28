@@ -55,6 +55,14 @@ module KafkaBatch
     attr_accessor :retry_delay        # Integer – seconds before each later retry (default 180)
     attr_accessor :retry_jitter       # Float   – +/- fraction of randomization (default 0.1)
 
+    # After this many retries a still-failing job counts toward its batch's
+    # on_complete (as failed) so the batch needn't wait for the full retry budget
+    # — the job keeps retrying in the background up to max_retries. Set equal to
+    # (or above) max_retries to disable early completion (the default 3 == default
+    # max_retries, so default behaviour is unchanged). on_success is unaffected:
+    # it still fires only when every job truly succeeds.
+    attr_accessor :complete_after_retries  # Integer – default 3 (worker can override)
+
     # ── Completion-event emission retries ────────────────────────────────────
     # After a job succeeds, the consumer produces a completion event. If that
     # produce fails (transient Kafka issue) it is retried inline before giving
@@ -80,6 +88,28 @@ module KafkaBatch
     # keeps working, you just may not see every failure in the UI.
     attr_accessor :failures_ttl              # Integer – seconds; default 1 day
     attr_accessor :max_failures_per_batch    # Integer – 0 = unlimited; default 1000
+
+    # ── Multi-tenant fairness (hybrid WFQ scheduler; requires Redis) ─────────
+    # When enabled, jobs are dispatched through a Redis-backed weighted-fair-queue
+    # so capacity is shared dynamically across tenants: one active tenant uses
+    # 100% of the global budget, two split ~50:50, etc. (work-conserving). The
+    # durable backlog stays in Kafka; only a bounded ready-window per tenant lives
+    # in Redis. See KafkaBatch::Fairness::Scheduler.
+    attr_accessor :fairness_enabled                 # Boolean – default false
+    attr_accessor :fairness_global_concurrency      # Integer – total in-flight slots; default 50
+    attr_accessor :fairness_max_inflight_per_tenant # Integer – per-tenant cap; 0 = none (default)
+    attr_accessor :fairness_ready_window            # Integer – bounded ready jobs/tenant in Redis; default 500
+    attr_accessor :fairness_default_weight          # Numeric – default share weight; default 1.0
+
+    # Kafka-ready-topic design: jobs land on the ingest topic (keyed
+    # one-tenant-per-partition); a Dispatcher forwards them onto the ready topic
+    # which a swarm of normal JobConsumers drains. The dispatcher throttles so the
+    # ready topic's un-consumed depth stays between the low/high watermarks (this
+    # is what keeps fairness dynamic). No Redis on the path.
+    attr_accessor :fairness_ingest_topic   # String – default "kafka_batch.ingest"
+    attr_accessor :fairness_ready_topic    # String – default "kafka_batch.ready"
+    attr_accessor :fairness_ready_lag_high # Integer – pause forwarding above this; default 5000
+    attr_accessor :fairness_ready_lag_low  # Integer – resume forwarding below this; default 1000
 
     # ── Reconciliation ───────────────────────────────────────────────────────
     # A periodic sweep that re-checks "running" batches that look stuck.
@@ -125,6 +155,7 @@ module KafkaBatch
       @retry_first_delay        = 10   # seconds
       @retry_delay              = 180  # seconds (3 minutes)
       @retry_jitter             = 0.1  # +/- 10%
+      @complete_after_retries   = 3    # == max_retries default → no early completion by default
       @event_emit_retries       = 3
       @event_emit_backoff       = 2
       @redis_url                = "redis://localhost:6379/0"
@@ -132,6 +163,15 @@ module KafkaBatch
       @batch_ttl                = 7 * 24 * 3600  # 7 days
       @failures_ttl             = 24 * 3600      # 1 day (metadata only; Kafka is the source of truth)
       @max_failures_per_batch   = 1000           # cap tracked failing jobs per batch (0 = unlimited)
+      @fairness_enabled                 = false
+      @fairness_global_concurrency      = 50
+      @fairness_max_inflight_per_tenant = 0     # 0 = no per-tenant cap (rely on WFQ)
+      @fairness_ready_window            = 500   # bounded ready jobs per tenant in Redis
+      @fairness_default_weight          = 1.0
+      @fairness_ingest_topic            = "kafka_batch.ingest"
+      @fairness_ready_topic             = "kafka_batch.ready"
+      @fairness_ready_lag_high          = 5000
+      @fairness_ready_lag_low           = 1000
       @reconciliation_interval  = 300
       @reconciler_lock_ttl      = 600
       @producer_config          = {}

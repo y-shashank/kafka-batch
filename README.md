@@ -24,7 +24,9 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
   - [Batch.find and Batch.cancel](#batchfind-and-batchcancel)
 - [Callbacks](#callbacks)
 - [Retry behaviour](#retry-behaviour)
+  - [Early batch completion (`complete_after_retries`)](#early-batch-completion-complete_after_retries)
 - [Dead Letter Topic](#dead-letter-topic)
+- [Multi-tenant fairness (WFQ)](#multi-tenant-fairness-wfq)
 - [Web UI](#web-ui)
 - [Reconciler](#reconciler)
 - [Instrumentation](#instrumentation)
@@ -553,6 +555,24 @@ Short delays keep the `RetryConsumer`'s `pause()` head-of-line wait negligible (
 
 Override attempts per worker with `max_retries`.
 
+### Early batch completion (`complete_after_retries`)
+
+A persistently-failing job can otherwise hold up its batch's **`on_complete`** for the whole retry budget (`max_retries × retry_delay`), even when every other job is done. To cap that latency, a job counts toward its batch (as *failed*) after **`complete_after_retries`** retries (default **3**) — while it **keeps retrying in the background** up to `max_retries`:
+
+```ruby
+class FlakyWorker
+  include KafkaBatch::Worker
+  kafka_topic "flaky.jobs"
+  max_retries            20   # keep trying for a long time
+  complete_after_retries 3    # ...but don't make the batch wait past 3 retries
+end
+```
+
+- The batch's `on_complete` fires once all jobs have either succeeded **or** hit `complete_after_retries`.
+- Counting is **exactly once** — a `batch_counted` flag rides the retry message, so the later background retries (success or exhaustion) never double-count.
+- **`on_success` is unaffected**: it still fires only when every job genuinely succeeds. A batch with an early-counted job reports outcome `complete` (a job was counted failed), so `on_success` won't fire even if that job later succeeds in the background.
+- Default `complete_after_retries` (3) == default `max_retries` (3), so **default behaviour is unchanged** — set `max_retries` higher to benefit.
+
 **Event emission retries:** If `perform` succeeds but the subsequent produce to `kafka_batch.events` fails (transient Kafka issue), the gem retries emission up to `EVENT_EMIT_RETRIES` (3) times with a short backoff. If all retries fail, the offset is left uncommitted so Karafka redelivers the job message and `perform` runs again. This is why workers must be idempotent.
 
 ---
@@ -605,6 +625,57 @@ topic KafkaBatch.config.dead_letter_topic do
   consumer DeadLetterConsumer
 end
 ```
+
+---
+
+## Multi-tenant fairness (WFQ)
+
+When many tenants (businesses) push jobs into the same system, a naive Kafka topic processes them roughly FIFO — so one tenant dumping 10M jobs starves everyone behind it. KafkaBatch ships a **hybrid weighted-fair-queuing (WFQ) scheduler** that shares capacity dynamically:
+
+- **1 active tenant → 100%** of capacity; **2 → ~50:50**; **N → ~1/N each** — and it's **work-conserving** (an idle tenant's share is instantly redistributed).
+- The durable backlog stays in **Kafka**; only a **bounded ready-window per tenant** lives in Redis, so memory is `O(active_tenants × window)`, not `O(total jobs)`. (Putting the whole backlog in Redis would cost orders of magnitude more RAM — keep it in Kafka.)
+- Per-tenant **weights** give proportional shares; a global **concurrency budget** and optional **per-tenant in-flight cap** bound load.
+
+Tag jobs with a tenant:
+
+```ruby
+batch = KafkaBatch::Batch.create(on_complete: "Cb", tenant_id: "acme")
+batch.push(ProcessUserWorker, { "user_id" => 1 })          # inherits tenant "acme"
+batch.push(ProcessUserWorker, { "user_id" => 2 }, tenant_id: "globex")  # override
+```
+
+Configure (requires `config.redis_url`):
+
+```ruby
+config.fairness_enabled                 = true
+config.fairness_global_concurrency      = 50    # total in-flight slots = system capacity
+config.fairness_max_inflight_per_tenant = 0     # 0 = no per-tenant cap
+config.fairness_ready_window            = 500   # bounded ready jobs/tenant in Redis
+config.fairness_default_weight          = 1.0
+```
+
+### How it's wired (reuses normal Kafka consumers, no Redis on the path)
+
+Execution stays on ordinary `JobConsumer`s — fairness is achieved by controlling the *order* jobs reach them, using only Kafka:
+
+```
+push → ingest topic (keyed one-tenant-per-partition)
+        │
+   Fairness::Dispatcher (Karafka consumer): forwards each job ingest → ready,
+        │   THROTTLED so the ready topic's un-consumed depth stays between
+        │   fairness_ready_lag_low/high (pauses above high, resumes below low)
+        ▼
+   ready topic ── swarm of normal JobConsumers (full speed) → perform → events
+```
+
+Two things make this fair, with no Redis and no extra process:
+
+1. **Kafka's balanced fetch.** A consumer fetches roughly evenly across its assigned partitions, so with ingest keyed one-tenant-per-partition the dispatcher naturally forwards a balanced mix. One active tenant fills the ready topic alone (**100%**); N active split **~1/N**; idle tenants contribute nothing (**work-conserving**).
+2. **A shallow ready topic.** The throttle keeps the ready topic's depth bounded, so a newly active tenant only ever waits behind ~the watermark of queued work — not the whole backlog. That's what keeps fairness *dynamic*.
+
+`draw_routes` wires this automatically when `fairness_enabled` (a `…-dispatch` group on the ingest topic + the `…-jobs` group on the ready topic). The durable backlog stays in the **ingest topic (Kafka)**; the ready topic + existing retry/DLT path keep the usual at-least-once guarantees.
+
+Fairness here is **approximate** ("good enough"): granularity is the fetch batch, and it assumes ~even partition assignment per tenant and similar job sizes. For **strict weighted shares**, `KafkaBatch::Fairness::Scheduler` is available as a standalone Redis-backed virtual-time WFQ engine (`enqueue`/`checkout`/`complete`/`set_weight`/`stats`) you can build a custom dispatcher/worker around.
 
 ---
 

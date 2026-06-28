@@ -46,6 +46,14 @@ KafkaBatch.configure do |config|
   config.retry_delay       = 180 # seconds before each later retry (3 min)
   config.retry_jitter      = 0.1 # +/- 10% to avoid retry storms
 
+  # After this many retries a still-failing job counts toward its batch's
+  # on_complete (counted as failed) so the batch needn't wait for the full retry
+  # budget — the job keeps retrying up to max_retries in the background. Default
+  # 3 == max_retries default, so default behaviour is unchanged; set max_retries
+  # higher (e.g. 20) and this lower (e.g. 3) to cut on_complete latency.
+  # on_success is unaffected (still fires only when every job truly succeeds).
+  config.complete_after_retries = 3
+
   # ── Completion-event emission retries ──────────────────────────────────────
   # Inline retries when producing the post-job completion event fails. The
   # backoff sleeps on the Karafka worker thread, so keep retries * backoff small.
@@ -65,6 +73,25 @@ KafkaBatch.configure do |config|
   # failure in the UI.
   config.failures_ttl           = 24 * 3600  # seconds; metadata retention
   config.max_failures_per_batch = 1000       # 0 = unlimited
+
+  # ── Multi-tenant fairness (hybrid WFQ; requires Redis) ─────────────────────
+  # Share capacity dynamically across tenants: 1 active tenant uses 100%, 2 split
+  # ~50:50, etc. (work-conserving). The backlog stays in Kafka; only a bounded
+  # ready-window per tenant lives in Redis. Tag jobs with a tenant via
+  # Batch.create(tenant_id: "...") / batch.push(Worker, payload, tenant_id: "...").
+  config.fairness_enabled                 = false  # opt-in
+  config.fairness_global_concurrency      = 50     # total in-flight slots (system capacity)
+  config.fairness_max_inflight_per_tenant = 0      # 0 = no per-tenant cap (rely on WFQ)
+  config.fairness_ready_window            = 500    # bounded ready jobs/tenant in Redis
+  config.fairness_default_weight          = 1.0    # per-tenant weight via Scheduler#set_weight
+  # Kafka-ready-topic wiring (jobs → ingest → [dispatcher] → ready → JobConsumer swarm):
+  config.fairness_ingest_topic            = "kafka_batch.ingest"
+  config.fairness_ready_topic             = "kafka_batch.ready"
+  config.fairness_ready_lag_high          = 5000   # dispatcher pauses forwarding above this depth
+  config.fairness_ready_lag_low           = 1000   # ...resumes below this depth
+  # No extra process: the Dispatcher (auto-wired by draw_routes) forwards
+  # ingest→ready directly. fairness_global_concurrency / _ready_window / weights
+  # only apply to the optional standalone Scheduler (strict weighted shares).
 
   # ── Reconciliation ─────────────────────────────────────────────────────────
   # Batches stuck in "running" older than this threshold are re-evaluated.

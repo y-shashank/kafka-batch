@@ -1,18 +1,78 @@
 RSpec.describe KafkaBatch::Consumers::JobConsumer do
   let(:consumer) { build_consumer(described_class) }
 
-  def job_message(worker:, batch_id:, attempt: 0, job_id: "j1", topic: nil, max_retries: nil)
-    FakeMessage.new(
-      topic:   topic || worker.kafka_topic,
-      payload: {
-        "job_id"        => job_id,
-        "batch_id"      => batch_id,
-        "worker_class"  => worker.name,
-        "payload"       => { "x" => 1 },
-        "attempt"       => attempt,
-        "max_retries"   => max_retries || worker.max_retries
-      }
-    )
+  def job_message(worker:, batch_id:, attempt: 0, job_id: "j1", topic: nil, max_retries: nil,
+                  complete_after_retries: nil, batch_counted: false, offset: 0)
+    payload = {
+      "job_id"        => job_id,
+      "batch_id"      => batch_id,
+      "worker_class"  => worker.name,
+      "payload"       => { "x" => 1 },
+      "attempt"       => attempt,
+      "max_retries"   => max_retries || worker.max_retries
+    }
+    payload["complete_after_retries"] = complete_after_retries unless complete_after_retries.nil?
+    payload["batch_counted"]          = batch_counted if batch_counted
+    FakeMessage.new(topic: topic || worker.kafka_topic, offset: offset, payload: payload)
+  end
+
+  def events_for(job_id)
+    FakeProducer.for_topic(KafkaBatch.config.events_topic).select { |m| m.payload["job_id"] == job_id }
+  end
+
+  def retry_for(job_id)
+    FakeProducer.for_topic(KafkaBatch.config.retry_topic).find { |m| m.payload["job_id"] == job_id }
+  end
+
+  describe "early batch completion (complete_after_retries)" do
+    it "counts a still-failing job toward the batch after complete_after_retries, and keeps retrying" do
+      # max_retries 5, threshold 2 → at attempt 2 it counts (failed) but still retries
+      consumer.send(:process_message, job_message(
+        worker: FailingWorker, batch_id: "b1", attempt: 2,
+        max_retries: 5, complete_after_retries: 2, job_id: "je1"
+      ))
+
+      evt = events_for("je1").first
+      expect(evt).not_to be_nil
+      expect(evt.payload["status"]).to eq("failed")  # counted toward batch
+
+      rmsg = retry_for("je1")
+      expect(rmsg).not_to be_nil               # still scheduled to retry
+      expect(rmsg.payload["attempt"]).to eq(3)
+      expect(rmsg.payload["batch_counted"]).to eq(true)
+    end
+
+    it "does not double-count once batch_counted (later retries emit no event)" do
+      consumer.send(:process_message, job_message(
+        worker: FailingWorker, batch_id: "b1", attempt: 3,
+        max_retries: 5, complete_after_retries: 2, batch_counted: true, job_id: "je2"
+      ))
+
+      expect(events_for("je2")).to be_empty           # no second count
+      expect(retry_for("je2")).not_to be_nil          # but keeps retrying
+    end
+
+    it "does not emit the final failed event at exhaustion if already counted" do
+      consumer.send(:process_message, job_message(
+        worker: FailingWorker, batch_id: "b1", attempt: 5,
+        max_retries: 5, complete_after_retries: 2, batch_counted: true, job_id: "je3"
+      ))
+      expect(events_for("je3")).to be_empty           # exhausted, but already counted
+    end
+
+    it "emits no success event for a job already counted that later succeeds" do
+      consumer.send(:process_message, job_message(
+        worker: SuccessfulWorker, batch_id: "b1", attempt: 4, batch_counted: true, job_id: "je4"
+      ))
+      expect(events_for("je4")).to be_empty
+    end
+
+    it "does not early-count when complete_after_retries >= max_retries (default behaviour)" do
+      # FailingWorker: max_retries 2, threshold default 3 → never early; still retrying at attempt 1
+      consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 1, job_id: "je5"))
+      expect(events_for("je5")).to be_empty           # no completion event yet
+      expect(retry_for("je5")).not_to be_nil
+    end
   end
 
   describe "successful job" do

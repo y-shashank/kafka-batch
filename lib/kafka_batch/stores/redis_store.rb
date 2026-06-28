@@ -463,6 +463,22 @@ module KafkaBatch
         result
       end
 
+      def pending_jobs_total
+        ids = with_redis { |r| r.zrange(ALL_INDEX, 0, -1) }
+        return 0 if ids.empty?
+
+        rows = with_redis do |r|
+          r.pipelined do |p|
+            ids.each { |id| p.hmget(batch_key(id), "status", "total_jobs", "completed_count", "failed_count") }
+          end
+        end
+
+        rows.sum do |h|
+          next 0 if h[0].nil? || h[0] != "running"
+          [h[1].to_i - h[2].to_i - h[3].to_i, 0].max
+        end
+      end
+
       def batch_counts
         ids    = with_redis { |r| r.zrange(ALL_INDEX, 0, -1) }
         counts = Hash.new(0)

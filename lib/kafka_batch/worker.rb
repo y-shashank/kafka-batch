@@ -41,6 +41,17 @@ module KafkaBatch
           @max_retries || KafkaBatch.config.max_retries
         end
       end
+
+      # After this many retries a still-failing job counts toward its batch's
+      # on_complete (the job keeps retrying up to max_retries in the background).
+      # Defaults to KafkaBatch.config.complete_after_retries.
+      def complete_after_retries(n = nil)
+        if n
+          @complete_after_retries = n.to_i
+        else
+          @complete_after_retries || KafkaBatch.config.complete_after_retries
+        end
+      end
     end
 
     # Set by JobConsumer before #perform so a running job knows its batch.

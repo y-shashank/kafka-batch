@@ -163,6 +163,13 @@ module KafkaBatch
         raise NotImplementedError, "#{self.class}#list_batches"
       end
 
+      # Total pending jobs across all running batches (sum of
+      # total_jobs - completed_count - failed_count). For the dashboard.
+      # @return [Integer]
+      def pending_jobs_total
+        raise NotImplementedError, "#{self.class}#pending_jobs_total"
+      end
+
       # Count of batches grouped by status, for the UI summary.
       # @return [Hash{String=>Integer}]
       def batch_counts

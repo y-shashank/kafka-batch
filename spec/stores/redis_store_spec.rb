@@ -97,6 +97,18 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
     end
   end
 
+  describe "#pending_jobs_total" do
+    it "sums pending jobs across running batches only" do
+      a = new_batch(total: 10)
+      store.record_completion_by_offset(batch_id: a, source_topic: "t", source_partition: 0, source_offset: 1, status: "success")  # pending 9
+      new_batch(total: 5)  # pending 5
+      done = new_batch(total: 2)
+      store.update_batch_status(done, "success")  # excluded
+
+      expect(store.pending_jobs_total).to eq(14)
+    end
+  end
+
   describe "#record_completions_batch" do
     it "dedups by offset, aggregates per batch, and finalizes once" do
       id = new_batch(total: 2)

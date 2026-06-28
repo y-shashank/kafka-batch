@@ -323,6 +323,12 @@ module KafkaBatch
           .update_all(status: outcome, finished_at: Time.now)
       end
 
+      def pending_jobs_total
+        sum = batch_record_class.where(status: "running")
+                                .sum("total_jobs - completed_count - failed_count")
+        [sum.to_i, 0].max
+      end
+
       def stale_batches(older_than:)
         batch_record_class
           .where(status: "running")

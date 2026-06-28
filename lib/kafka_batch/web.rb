@@ -42,6 +42,8 @@ module KafkaBatch
         html(render_live)
       elsif method == "GET" && path == "/lag"
         html(render_lag)
+      elsif method == "GET" && path == "/fairness"
+        html(render_fairness)
       elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
         batch = KafkaBatch.store.find_batch(m[1])
         batch ? html(render_show(batch)) : not_found
@@ -97,7 +99,7 @@ module KafkaBatch
       has_next = batches.size > PER_PAGE
       batches  = batches.first(PER_PAGE)
 
-      summary = summary_cards(counts)
+      summary = summary_cards(counts, safe_pending_jobs)
       filters = status_filters(status, counts, search)
       rows    = batches.map { |b| batch_row(b) }.join
       empty   = search ? "No batches match “#{h(search)}”." : "No batches found."
@@ -106,7 +108,7 @@ module KafkaBatch
 
       <<~HTML
         #{summary}
-        <div class="toolbar"><a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a> <a class="btn" href="#{lag_path}">▦ Topic lag</a></div>
+        <div class="toolbar"><a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a> <a class="btn" href="#{lag_path}">▦ Topic lag</a>#{KafkaBatch.config.fairness_enabled ? " <a class=\"btn\" href=\"#{fairness_path}\">⚖ Fairness</a>" : ""}</div>
         <div class="filterbar">#{filters}#{search_box(search, status)}</div>
         <div class="card">
           <table>
@@ -325,6 +327,80 @@ module KafkaBatch
       nil
     end
 
+    def render_fairness
+      back = "<p><a class=\"back\" href=\"#{index_path}\">← All batches</a></p>"
+
+      unless KafkaBatch.config.fairness_enabled
+        return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>Multi-tenant fairness is disabled (<code>config.fairness_enabled = false</code>).</p></div>"
+      end
+      unless KafkaBatch::Lag.available?
+        return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>"
+      end
+
+      cfg            = KafkaBatch.config
+      ingest, ready =
+        begin
+          [lag_partitions("#{cfg.consumer_group}-dispatch", cfg.fairness_ingest_topic),
+           lag_partitions("#{cfg.consumer_group}-jobs",     cfg.fairness_ready_topic)]
+        rescue StandardError => e
+          KafkaBatch.logger.warn("[KafkaBatch::Web] fairness lag read failed: #{e.message}")
+          return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>"
+        end
+
+      ingest_total = ingest.sum { |p| p[:lag] }
+      ready_total  = ready.sum { |p| p[:lag] }
+      lanes        = ingest.count { |p| p[:lag].positive? }
+      throttled    = ready_total >= cfg.fairness_ready_lag_high.to_i
+      status_html  = throttled ? "<span class='badge' style='background:#ef4444'>Throttled</span>"
+                               : "<span class='badge' style='background:#10b981'>Flowing</span>"
+
+      ingest_rows = ingest.reject { |p| p[:lag].zero? }.map do |p|
+        "<tr><td>#{p[:partition]}</td><td>#{lag_badge(p[:lag])}</td></tr>"
+      end.join
+      ingest_rows = "<tr><td colspan='2' class='empty'>No un-dispatched jobs — all lanes drained.</td></tr>" if ingest_rows.empty?
+
+      ready_rows = ready.map do |p|
+        "<tr><td>#{p[:partition]}</td><td>#{lag_badge(p[:lag])}</td></tr>"
+      end.join
+      ready_rows = "<tr><td colspan='2' class='empty'>Ready topic empty.</td></tr>" if ready_rows.empty?
+
+      <<~HTML
+        #{back}
+        <div class="metrics">
+          <div class="metric"><div class="metric-value">#{lanes}</div><div class="metric-label">Active lanes (≈ tenants)</div></div>
+          <div class="metric"><div class="metric-value">#{ingest_total}</div><div class="metric-label">Un-dispatched (ingest)</div></div>
+          <div class="metric"><div class="metric-value">#{ready_total}</div><div class="metric-label">In buffer (ready)</div></div>
+          <div class="metric"><div class="metric-value">#{status_html}</div><div class="metric-label">Dispatcher</div></div>
+        </div>
+        <div class="card">
+          <p class="muted">Jobs land on the ingest topic (keyed one-tenant-per-partition), the dispatcher forwards them fairly onto the ready topic, and the JobConsumer swarm drains it. The dispatcher throttles to keep the ready buffer between <code>#{cfg.fairness_ready_lag_low}</code> and <code>#{cfg.fairness_ready_lag_high}</code>. Auto-refreshing every 5s.</p>
+        </div>
+        <div class="card">
+          <h3>Ingest backlog by lane (un-dispatched, ≈ per tenant)</h3>
+          <table>
+            <thead><tr><th>Ingest partition</th><th>Waiting (lag)</th></tr></thead>
+            <tbody>#{ingest_rows}</tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Ready buffer by partition (scheduled, awaiting execution)</h3>
+          <table>
+            <thead><tr><th>Ready partition</th><th>Depth (lag)</th></tr></thead>
+            <tbody>#{ready_rows}</tbody>
+          </table>
+        </div>
+        <script>setTimeout(function(){ location.reload(); }, 5000);</script>
+      HTML
+    end
+
+    # Per-partition lag rows for a (group, topic), sorted by lag desc.
+    def lag_partitions(group, topic)
+      data  = KafkaBatch::Lag.read_group(group, [topic])
+      parts = (data[group] || {})[topic] || {}
+      parts.map { |partition, info| { partition: partition.to_i, lag: [info[:lag].to_i, 0].max } }
+           .sort_by { |p| -p[:lag] }
+    end
+
     # Colour the lag number: grey at 0, amber when backed up.
     def lag_badge(lag)
       n = lag.to_i
@@ -406,12 +482,14 @@ module KafkaBatch
 
     # ── Partials ───────────────────────────────────────────────────────────
 
-    def summary_cards(counts)
+    def summary_cards(counts, pending_jobs = nil)
       total = counts.values.sum
       cards = [["Total", total, "#111827"]]
       %w[running success complete cancelled].each do |s|
         cards << [s.capitalize, counts[s].to_i, STATUS_COLORS[s]]
       end
+      # System-wide backlog: jobs pushed but not yet completed/failed.
+      cards << ["Pending jobs", pending_jobs, STATUS_COLORS["pending"]] unless pending_jobs.nil?
       inner = cards.map do |label, value, color|
         "<div class='metric'><div class='metric-value' style='color:#{color}'>#{value}</div>" \
         "<div class='metric-label'>#{label}</div></div>"
@@ -522,6 +600,13 @@ module KafkaBatch
       {}
     end
 
+    def safe_pending_jobs
+      KafkaBatch.store.pending_jobs_total
+    rescue StandardError => e
+      KafkaBatch.logger.warn("[KafkaBatch::Web] pending_jobs_total failed: #{e.message}")
+      nil
+    end
+
     def short_id(id)
       id.to_s[0, 8]
     end
@@ -540,6 +625,10 @@ module KafkaBatch
 
     def lag_path
       "#{@script_name}/lag"
+    end
+
+    def fairness_path
+      "#{@script_name}/fairness"
     end
 
     def show_path(id)

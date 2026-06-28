@@ -40,12 +40,16 @@ module KafkaBatch
   class Batch
     attr_reader :id
 
-    def initialize(on_success: nil, on_complete: nil, meta: {}, description: nil, id: nil)
+    # @param tenant_id [String, nil] default tenant for jobs pushed into this
+    #   batch (used by the multi-tenant fairness scheduler). Each push can
+    #   override it.
+    def initialize(on_success: nil, on_complete: nil, meta: {}, description: nil, tenant_id: nil, id: nil)
       @id          = id || SecureRandom.uuid
       @on_success  = on_success
       @on_complete = on_complete
       @meta        = meta
       @description = description
+      @tenant_id   = tenant_id
     end
 
     # Create a new batch (persisted immediately with total_jobs = 0).
@@ -56,8 +60,8 @@ module KafkaBatch
     #
     # Without a block: the batch is sealed immediately and will complete as soon
     # as it drains. Returns the Batch for incremental pushing.
-    def self.create(on_success: nil, on_complete: nil, meta: {}, description: nil)
-      batch = new(on_success: on_success, on_complete: on_complete, meta: meta, description: description)
+    def self.create(on_success: nil, on_complete: nil, meta: {}, description: nil, tenant_id: nil)
+      batch = new(on_success: on_success, on_complete: on_complete, meta: meta, description: description, tenant_id: tenant_id)
       KafkaBatch.store.create_batch(
         id:          batch.id,
         total_jobs:  0,
@@ -96,12 +100,12 @@ module KafkaBatch
     # Push a job into this (open) batch: atomically grows total_jobs and produces
     # the job. Raises BatchClosedError if the batch has completed or been
     # cancelled. @return [String] job_id
-    def push(worker_class, payload = {}, job_id: SecureRandom.uuid)
+    def push(worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil)
       validate_worker!(worker_class)
       reserve!(1)
 
       begin
-        produce_job(worker_class, payload, job_id)
+        produce_job(worker_class, payload, job_id, tenant_id || @tenant_id)
       rescue StandardError
         KafkaBatch.store.add_jobs(@id, -1) rescue nil  # roll back the reserved count
         raise
@@ -118,19 +122,20 @@ module KafkaBatch
     #
     # @param payloads [Array<Hash>] one payload per job
     # @return [Array<String>] the job ids, in order
-    def push_many(worker_class, payloads)
+    def push_many(worker_class, payloads, tenant_id: nil)
       validate_worker!(worker_class)
       payloads = payloads.to_a
       return [] if payloads.empty?
 
       reserve!(payloads.size)
 
+      tid      = tenant_id || @tenant_id
       job_ids  = []
       produced = 0
       begin
         payloads.each do |payload|
           job_id = SecureRandom.uuid
-          produce_job(worker_class, payload, job_id)
+          produce_job(worker_class, payload, job_id, tid)
           job_ids << job_id
           produced += 1
         end
@@ -155,14 +160,14 @@ module KafkaBatch
     end
 
     # Enqueue a single job outside of any batch context. @return [String] job_id
-    def self.enqueue(worker_class, payload = {}, job_id: SecureRandom.uuid)
+    def self.enqueue(worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil)
       unless worker_class.is_a?(Class) && worker_class.include?(KafkaBatch::Worker)
         raise ArgumentError, "#{worker_class} must include KafkaBatch::Worker"
       end
 
       message = build_message(
         worker_class: worker_class, payload: payload,
-        job_id: job_id, batch_id: nil, attempt: 0
+        job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id
       )
       KafkaBatch::Producer.produce_sync(
         topic: worker_class.kafka_topic, payload: message, key: job_id
@@ -179,16 +184,19 @@ module KafkaBatch
       )
     end
 
-    def self.build_message(worker_class:, payload:, job_id:, batch_id:, attempt:)
-      {
-        "job_id"        => job_id,
-        "batch_id"      => batch_id,
-        "worker_class"  => worker_class.name,
-        "payload"       => payload,
-        "attempt"       => attempt,
-        "max_retries"   => worker_class.max_retries,
-        "enqueued_at"   => Time.now.iso8601
+    def self.build_message(worker_class:, payload:, job_id:, batch_id:, attempt:, tenant_id: nil)
+      msg = {
+        "job_id"                 => job_id,
+        "batch_id"               => batch_id,
+        "worker_class"           => worker_class.name,
+        "payload"                => payload,
+        "attempt"                => attempt,
+        "max_retries"            => worker_class.max_retries,
+        "complete_after_retries" => worker_class.complete_after_retries,
+        "enqueued_at"            => Time.now.iso8601
       }
+      msg["tenant_id"] = tenant_id if tenant_id
+      msg
     end
 
     private
@@ -224,14 +232,25 @@ module KafkaBatch
       self
     end
 
-    def produce_job(worker_class, payload, job_id)
+    def produce_job(worker_class, payload, job_id, tenant_id = nil)
       message = self.class.build_message(
         worker_class: worker_class, payload: payload,
-        job_id: job_id, batch_id: @id, attempt: 0
+        job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tenant_id
       )
-      KafkaBatch::Producer.produce_sync(
-        topic: worker_class.kafka_topic, payload: message, key: job_id
-      )
+
+      if KafkaBatch.config.fairness_enabled
+        # Land on the ingest topic keyed by tenant (per-tenant ordering); the
+        # Dispatcher fairly schedules from there onto the ready topic.
+        KafkaBatch::Producer.produce_sync(
+          topic:   KafkaBatch.config.fairness_ingest_topic,
+          payload: message,
+          key:     (tenant_id || @id).to_s
+        )
+      else
+        KafkaBatch::Producer.produce_sync(
+          topic: worker_class.kafka_topic, payload: message, key: job_id
+        )
+      end
     end
 
     # Produce the callback message when locking finalizes the batch (mirrors

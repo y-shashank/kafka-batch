@@ -13,6 +13,7 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.retry_first_delay).to eq(10)
       expect(config.retry_delay).to eq(180)
       expect(config.retry_jitter).to eq(0.1)
+      expect(config.complete_after_retries).to eq(3)
     end
 
     it "decouples the reconciler lock TTL from the staleness threshold" do
@@ -29,6 +30,18 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.batch_ttl).to eq(7 * 24 * 3600)
       expect(config.failures_ttl).to eq(24 * 3600)       # shorter than batch_ttl
       expect(config.max_failures_per_batch).to eq(1000)
+    end
+
+    it "ships fairness disabled with sane WFQ defaults" do
+      expect(config.fairness_enabled).to eq(false)
+      expect(config.fairness_global_concurrency).to eq(50)
+      expect(config.fairness_max_inflight_per_tenant).to eq(0)
+      expect(config.fairness_ready_window).to eq(500)
+      expect(config.fairness_default_weight).to eq(1.0)
+      expect(config.fairness_ingest_topic).to eq("kafka_batch.ingest")
+      expect(config.fairness_ready_topic).to eq("kafka_batch.ready")
+      expect(config.fairness_ready_lag_high).to eq(5000)
+      expect(config.fairness_ready_lag_low).to eq(1000)
     end
   end
 

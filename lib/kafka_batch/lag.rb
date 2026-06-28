@@ -63,6 +63,14 @@ module KafkaBatch
       rows.sum { |r| r[:lag] }
     end
 
+    # Read committed lag for a specific consumer group + topics.
+    # @return [Hash] { group => { topic => { partition => { offset:, lag: } } } }
+    def read_group(group, topics)
+      return {} unless available?
+
+      Karafka::Admin.read_lags_with_offsets({ group => topics })
+    end
+
     # @api private
     # Read lags ONLY for this gem's consumer groups (control + jobs), so the
     # dashboard never reports on the host app's unrelated topics. Returns {} if

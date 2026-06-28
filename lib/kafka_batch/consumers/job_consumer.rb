@@ -77,8 +77,12 @@ module KafkaBatch
             return
           end
 
-        attempt       = data["attempt"].to_i
-        max_retries   = data.fetch("max_retries",   KafkaBatch.config.max_retries).to_i
+        attempt        = data["attempt"].to_i
+        max_retries    = data.fetch("max_retries", KafkaBatch.config.max_retries).to_i
+        complete_after = data.fetch("complete_after_retries", KafkaBatch.config.complete_after_retries).to_i
+        # Whether this job has already been counted toward its batch early (rides
+        # the retry message so a job is counted at most once).
+        batch_counted  = data["batch_counted"] ? true : false
 
         KafkaBatch.logger.debug(
           "[KafkaBatch][JobConsumer] #{worker_class}#perform " \
@@ -116,14 +120,16 @@ module KafkaBatch
             worker.perform(payload)
           rescue StandardError => e
             handle_failure(
-              message:      message,
-              data:         data,
-              error:        e,
-              job_id:       job_id,
-              batch_id:     batch_id,
-              worker_class: worker_class,
-              attempt:      attempt,
-              max_retries:  max_retries
+              message:                message,
+              data:                   data,
+              error:                  e,
+              job_id:                 job_id,
+              batch_id:               batch_id,
+              worker_class:           worker_class,
+              attempt:                attempt,
+              max_retries:            max_retries,
+              complete_after_retries: complete_after,
+              batch_counted:          batch_counted
             )
             return  # offset committed inside handle_failure
           end
@@ -137,13 +143,19 @@ module KafkaBatch
           # failure.  We retry emission a few times; if it keeps failing we
           # raise so the offset is NOT committed → Karafka redelivers the
           # message → worker runs again (idempotency required) → tries again.
-          emit_event_with_retry(
-            batch_id:     batch_id,
-            job_id:       job_id,
-            status:       "success",
-            worker_class: worker_class,
-            message:      message
-          )
+          #
+          # If the job was already counted toward the batch early (after
+          # complete_after_retries), skip the success event so it isn't counted
+          # twice — the batch already advanced. The work still ran.
+          unless batch_counted
+            emit_event_with_retry(
+              batch_id:     batch_id,
+              job_id:       job_id,
+              status:       "success",
+              worker_class: worker_class,
+              message:      message
+            )
+          end
 
           duration = Time.now - started_at
           KafkaBatch::Instrumentation.job_processed(
@@ -162,7 +174,8 @@ module KafkaBatch
       # ── Failure handling ─────────────────────────────────────────────────
 
       def handle_failure(message:, data:, error:, job_id:, batch_id:,
-                         worker_class:, attempt:, max_retries:)
+                         worker_class:, attempt:, max_retries:,
+                         complete_after_retries:, batch_counted:)
         KafkaBatch.logger.error(
           "[KafkaBatch][JobConsumer] job_id=#{job_id} attempt=#{attempt} " \
           "#{error.class}: #{error.message}"
@@ -183,26 +196,48 @@ module KafkaBatch
           record_failure(batch_id, job_id, worker_class, error,
                          attempt: attempt, status: "retrying", next_retry_at: retry_after)
 
+          # Early batch completion: once a still-failing job has retried
+          # complete_after_retries times, count it toward the batch (as failed)
+          # so on_complete needn't wait for the full retry budget. It keeps
+          # retrying; the batch_counted flag rides the retry message so it is
+          # counted exactly once.
+          if batch_id && !batch_counted && attempt >= complete_after_retries
+            emit_event_with_retry(
+              batch_id:     batch_id,
+              job_id:       job_id,
+              status:       "failed",
+              worker_class: worker_class,
+              message:      message
+            )
+            batch_counted = true
+            KafkaBatch.logger.info(
+              "[KafkaBatch][JobConsumer] job_id=#{job_id} counted toward batch after " \
+              "#{attempt} retries (still retrying up to #{max_retries})"
+            )
+          end
+
           schedule_retry(
-            message:      message,
-            data:         data,
-            job_id:       job_id,
-            next_attempt: next_attempt,
-            retry_after:  retry_after,
-            worker_class: worker_class,
-            batch_id:     batch_id
+            message:       message,
+            data:          data,
+            job_id:        job_id,
+            next_attempt:  next_attempt,
+            retry_after:   retry_after,
+            worker_class:  worker_class,
+            batch_id:      batch_id,
+            batch_counted: batch_counted
           )
         else
           record_failure(batch_id, job_id, worker_class, error,
                          attempt: attempt, status: "failed", next_retry_at: nil)
           exhaust_job(
-            message:      message,
-            data:         data,
-            job_id:       job_id,
-            batch_id:     batch_id,
-            worker_class: worker_class,
-            error:        error,
-            attempt:      attempt
+            message:       message,
+            data:          data,
+            job_id:        job_id,
+            batch_id:      batch_id,
+            worker_class:  worker_class,
+            error:         error,
+            attempt:       attempt,
+            batch_counted: batch_counted
           )
         end
       end
@@ -211,7 +246,7 @@ module KafkaBatch
       # The RetryConsumer uses Karafka pause to wait until retry_after, then
       # re-enqueues back to the original topic – zero blocking here.
       def schedule_retry(message:, data:, job_id:, next_attempt:, retry_after:,
-                         worker_class: nil, batch_id: nil)
+                         worker_class: nil, batch_id: nil, batch_counted: false)
         KafkaBatch.logger.info(
           "[KafkaBatch][JobConsumer] Scheduling retry for job_id=#{job_id} " \
           "attempt=#{next_attempt} at #{retry_after.iso8601}"
@@ -220,9 +255,10 @@ module KafkaBatch
         KafkaBatch::Producer.produce_sync(
           topic:   KafkaBatch.config.retry_topic,
           payload: data.merge(
-            "attempt"      => next_attempt,
-            "retry_after"  => retry_after.iso8601,
-            "retry_to"     => message.topic
+            "attempt"       => next_attempt,
+            "retry_after"   => retry_after.iso8601,
+            "retry_to"      => message.topic,
+            "batch_counted" => batch_counted
           ),
           key: job_id
         )
@@ -241,18 +277,22 @@ module KafkaBatch
 
       # Job has exhausted all retries.  Emit a failure event (so the batch
       # counter is updated) and forward the raw message to the DLT.
-      def exhaust_job(message:, data:, job_id:, batch_id:, worker_class:, error:, attempt: nil)
+      def exhaust_job(message:, data:, job_id:, batch_id:, worker_class:, error:, attempt: nil, batch_counted: false)
         KafkaBatch.logger.error(
           "[KafkaBatch][JobConsumer] job_id=#{job_id} exhausted retries – failing"
         )
 
-        emit_event_with_retry(
-          batch_id:     batch_id,
-          job_id:       job_id,
-          status:       "failed",
-          worker_class: worker_class,
-          message:      message
-        )
+        # Skip the batch event if the job was already counted early
+        # (complete_after_retries < max_retries) — it's already in the tally.
+        unless batch_counted
+          emit_event_with_retry(
+            batch_id:     batch_id,
+            job_id:       job_id,
+            status:       "failed",
+            worker_class: worker_class,
+            message:      message
+          )
+        end
 
         KafkaBatch::Instrumentation.job_failed(
           job_id:       job_id,

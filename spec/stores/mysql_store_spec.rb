@@ -92,6 +92,21 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     end
   end
 
+  describe "#pending_jobs_total" do
+    it "sums pending jobs across running batches only" do
+      a = SecureRandom.uuid
+      store.create_batch(id: a, total_jobs: 10)
+      store.record_completion_by_offset(batch_id: a, source_topic: "t", source_partition: 0, source_offset: 1, status: "success")  # pending 9
+      b = SecureRandom.uuid
+      store.create_batch(id: b, total_jobs: 5)  # pending 5
+      done = SecureRandom.uuid
+      store.create_batch(id: done, total_jobs: 2)
+      store.update_batch_status(done, "success")  # excluded (not running)
+
+      expect(store.pending_jobs_total).to eq(14)
+    end
+  end
+
   describe "#record_completions_batch" do
     it "dedups by offset, aggregates per batch, and finalizes once" do
       id = SecureRandom.uuid

@@ -13,6 +13,8 @@ require_relative "kafka_batch/producer"
 require_relative "kafka_batch/cancellation_cache"
 require_relative "kafka_batch/liveness"
 require_relative "kafka_batch/lag"
+require_relative "kafka_batch/fairness/scheduler"
+require_relative "kafka_batch/fairness/dispatcher"
 require_relative "kafka_batch/worker"
 require_relative "kafka_batch/batch"
 require_relative "kafka_batch/reconciler"
@@ -69,6 +71,14 @@ module KafkaBatch
       end
     end
 
+    # ── Fairness scheduler (multi-tenant WFQ) ───────────────────────────────
+
+    # Shared Redis-backed WFQ scheduler used by the fairness dispatcher/forwarder.
+    # @return [Fairness::Scheduler]
+    def fairness_scheduler
+      @fairness_scheduler ||= Fairness::Scheduler.new
+    end
+
     # ── Worker registry ────────────────────────────────────────────────────
 
     # Called automatically when a class includes KafkaBatch::Worker.
@@ -113,6 +123,8 @@ module KafkaBatch
       # Karafka's routing DSL methods (consumer_group/topic/consumer) are private
       # and only resolve with implicit self, so define routes inside the builder
       # via instance_eval. Locals (cfg/workers) remain available via closure.
+      fairness = cfg.fairness_enabled
+
       builder.instance_eval do
         consumer_group "#{cfg.consumer_group}-control" do
           topic(cfg.events_topic)    { consumer KafkaBatch::Consumers::EventConsumer }
@@ -120,7 +132,17 @@ module KafkaBatch
           topic(cfg.retry_topic)     { consumer KafkaBatch::Consumers::RetryConsumer }
         end
 
-        unless workers.empty?
+        if fairness
+          # Fairness mode: jobs land on the ingest topic; the Dispatcher forwards
+          # them (throttled) onto the ready topic, which the JobConsumer swarm
+          # drains. No Redis or extra process on the path.
+          consumer_group "#{cfg.consumer_group}-dispatch" do
+            topic(cfg.fairness_ingest_topic) { consumer KafkaBatch::Fairness::Dispatcher }
+          end
+          consumer_group "#{cfg.consumer_group}-jobs" do
+            topic(cfg.fairness_ready_topic) { consumer KafkaBatch::Consumers::JobConsumer }
+          end
+        elsif !workers.empty?
           consumer_group "#{cfg.consumer_group}-jobs" do
             workers.each do |worker_class|
               topic(worker_class.kafka_topic) { consumer KafkaBatch::Consumers::JobConsumer }
@@ -179,11 +201,13 @@ module KafkaBatch
     # ── Reset (for tests) ─────────────────────────────────────────────────
 
     def reset!
-      @configuration = nil
-      @store         = nil
-      @workers       = []
-      @store_mutex   = nil
-      @workers_mutex = nil
+      @configuration      = nil
+      @store              = nil
+      @workers            = []
+      @store_mutex        = nil
+      @workers_mutex      = nil
+      @fairness_scheduler = nil
+      @node_id            = nil
       Producer.reset!
       CancellationCache.reset!
       Liveness.reset!

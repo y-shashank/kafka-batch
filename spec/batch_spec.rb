@@ -138,6 +138,28 @@ RSpec.describe KafkaBatch::Batch do
     end
   end
 
+  describe "fairness routing" do
+    it "routes pushes to the ingest topic keyed by tenant when fairness is enabled" do
+      KafkaBatch.config.fairness_enabled = true
+      batch = described_class.create(tenant_id: "acme")
+      batch.push(SuccessfulWorker, { "x" => 1 })
+
+      ingest = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic)
+      expect(ingest.size).to eq(1)
+      expect(ingest.first.key).to eq("acme")
+      expect(ingest.first.payload["tenant_id"]).to eq("acme")
+      expect(FakeProducer.for_topic("test.success")).to be_empty  # not the worker topic
+    end
+
+    it "produces to the worker topic (not ingest) when fairness is disabled" do
+      batch = described_class.create
+      batch.push(SuccessfulWorker, { "x" => 1 })
+
+      expect(FakeProducer.for_topic("test.success").size).to eq(1)
+      expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic)).to be_empty
+    end
+  end
+
   describe ".enqueue" do
     it "produces a single standalone job with a nil batch_id" do
       job_id = described_class.enqueue(SuccessfulWorker, { "user_id" => 7 })
