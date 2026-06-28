@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write  # the badge job force-pushes coverage.json to the `badges` branch
+
+jobs:
+  test:
+    name: Test (Ruby ${{ matrix.ruby }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.2", "3.3"]
+
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      COVERAGE: "1"  # enable SimpleCov in spec_helper
+      KAFKA_BATCH_TEST_REDIS_URL: redis://localhost:6379/15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+
+      - name: Run tests
+        run: bundle exec rspec
+
+      - name: Read coverage %
+        id: cov
+        run: |
+          pct=$(ruby -rjson -e 'r=JSON.parse(File.read("coverage/.last_run.json"))["result"]; puts ((r["line"]||r["covered_percent"]).to_f.round(1))')
+          echo "pct=$pct" >> "$GITHUB_OUTPUT"
+          echo "Line coverage: ${pct}%"
+
+      # Publish a shields.io endpoint badge to an orphan `badges` branch.
+      # Runs once (single Ruby) and only on pushes to main, never on PRs/forks.
+      - name: Publish coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.ruby == '3.3'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PCT: ${{ steps.cov.outputs.pct }}
+        run: |
+          int=${PCT%.*}
+          if   [ "$int" -ge 90 ]; then color=brightgreen
+          elif [ "$int" -ge 80 ]; then color=green
+          elif [ "$int" -ge 70 ]; then color=yellowgreen
+          elif [ "$int" -ge 60 ]; then color=yellow
+          elif [ "$int" -ge 50 ]; then color=orange
+          else color=red
+          fi
+          tmp="$(mktemp -d)"
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$color" > "$tmp/coverage.json"
+          cd "$tmp"
+          git init -q
+          git checkout -q -b badges
+          git add coverage.json
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "ci: update coverage badge (${PCT}%)"
+          git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
