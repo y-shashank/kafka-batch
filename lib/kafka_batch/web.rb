@@ -86,6 +86,14 @@ module KafkaBatch
       [302, { "location" => index_path, "cache-control" => "no-store", "content-type" => "text/html" }, []]
     end
 
+    # Full-page auto-reload used by the always-live pages (/live, /lag, /fairness).
+    # Each response is a fresh server render (cache-control: no-store), so a reload
+    # simply shows current data. Included on their transient "unavailable" states
+    # too, so those pages self-recover once the backend comes back.
+    def auto_reload_script
+      '<script>setTimeout(function(){ location.reload(); }, 5000);</script>'
+    end
+
     # ── Pages ──────────────────────────────────────────────────────────────
 
     def render_index(params)
@@ -108,7 +116,7 @@ module KafkaBatch
 
       <<~HTML
         #{summary}
-        <div class="toolbar"><a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a> <a class="btn" href="#{lag_path}">▦ Topic lag</a>#{KafkaBatch.config.fairness_enabled ? " <a class=\"btn\" href=\"#{fairness_path}\">⚖ Fairness</a>" : ""}</div>
+        <div class="toolbar"><button id="kb-live-toggle" type="button" class="btn">○ Live</button> <a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a> <a class="btn" href="#{lag_path}">▦ Topic lag</a>#{KafkaBatch.config.fairness_enabled ? " <a class=\"btn\" href=\"#{fairness_path}\">⚖ Fairness</a>" : ""}</div>
         <div class="filterbar">#{filters}#{search_box(search, status)}</div>
         <div class="card">
           <table>
@@ -122,6 +130,46 @@ module KafkaBatch
           </table>
         </div>
         #{pager}
+        #{live_toggle_script}
+      HTML
+    end
+
+    # Client-side "Live" toggle for the batch-list page: when on, reloads the
+    # page every 5s (full server render, so all counters refresh). The choice is
+    # persisted in localStorage so it survives the reloads and navigation, and a
+    # small countdown is shown on the button. Reload keeps the current URL, so
+    # the active filter / search / page are preserved.
+    def live_toggle_script
+      <<~'HTML'
+        <script>
+        (function () {
+          var KEY = "kafka_batch_live";
+          var INTERVAL = 5;
+          var btn = document.getElementById("kb-live-toggle");
+          if (!btn) return;
+          var timer = null, secs = INTERVAL;
+          function isOn() { return localStorage.getItem(KEY) === "1"; }
+          function paint() {
+            if (isOn()) { btn.textContent = "● Live: " + secs + "s"; btn.classList.add("live-on"); }
+            else { btn.textContent = "○ Live"; btn.classList.remove("live-on"); }
+          }
+          function stop() { if (timer) { clearInterval(timer); timer = null; } }
+          function start() {
+            stop(); secs = INTERVAL; paint();
+            timer = setInterval(function () {
+              secs -= 1;
+              if (secs <= 0) { location.reload(); return; }
+              paint();
+            }, 1000);
+          }
+          btn.addEventListener("click", function () {
+            if (isOn()) { localStorage.setItem(KEY, "0"); stop(); paint(); }
+            else { localStorage.setItem(KEY, "1"); start(); }
+          });
+          paint();
+          if (isOn()) start();
+        })();
+        </script>
       HTML
     end
 
@@ -189,6 +237,7 @@ module KafkaBatch
             <h2>Live activity</h2>
             <p class="muted">#{msg}</p>
           </div>
+          #{auto_reload_script}
         HTML
       end
 
@@ -230,7 +279,7 @@ module KafkaBatch
             <tbody>#{job_rows}</tbody>
           </table>
         </div>
-        <script>setTimeout(function(){ location.reload(); }, 5000);</script>
+        #{auto_reload_script}
       HTML
     end
 
@@ -242,6 +291,7 @@ module KafkaBatch
             <h2>Topic lag</h2>
             <p class="muted">Lag requires Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p>
           </div>
+          #{auto_reload_script}
         HTML
       end
 
@@ -255,6 +305,7 @@ module KafkaBatch
             <h2>Topic lag</h2>
             <p class="muted">Could not read lag from Kafka: <code>#{h(e.message)}</code></p>
           </div>
+          #{auto_reload_script}
         HTML
       end
 
@@ -298,7 +349,7 @@ module KafkaBatch
             <tbody>#{part_rows}</tbody>
           </table>
         </div>
-        <script>setTimeout(function(){ location.reload(); }, 5000);</script>
+        #{auto_reload_script}
       HTML
     end
 
@@ -353,7 +404,7 @@ module KafkaBatch
         return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>Multi-tenant fairness is disabled (<code>config.fairness_enabled = false</code>).</p></div>"
       end
       unless KafkaBatch::Lag.available?
-        return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>"
+        return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>#{auto_reload_script}"
       end
 
       cfg            = KafkaBatch.config
@@ -363,7 +414,7 @@ module KafkaBatch
            lag_partitions("#{cfg.consumer_group}-jobs",     cfg.fairness_ready_topic)]
         rescue StandardError => e
           KafkaBatch.logger.warn("[KafkaBatch::Web] fairness lag read failed: #{e.message}")
-          return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>"
+          return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>#{auto_reload_script}"
         end
 
       ingest_total = ingest.sum { |p| p[:lag] }
@@ -408,7 +459,7 @@ module KafkaBatch
             <tbody>#{ready_rows}</tbody>
           </table>
         </div>
-        <script>setTimeout(function(){ location.reload(); }, 5000);</script>
+        #{auto_reload_script}
       HTML
     end
 
@@ -765,6 +816,7 @@ module KafkaBatch
              color: #374151; padding: 5px 12px; border-radius: 7px; font-size: 13px; cursor: pointer; }
       .btn.warn { border-color: #f59e0b; color: #b45309; }
       .btn.danger-btn { border-color: #ef4444; color: #b91c1c; }
+      .btn.live-on { border-color: #10b981; background: #10b981; color: #fff; }
       .actions { white-space: nowrap; }
       td.danger { color: #b91c1c; font-weight: 600; }
       .pager { display: flex; gap: 12px; align-items: center; justify-content: center; margin: 8px 0 24px; }

@@ -51,6 +51,13 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("Pending")
     end
 
+    it "has a Live toggle (localStorage-persisted 5s auto-reload)" do
+      html = get("/").last.join
+      expect(html).to include('id="kb-live-toggle"')
+      expect(html).to include("kafka_batch_live")  # localStorage key
+      expect(html).to include("location.reload()")
+    end
+
     it "shows the batch description on the list and detail pages" do
       id = seed(description: "Important nightly batch")
       expect(get("/").last.join).to include("Important nightly batch")
@@ -159,6 +166,10 @@ RSpec.describe KafkaBatch::Web do
   end
 
   describe "GET /failures (all batches)" do
+    it "does not include the Live toggle (failures page has no live mode)" do
+      expect(get("/failures").last.join).not_to include("kb-live-toggle")
+    end
+
     it "lists failures across batches and the dashboard links to it" do
       a = seed(total: 1)
       b = seed(total: 1)
@@ -236,6 +247,14 @@ RSpec.describe KafkaBatch::Web do
       allow(KafkaBatch::Liveness).to receive(:available?).and_return(false)
       html = get("/live").last.join
       expect(html).to include("requires Redis")
+    end
+
+    it "/live, /lag and /fairness auto-reload every 5s" do
+      KafkaBatch.config.fairness_enabled = true
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(false)
+      %w[/live /lag /fairness].each do |path|
+        expect(get(path).last.join).to include("setTimeout(function(){ location.reload(); }, 5000)")
+      end
     end
   end
 
