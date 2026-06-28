@@ -197,17 +197,13 @@ module KafkaBatch
     end
 
     # Number of partitions on the fairness ingest topic, or nil if it can't be
-    # determined (cluster unreachable / topic missing / no introspection).
+    # determined (Karafka::Admin unavailable / cluster unreachable / topic missing).
     def fairness_ingest_partition_count
-      producer  = KafkaBatch::Producer.instance
-      rd_handle = producer.respond_to?(:client) ? producer.client : nil
-      return nil unless rd_handle.respond_to?(:metadata)
+      return nil unless defined?(Karafka) && defined?(Karafka::Admin)
 
-      topic = rd_handle.metadata(true, config.fairness_ingest_topic, 5000)
-                       .topics.find { |t| t.topic == config.fairness_ingest_topic }
-      return nil if topic.nil?
-
-      topic.respond_to?(:partition_count) ? topic.partition_count : topic.partitions.size
+      topic = Karafka::Admin.cluster_info.topics
+                            .find { |t| t[:topic_name] == config.fairness_ingest_topic }
+      topic && topic[:partition_count]
     rescue => e
       logger.warn("[KafkaBatch] could not read partition count for '#{config.fairness_ingest_topic}': #{e.message}")
       nil
