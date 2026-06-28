@@ -105,6 +105,8 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
    └──────────────────────────┘
 ```
 
+> **Multi-tenant fairness mode** (opt-in) inserts a stage before `JobConsumer`: `Batch.push` writes to a per-tenant **ingest** topic, a `Fairness::Dispatcher` fairly forwards onto a throttled **ready** topic, and the `JobConsumer` swarm drains *that*. Everything downstream (events/callbacks/retry/DLT) is identical. See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
+
 ---
 
 ## Installation
@@ -167,6 +169,9 @@ KafkaBatch.configure do |config|
   config.callbacks_topic   = "kafka_batch.callbacks"
   config.retry_topic       = "kafka_batch.jobs.retry"   # dedicated retry topic
   config.dead_letter_topic = "kafka_batch.dead_letter"
+  # Multi-tenant fairness topics (only used when config.fairness_enabled = true):
+  config.fairness_ingest_topic = "kafka_batch.ingest"   # per-tenant intake (durable backlog)
+  config.fairness_ready_topic  = "kafka_batch.ready"    # throttled execution queue
 
   # ── Consumer group ──────────────────────────────────────────────────
   config.consumer_group = "kafka-batch"
@@ -926,17 +931,23 @@ Callbacks are **at-least-once**: the `CallbackConsumer` invokes the callback, th
 8.  CallbackConsumer → callback class   INVOKE on_success / on_complete, then CLAIM
 ```
 
+**In fairness mode**, step 2 changes to: `Batch.push → Kafka ingest topic` (keyed by `tenant_id`), then `Fairness::Dispatcher → Kafka ready topic` (fairly ordered + throttled), and the `JobConsumer` swarm consumes the **ready** topic. Steps 3–8 are otherwise unchanged.
+
 ---
 
 ## Topic reference
 
 | Topic (default name) | Produced by | Consumed by | Purpose |
 |---|---|---|---|
-| `kafka_batch.jobs` (per worker) | `Batch.create` / `Batch.enqueue` | `JobConsumer` | Individual job messages |
+| `kafka_batch.jobs` (per worker) | `Batch.create` / `Batch.enqueue` | `JobConsumer` | Individual job messages (non-fairness mode) |
 | `kafka_batch.jobs.retry` | `JobConsumer` | `RetryConsumer` | Failed jobs awaiting backoff |
 | `kafka_batch.events` | `JobConsumer` | `EventConsumer` | Job completion signals |
 | `kafka_batch.callbacks` | `EventConsumer` / `Reconciler` | `CallbackConsumer` | Batch-complete triggers |
 | `kafka_batch.dead_letter` | `JobConsumer` / `CallbackConsumer` / `RetryConsumer` | Your consumer | Exhausted jobs + unresolvable callbacks |
+| `kafka_batch.ingest` *(fairness only)* | `Batch.push` (keyed by `tenant_id`) | `Fairness::Dispatcher` | Per-tenant intake queue (durable backlog) |
+| `kafka_batch.ready` *(fairness only)* | `Fairness::Dispatcher` | `JobConsumer` swarm | Fairly-ordered, throttled execution queue |
+
+In **fairness mode** (`config.fairness_enabled = true`), jobs flow `ingest → ready → JobConsumer` instead of straight to the per-worker topic. The `ingest` topic holds the durable backlog (key it one-tenant-per-partition), and the `ready` topic is the shallow, throttled queue the worker swarm drains. See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
 
 ---
 
