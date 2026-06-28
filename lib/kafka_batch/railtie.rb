@@ -38,6 +38,17 @@ module KafkaBatch
     # cleanly inside the Karafka lifecycle rather than relying on at_exit.
     config.after_initialize do
       if defined?(Karafka::App)
+        # When the consumer process starts, warn if the fairness ingest topic has
+        # too few partitions (best-effort; strict raising is handled by
+        # validate_topics! at boot when config.validate_topics_on_boot = true).
+        Karafka::App.monitor.subscribe("app.running") do
+          begin
+            KafkaBatch.validate_fairness_partitions!(strict: false)
+          rescue => e
+            KafkaBatch.logger.warn("[KafkaBatch] fairness partition check skipped: #{e.message}")
+          end
+        end
+
         Karafka::App.monitor.subscribe("app.stopped") do
           KafkaBatch::Producer.reset!
         end

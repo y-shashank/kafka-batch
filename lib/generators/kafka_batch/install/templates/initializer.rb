@@ -86,6 +86,11 @@ KafkaBatch.configure do |config|
   config.fairness_ready_topic    = "kafka_batch.ready"   # throttled execution queue
   config.fairness_ready_lag_high = 5000   # dispatcher pauses forwarding above this depth
   config.fairness_ready_lag_low  = 1000   # ...resumes below this depth
+  # Tenants are hashed to ingest partitions, so the ingest topic needs enough
+  # partitions (≈ max concurrent tenants) or tenants collide and fairness
+  # degrades. You MUST pre-create the topic with enough partitions; this boot
+  # check warns (raises under validate_topics_on_boot) if it has fewer:
+  config.fairness_min_ingest_partitions = 2
 
   # The settings below apply ONLY to the optional Redis-backed
   # KafkaBatch::Fairness::Scheduler (strict weighted shares) — NOT the default

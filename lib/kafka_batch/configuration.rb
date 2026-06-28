@@ -113,6 +113,13 @@ module KafkaBatch
     attr_accessor :fairness_ready_lag_high # Integer – pause forwarding above this; default 5000
     attr_accessor :fairness_ready_lag_low  # Integer – resume forwarding below this; default 1000
 
+    # Tenants are spread across the ingest topic's partitions by key hash
+    # (key = tenant_id). With too few partitions tenants collide onto the same
+    # partition and fairness degrades (1 partition = none at all). The boot check
+    # warns (or raises under validate_topics_on_boot) if the ingest topic has
+    # fewer partitions than this. Set it near your max concurrent tenant count.
+    attr_accessor :fairness_min_ingest_partitions # Integer – default 2
+
     # ── Reconciliation ───────────────────────────────────────────────────────
     # A periodic sweep that re-checks "running" batches that look stuck.
     attr_accessor :reconciliation_interval  # Integer – seconds; default 300
@@ -174,6 +181,7 @@ module KafkaBatch
       @fairness_ready_topic             = "kafka_batch.ready"
       @fairness_ready_lag_high          = 5000
       @fairness_ready_lag_low           = 1000
+      @fairness_min_ingest_partitions   = 2
       @reconciliation_interval  = 300
       @reconciler_lock_ttl      = 600
       @producer_config          = {}

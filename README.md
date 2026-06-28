@@ -279,6 +279,7 @@ Every option on `KafkaBatch.config`:
 | `fairness_ready_topic` | String | `"kafka_batch.ready"` | Throttled execution topic (fairness) |
 | `fairness_ready_lag_high` | Integer | `5000` | Dispatcher pauses forwarding above this ready-topic depth |
 | `fairness_ready_lag_low` | Integer | `1000` | Dispatcher resumes forwarding below this depth |
+| `fairness_min_ingest_partitions` | Integer | `2` | Boot check warns (raises under `validate_topics_on_boot`) if the ingest topic has fewer partitions; set near max concurrent tenants |
 | `fairness_global_concurrency` | Integer | `50` | **Optional `Scheduler` only** — total in-flight slots |
 | `fairness_max_inflight_per_tenant` | Integer | `0` | **Optional `Scheduler` only** — per-tenant cap (`0` = none) |
 | `fairness_ready_window` | Integer | `500` | **Optional `Scheduler` only** — bounded ready jobs/tenant in Redis |
@@ -747,6 +748,27 @@ Two things make this fair, with no Redis and no extra process:
 `draw_routes` wires this automatically when `fairness_enabled` (a `…-dispatch` group on the ingest topic + the `…-jobs` group on the ready topic). The durable backlog stays in the **ingest topic (Kafka)**; the ready topic + existing retry/DLT path keep the usual at-least-once guarantees.
 
 Fairness here is **approximate** ("good enough"): granularity is the fetch batch, and it assumes ~even partition assignment per tenant and similar job sizes. For **strict weighted shares**, `KafkaBatch::Fairness::Scheduler` is available as a standalone Redis-backed virtual-time WFQ engine (`enqueue`/`checkout`/`complete`/`set_weight`/`stats`) you can build a custom dispatcher/worker around.
+
+### Partitioning & topic sizing (important)
+
+Tenants are mapped to ingest partitions by **Kafka's key-hash partitioner** — the gem sets the message key to `tenant_id`, and the producer/consumer discover the partition count automatically. Consequences:
+
+- A given tenant **always lands on the same partition** (consistent hashing); tenants spread across partitions by hash.
+- It is **hash-based, not a guaranteed 1-tenant-per-partition mapping.** When you have more tenants than partitions (or on hash collisions), **multiple tenants share a partition** and FIFO-contend with each other — fairness *between those tenants* degrades. So size the ingest topic with **partitions ≈ your max concurrent tenant count** (with headroom). A single-partition topic gives **no fairness at all**.
+- **You must pre-create the ingest topic with enough partitions.** The gem does **not** create topics or set partition counts. Relying on Kafka auto-create yields the broker default (often 1 partition).
+
+  ```bash
+  kafka-topics --create --topic <prefix>kafka_batch.ingest --partitions 512 --replication-factor 3
+  kafka-topics --create --topic <prefix>kafka_batch.ready  --partitions 64  --replication-factor 3
+  ```
+
+**Boot safety check:** when `fairness_enabled`, KafkaBatch checks the ingest topic's partition count at consumer startup and **warns** if it's below `config.fairness_min_ingest_partitions` (default `2`; a single partition is always flagged). Under `config.validate_topics_on_boot = true` it **raises** instead. Set `fairness_min_ingest_partitions` near your expected concurrent-tenant count to enforce proper sizing:
+
+```ruby
+config.fairness_min_ingest_partitions = 128   # warn/raise if the ingest topic has fewer
+```
+
+> For **strict** 1:1 tenant→partition isolation you'd supply a custom WaterDrop partitioner mapping `tenant_id → a dedicated partition`; the gem ships only the standard key-hash partitioning.
 
 ---
 

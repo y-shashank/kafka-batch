@@ -192,6 +192,49 @@ module KafkaBatch
       end
 
       logger.info("[KafkaBatch] All #{required.size} required topics verified.")
+
+      validate_fairness_partitions!(strict: true)
+    end
+
+    # Number of partitions on the fairness ingest topic, or nil if it can't be
+    # determined (cluster unreachable / topic missing / no introspection).
+    def fairness_ingest_partition_count
+      producer  = KafkaBatch::Producer.instance
+      rd_handle = producer.respond_to?(:client) ? producer.client : nil
+      return nil unless rd_handle.respond_to?(:metadata)
+
+      topic = rd_handle.metadata(true, config.fairness_ingest_topic, 5000)
+                       .topics.find { |t| t.topic == config.fairness_ingest_topic }
+      return nil if topic.nil?
+
+      topic.respond_to?(:partition_count) ? topic.partition_count : topic.partitions.size
+    rescue => e
+      logger.warn("[KafkaBatch] could not read partition count for '#{config.fairness_ingest_topic}': #{e.message}")
+      nil
+    end
+
+    # Warn (or raise, when strict) if the fairness ingest topic has too few
+    # partitions. Tenants are spread across partitions by key hash, so too few
+    # means tenants collide onto one partition and fairness degrades — a single
+    # partition gives no fairness at all. No-op unless fairness is enabled.
+    # @param strict [Boolean] raise ConfigurationError instead of warning
+    def validate_fairness_partitions!(strict: config.validate_topics_on_boot)
+      return unless config.fairness_enabled
+
+      count = fairness_ingest_partition_count
+      return if count.nil?  # couldn't determine — don't false-alarm
+
+      min = [config.fairness_min_ingest_partitions.to_i, 2].max
+      return if count >= min
+
+      msg = "[KafkaBatch] fairness_enabled but ingest topic '#{config.fairness_ingest_topic}' has " \
+            "#{count} partition(s) (recommended >= #{min}). Tenants are hashed to partitions, so too " \
+            "few means tenants share a partition (1 = no fairness at all). Recreate the topic with more " \
+            "partitions (≈ your max concurrent tenant count)."
+
+      raise ConfigurationError, msg if strict
+
+      logger.warn(msg)
     end
 
     # ── Logging ────────────────────────────────────────────────────────────

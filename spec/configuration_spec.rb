@@ -42,6 +42,7 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.fairness_ready_topic).to eq("kafka_batch.ready")
       expect(config.fairness_ready_lag_high).to eq(5000)
       expect(config.fairness_ready_lag_low).to eq(1000)
+      expect(config.fairness_min_ingest_partitions).to eq(2)
     end
   end
 
