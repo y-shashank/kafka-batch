@@ -134,10 +134,20 @@ RSpec.describe KafkaBatch::Web do
   end
 
   describe "GET /fairness" do
-    it "says fairness is off when no worker opts in" do
+    it "shows an inactive notice but still renders lag when no worker opts in" do
       allow(KafkaBatch).to receive(:fairness?).and_return(false)
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      ingest_group = KafkaBatch.dispatch_consumer_group
+      fair_group   = KafkaBatch.jobs_fair_consumer_group
+      allow(KafkaBatch::Lag).to receive(:read_group).with(ingest_group, [KafkaBatch.config.fairness_ingest_topic])
+        .and_return(ingest_group => { KafkaBatch.config.fairness_ingest_topic => { 0 => { offset: 0, lag: 3 } } })
+      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [KafkaBatch.config.fairness_ready_topic])
+        .and_return(fair_group => { KafkaBatch.config.fairness_ready_topic => { 0 => { offset: 0, lag: 0 } } })
+
       html = get("/fairness").last.join
-      expect(html).to include("No workers opt into")
+      expect(html).to include("No registered workers opt into")
+      expect(html).to include("Active lanes")
+      expect(html).to include(">3<")
     end
 
     it "renders lanes, buffer depth and dispatcher status when a worker is fair" do
@@ -159,8 +169,7 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("Flowing")
     end
 
-    it "links to /fairness from the dashboard when a worker is fair" do
-      allow(KafkaBatch).to receive(:fairness?).and_return(true)
+    it "links to /fairness from the dashboard" do
       expect(get("/").last.join).to include("/kafka_batch/fairness")
     end
   end
@@ -250,7 +259,6 @@ RSpec.describe KafkaBatch::Web do
     end
 
     it "/live, /lag and /fairness auto-reload every 5s" do
-      allow(KafkaBatch).to receive(:fairness?).and_return(true)
       allow(KafkaBatch::Lag).to receive(:available?).and_return(false)
       %w[/live /lag /fairness].each do |path|
         expect(get(path).last.join).to include("setTimeout(function(){ location.reload(); }, 5000)")

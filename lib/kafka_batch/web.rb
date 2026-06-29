@@ -116,7 +116,7 @@ module KafkaBatch
 
       <<~HTML
         #{summary}
-        <div class="toolbar"><button id="kb-live-toggle" type="button" class="btn">○ Live</button> <a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a> <a class="btn" href="#{lag_path}">▦ Topic lag</a>#{KafkaBatch.fairness? ? " <a class=\"btn\" href=\"#{fairness_path}\">⚖ Fairness</a>" : ""}</div>
+        <div class="toolbar"><button id="kb-live-toggle" type="button" class="btn">○ Live</button> <a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a> <a class="btn" href="#{lag_path}">▦ Topic lag</a> <a class="btn" href="#{fairness_path}">⚖ Fairness</a></div>
         <div class="filterbar">#{filters}#{search_box(search, status)}</div>
         <div class="card">
           <table>
@@ -400,11 +400,12 @@ module KafkaBatch
     def render_fairness
       back = "<p><a class=\"back\" href=\"#{index_path}\">← All batches</a></p>"
 
-      unless KafkaBatch.fairness?
-        return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>No workers opt into multi-tenant fairness (set <code>fairness true</code> on a Worker class).</p></div>"
-      end
+      inactive_notice =
+        unless KafkaBatch.fairness?
+          "<div class='card'><p class='muted'>No registered workers opt into multi-tenant fairness yet (set <code>fairness true</code> on a Worker class). Lag below reflects the configured ingest/ready topics.</p></div>"
+        end
       unless KafkaBatch::Lag.available?
-        return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>#{auto_reload_script}"
+        return "#{back}#{inactive_notice}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>#{auto_reload_script}"
       end
 
       cfg            = KafkaBatch.config
@@ -414,7 +415,7 @@ module KafkaBatch
            lag_partitions(KafkaBatch.jobs_fair_consumer_group, cfg.fairness_ready_topic)]
         rescue StandardError => e
           KafkaBatch.logger.warn("[KafkaBatch::Web] fairness lag read failed: #{e.message}")
-          return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>#{auto_reload_script}"
+          return "#{back}#{inactive_notice}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>#{auto_reload_script}"
         end
 
       ingest_total = ingest.sum { |p| p[:lag] }
@@ -436,6 +437,7 @@ module KafkaBatch
 
       <<~HTML
         #{back}
+        #{inactive_notice}
         <div class="metrics">
           <div class="metric"><div class="metric-value">#{lanes}</div><div class="metric-label">Active lanes (≈ tenants)</div></div>
           <div class="metric"><div class="metric-value">#{ingest_total}</div><div class="metric-label">Un-dispatched (ingest)</div></div>
