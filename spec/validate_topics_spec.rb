@@ -28,10 +28,17 @@ RSpec.describe "KafkaBatch.validate_topics!" do
 
   it "does not require config.jobs_topic when worker topics are registered" do
     allow(KafkaBatch).to receive(:workers).and_return([SuccessfulWorker])
-    # Cluster has the worker's topic + control plane, but NOT config.jobs_topic.
-    existing = [SuccessfulWorker.kafka_topic, KafkaBatch.config.events_topic,
-                KafkaBatch.config.callbacks_topic, KafkaBatch.config.dead_letter_topic,
-                *KafkaBatch.config.retry_topics]
+    # Cluster has the worker's topic + control plane + priority topics (always
+    # provisioned by topics.rb), but NOT config.jobs_topic.
+    existing = [SuccessfulWorker.kafka_topic,
+                KafkaBatch.config.events_topic,
+                KafkaBatch.config.callbacks_topic,
+                KafkaBatch.config.dead_letter_topic,
+                *KafkaBatch.config.retry_topics,
+                KafkaBatch.config.fast_p0_topic,
+                KafkaBatch.config.fast_p1_topic,
+                KafkaBatch.config.slow_p0_topic,
+                KafkaBatch.config.slow_p1_topic]
     stub_cluster_topics(existing)
 
     expect { KafkaBatch.validate_topics! }.not_to raise_error

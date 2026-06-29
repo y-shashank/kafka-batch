@@ -12,8 +12,27 @@ module KafkaBatch
     module_function
 
     def available?
-      defined?(Karafka) && defined?(Karafka::Admin) && defined?(Karafka::App) &&
-        Karafka::Admin.respond_to?(:read_lags_with_offsets)
+      # Try to load Karafka if it's not already required. Karafka is a
+      # kafka-batch dependency so it's always installed, but a UI-only service
+      # that never runs karafka.rb may not have required it yet.
+      unless defined?(Karafka)
+        begin
+          require "karafka"
+        rescue LoadError
+          return false
+        end
+      end
+
+      return false unless defined?(Karafka::Admin) &&
+                          Karafka::Admin.respond_to?(:read_lags_with_offsets)
+
+      # In a UI-only process karafka.rb is never executed, so Karafka may be
+      # loaded but not configured with broker settings. Provide a minimal setup
+      # from KafkaBatch.config so Karafka::Admin.read_lags_with_offsets works.
+      KafkaBatch.ensure_karafka_configured!
+      true
+    rescue StandardError
+      false
     end
 
     # Per-partition lag/offset rows across all routed consumer groups.
@@ -73,9 +92,7 @@ module KafkaBatch
 
     # @api private
     # Read lags ONLY for this gem's consumer groups, so the dashboard never
-    # reports on the host app's unrelated topics. Returns {} if the gem's groups
-    # aren't present in the routing (nothing to show) rather than falling back
-    # to Karafka's "all groups" behaviour.
+    # reports on the host app's unrelated topics.
     def read
       groups = gem_groups_with_topics
       return {} if groups.empty?
@@ -84,13 +101,76 @@ module KafkaBatch
     end
 
     # @api private
-    # @return [Hash<String, Array<String>>] { gem_consumer_group => [topics] }
+    # Returns { consumer_group_id => [topic_names] } for every KafkaBatch
+    # consumer group.
+    #
+    # Two-path resolution — no dependency on the worker registry:
+    #
+    # 1. Route-based (preferred): when Karafka routes owned by this gem exist in
+    #    this process (e.g. the Karafka server with draw_routes called), read
+    #    directly from Karafka::App.routes filtered by the gem's group prefix.
+    #    This is exact — only groups with at least one registered topic appear.
+    #
+    # 2. Config-based fallback: when NO gem-prefixed routes are found — e.g. a
+    #    UI-only process where karafka.rb exists (for admin access) but draws no
+    #    KafkaBatch consumer routes. Derives the full topic set from config.
+    #    All groups (control, priority, fairness, jobs) are included because
+    #    their topics are always provisioned (see topics.rb).
+    #
+    # NOTE: We gate on gem-owned routes specifically, not just Karafka::App.routes.any?,
+    # because a UI-only service may have a karafka.rb with an empty routes block
+    # (needed to configure Karafka::Admin) but no KafkaBatch consumer groups.
+    # In that case routes.any? is truthy but the select returns nothing — we must
+    # fall through to the config-based path.
+    #
+    # @return [Hash<String, Array<String>>]
     def gem_groups_with_topics
-      wanted = KafkaBatch.consumer_groups
+      cfg    = KafkaBatch.config
+      prefix = cfg.consumer_group   # e.g. "kafka-batch"
 
-      Karafka::App.routes
-                  .select { |cg| wanted.include?(cg.id) }
-                  .each_with_object({}) { |cg, h| h[cg.id] = cg.topics.map(&:name) }
+      own_routes =
+        if defined?(Karafka::App)
+          begin
+            Karafka::App.routes.select { |r| r.id == prefix || r.id.start_with?("#{prefix}-") }
+          rescue StandardError
+            []
+          end
+        else
+          []
+        end
+
+      if own_routes.any?
+        # Route-based: gem-owned consumer groups found in this process's routes.
+        own_routes.each_with_object({}) { |r, h| h[r.id] = r.topics.map(&:name) }
+      else
+        # Config-based fallback: no gem routes drawn here (UI-only service or
+        # process where karafka.rb runs but doesn't call draw_routes).
+        config_based_groups(cfg, prefix)
+      end
+    end
+
+    # @api private
+    def config_based_groups(cfg, prefix)
+      groups = {}
+
+      # Control plane — always present.
+      groups["#{prefix}-control"] =
+        [cfg.events_topic, cfg.callbacks_topic].compact + Array(cfg.retry_topics)
+
+      # Priority queues — always provisioned (topics.rb adds them unconditionally).
+      groups["#{prefix}-jobs-fast"] = [cfg.fast_p0_topic, cfg.fast_p1_topic].compact
+      groups["#{prefix}-jobs-slow"] = [cfg.slow_p0_topic, cfg.slow_p1_topic].compact
+
+      # Fair lane — include when the ingest topic is configured.
+      if cfg.fairness_ingest_topic && !cfg.fairness_ingest_topic.to_s.empty?
+        groups["#{prefix}-dispatch"]  = [cfg.fairness_ingest_topic]
+        groups["#{prefix}-jobs-fair"] = [cfg.fairness_ready_topic].compact
+      end
+
+      # Plain jobs group — use the default jobs topic.
+      groups["#{prefix}-jobs"] = [cfg.jobs_topic].compact
+
+      groups.reject { |_, topics| topics.empty? }
     end
   end
 end

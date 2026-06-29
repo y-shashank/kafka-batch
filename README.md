@@ -114,11 +114,26 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
 
 ## Installation
 
-Add to your `Gemfile`:
+### Entry points
 
+The gem ships two `require` entry points so each service loads only what it needs:
+
+| Entry point | Use in | Loads |
+|---|---|---|
+| `kafka_batch` (default) | **Worker service** — runs Karafka consumers, processes jobs | Everything: consumers, producer, batch, reconciler, topics, fairness |
+| `kafka_batch/ui` | **Web service** — mounts the dashboard only | Config, stores, lag, liveness, consumption control, web UI |
+
+**Worker service** `Gemfile`:
 ```ruby
-gem "kafka-batch"
+gem "kafka-batch"  # require: "kafka_batch" is the default
 ```
+
+**Web/API service** `Gemfile` (dashboard only, no Karafka dependency at runtime):
+```ruby
+gem "kafka-batch", require: "kafka_batch/ui"
+```
+
+The web service still gets the full dashboard (all tabs, pause/resume, cancel/delete) — it just doesn't load any consumer or producer code. Configure it with the same store + topic settings and it reads live data straight from Redis/MySQL and the Kafka Admin API.
 
 Run the installer:
 

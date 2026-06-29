@@ -52,7 +52,10 @@ module KafkaBatch
         batch = KafkaBatch.store.find_batch(m[1])
         batch ? html(render_show(batch)) : not_found
       elsif method == "POST" && (m = path.match(%r{\A/batches/([^/]+)/cancel\z}))
-        KafkaBatch::Batch.cancel(m[1])
+        # Inline cancel so web.rb works in UI-only mode (no Batch class loaded).
+        # Mirrors KafkaBatch::Batch.cancel exactly.
+        KafkaBatch.store.update_batch_status(m[1], "cancelled")
+        KafkaBatch::CancellationCache.add(m[1]) if defined?(KafkaBatch::CancellationCache)
         redirect_to_index
       elsif method == "POST" && (m = path.match(%r{\A/batches/([^/]+)/delete\z}))
         KafkaBatch.store.delete_batch(m[1])

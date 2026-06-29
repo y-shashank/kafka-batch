@@ -1,19 +1,17 @@
-require "logger"
-require "oj"
+# frozen_string_literal: true
 
-require_relative "kafka_batch/version"
-require_relative "kafka_batch/errors"
-require_relative "kafka_batch/configuration"
-require_relative "kafka_batch/instrumentation"
-require_relative "kafka_batch/stores/base"
-require_relative "kafka_batch/stores/mysql_store"
-require_relative "kafka_batch/stores/redis_store"
+# Full backend entry point — loads everything: UI layer + workers, consumers,
+# producer, batch, reconciler, topics, fairness.
+# Use this in processes that run Karafka consumers (the worker service).
+#
+# For web-only processes that only mount the dashboard, use:
+#   require "kafka_batch/ui"
+
+require "oj"
+require_relative "kafka_batch/ui"    # config, store, lag, liveness, web, …
+
+# ── Backend-only requires ────────────────────────────────────────────────────
 require_relative "kafka_batch/producer"
-require_relative "kafka_batch/cancellation_cache"
-require_relative "kafka_batch/liveness"
-require_relative "kafka_batch/lag"
-require_relative "kafka_batch/partition"
-require_relative "kafka_batch/consumption_control"
 require_relative "kafka_batch/consumers/consumption_gate"
 require_relative "kafka_batch/topics"
 require_relative "kafka_batch/fairness/scheduler"
@@ -30,61 +28,13 @@ require_relative "kafka_batch/consumers/slow_p1_consumer"
 require_relative "kafka_batch/consumers/retry_consumer"
 require_relative "kafka_batch/consumers/event_consumer"
 require_relative "kafka_batch/consumers/callback_consumer"
-require_relative "kafka_batch/web"
 
 module KafkaBatch
   class << self
-    # ── Configuration ─────────────────────────────────────────────────────
+    # ── Fairness scheduler ─────────────────────────────────────────────────
 
-    def configuration
-      @configuration ||= Configuration.new
-    end
-    alias config configuration
-
-    def configure
-      yield configuration
-    end
-
-    # Identifier for THIS process/pod, used to record which consumer ran a
-    # batch's callbacks. Prefers the K8s pod name (ENV["HOSTNAME"]) and falls
-    # back to the OS hostname; suffixed with the PID to disambiguate workers.
-    def node_id
-      @node_id ||= begin
-        require "socket"
-        host = ENV["HOSTNAME"]
-        host = Socket.gethostname if host.nil? || host.empty?
-        "#{host}##{Process.pid}"
-      end
-    end
-
-    # ── Store ──────────────────────────────────────────────────────────────
-
-    # Returns the configured store singleton.
-    # Thread-safe via double-checked locking.
-    # @return [Stores::MysqlStore, Stores::RedisStore]
-    def store
-      return @store if @store
-      store_mutex.synchronize do
-        @store ||= begin
-          config.validate!
-          case config.store
-          when :mysql
-            Stores::MysqlStore.new
-          when :redis
-            Stores::RedisStore.new
-          else
-            raise ConfigurationError, "Unknown store: #{config.store}"
-          end
-        end
-      end
-    end
-
-    # ── Fairness scheduler (multi-tenant WFQ) ───────────────────────────────
-
-    # Optional Redis-backed virtual-time WFQ scheduler for STRICT weighted shares.
-    # NOT used by the default fairness path (the Dispatcher needs no Redis) — it's
-    # a standalone engine to build a custom dispatcher/worker around.
-    # @return [Fairness::Scheduler]
+    # Optional Redis-backed WFQ scheduler. Not used by the default fairness
+    # path — standalone engine for custom dispatchers.
     def fairness_scheduler
       @fairness_scheduler ||= Fairness::Scheduler.new
     end
@@ -100,53 +50,26 @@ module KafkaBatch
     end
 
     # All registered worker classes.
-    # @return [Array<Class>]
     def workers
       workers_mutex.synchronize { Array(@workers) }
     end
 
-    # True if any registered worker opts into the multi-tenant fair lane. Used to
-    # decide whether to wire the dispatcher/ready consumer and create those topics.
-    # @return [Boolean]
+    # True if any registered worker opts into the multi-tenant fair lane.
     def fairness?
       workers.any?(&:fairness?)
     end
 
-    # ── Consumer group names (derived from config.consumer_group) ───────────
+    # ── Consumer groups ────────────────────────────────────────────────────
+    # Returns the groups that exist given the current worker registry.
+    # Used by draw_routes and (legacy) lag page fallback.
 
-    def control_consumer_group
-      "#{config.consumer_group}-control"
-    end
-
-    def dispatch_consumer_group
-      "#{config.consumer_group}-dispatch"
-    end
-
-    def jobs_fair_consumer_group
-      "#{config.consumer_group}-jobs-fair"
-    end
-
-    def jobs_consumer_group
-      "#{config.consumer_group}-jobs"
-    end
-
-    def fast_consumer_group
-      "#{config.consumer_group}-jobs-fast"
-    end
-
-    def slow_consumer_group
-      "#{config.consumer_group}-jobs-slow"
-    end
-
-    # All gem-managed consumer groups that exist given the current worker registry.
-    # @return [Array<String>]
     def consumer_groups
-      groups    = [control_consumer_group]
+      groups   = [control_consumer_group]
       groups << dispatch_consumer_group << jobs_fair_consumer_group if fairness?
 
-      plain     = workers.reject(&:fairness?)
-      fast_set  = [config.fast_p0_topic, config.fast_p1_topic]
-      slow_set  = [config.slow_p0_topic, config.slow_p1_topic]
+      plain    = workers.reject(&:fairness?)
+      fast_set = [config.fast_p0_topic, config.fast_p1_topic]
+      slow_set = [config.slow_p0_topic, config.slow_p1_topic]
 
       groups << fast_consumer_group if plain.any? { |w| fast_set.include?(w.kafka_topic) }
       groups << slow_consumer_group if plain.any? { |w| slow_set.include?(w.kafka_topic) }
@@ -157,40 +80,15 @@ module KafkaBatch
       groups
     end
 
-    # ── Karafka routing helper ─────────────────────────────────────────────
-    #
-    # Call this INSIDE your karafka.rb routes.draw block, passing `self` (the
-    # routing builder). Make sure your worker classes are loaded first so they
-    # are registered (reference them, or eager-load):
-    #
-    #   class KarafkaApp < Karafka::App
-    #     routes.draw do
-    #       MyWorker  # ensure workers are loaded/registered
-    #       KafkaBatch.draw_routes(self)
-    #       # ... your own routes
-    #     end
-    #   end
-    #
-    # It creates separate consumer groups so each lane scales independently:
-    #   "<consumer_group>-control"  – events + callbacks + retry
-    #   "<consumer_group>-dispatch" – fairness ingest → ready (when any fair worker)
-    #   "<consumer_group>-jobs-fair" – ready topic (fair JobConsumer swarm)
-    #   "<consumer_group>-jobs"     – plain worker topics (non-fair JobConsumer)
-    #
-    # With config.concurrency > 1 (recommended), control messages are then
-    # worked in parallel with jobs, so progress/callbacks propagate promptly.
-    def draw_routes(builder)
-      cfg     = config
-      workers = KafkaBatch.workers
+    # ── Karafka routing ────────────────────────────────────────────────────
 
-      # Fairness is per-worker: fair workers share the ingest→ready lane; plain
-      # workers consume their own topic. Each lane has its own consumer group so
-      # you can scale fair vs non-fair throughput independently.
-      fair_workers = workers.select(&:fairness?)
-      plain_topics = workers.reject(&:fairness?).map(&:kafka_topic).uniq
+    def draw_routes(builder)
+      cfg          = config
+      all_workers  = KafkaBatch.workers
+      fair_workers = all_workers.select(&:fairness?)
+      plain_topics = all_workers.reject(&:fairness?).map(&:kafka_topic).uniq
       any_fair     = fair_workers.any?
 
-      # Priority topic sets — workers route here by setting kafka_topic.
       fast_set = [cfg.fast_p0_topic, cfg.fast_p1_topic]
       slow_set = [cfg.slow_p0_topic, cfg.slow_p1_topic]
       all_prio = fast_set + slow_set
@@ -202,37 +100,27 @@ module KafkaBatch
       any_fast     = fast_p0_used || fast_p1_used
       any_slow     = slow_p0_used || slow_p1_used
 
-      # Non-priority plain topics (legacy or custom per-worker topics).
       other_plain_topics = plain_topics.reject { |t| all_prio.include?(t) }
 
-      # Karafka's routing DSL methods (consumer_group/topic/consumer) are private
-      # and only resolve with implicit self, so define routes inside the builder
-      # via instance_eval. Locals remain available via closure.
       builder.instance_eval do
         consumer_group "#{cfg.consumer_group}-control" do
           topic(cfg.events_topic)    { consumer KafkaBatch::Consumers::EventConsumer }
           topic(cfg.callbacks_topic) { consumer KafkaBatch::Consumers::CallbackConsumer }
-          # One retry topic per delay tier so a slow tier (e.g. large/20m) never
-          # head-of-line-blocks a fast one (e.g. short/30s).
           cfg.retry_topics.each do |retry_topic|
             topic(retry_topic) { consumer KafkaBatch::Consumers::RetryConsumer }
           end
         end
 
         if any_fair
-          # Fair lane: ingest → Dispatcher (throttled) → ready → JobConsumer swarm.
           consumer_group "#{cfg.consumer_group}-dispatch" do
             topic(cfg.fairness_ingest_topic) { consumer KafkaBatch::Fairness::Dispatcher }
           end
-
           consumer_group "#{cfg.consumer_group}-jobs-fair" do
             topic(cfg.fairness_ready_topic) { consumer KafkaBatch::Consumers::JobConsumer }
           end
         end
 
         if any_fast
-          # Fast group: p0 (critical) runs unconditionally; p1 (normal) yields
-          # briefly when p0 has lag (weighted priority).
           consumer_group "#{cfg.consumer_group}-jobs-fast" do
             topic(cfg.fast_p0_topic) { consumer KafkaBatch::Consumers::FastP0Consumer } if fast_p0_used
             topic(cfg.fast_p1_topic) { consumer KafkaBatch::Consumers::FastP1Consumer } if fast_p1_used
@@ -240,8 +128,6 @@ module KafkaBatch
         end
 
         if any_slow
-          # Slow group: p0 (critical) runs unconditionally; p1 (normal) pauses
-          # entirely while p0 has lag (strict priority).
           consumer_group "#{cfg.consumer_group}-jobs-slow" do
             topic(cfg.slow_p0_topic) { consumer KafkaBatch::Consumers::SlowP0Consumer } if slow_p0_used
             topic(cfg.slow_p1_topic) { consumer KafkaBatch::Consumers::SlowP1Consumer } if slow_p1_used
@@ -250,8 +136,6 @@ module KafkaBatch
 
         unless other_plain_topics.empty?
           consumer_group "#{cfg.consumer_group}-jobs" do
-            # Dedup: several plain workers may share a topic (e.g. config.jobs_topic
-            # default). JobConsumer dispatches per-message via embedded worker_class.
             other_plain_topics.uniq.each do |job_topic|
               topic(job_topic) { consumer KafkaBatch::Consumers::JobConsumer }
             end
@@ -262,31 +146,19 @@ module KafkaBatch
 
     # ── Topic validation ───────────────────────────────────────────────────
 
-    # Verify that all KafkaBatch topics exist in the Kafka cluster.
-    # Called at boot when config.validate_topics_on_boot = true.
-    # Raises ConfigurationError with a list of missing topics.
     def validate_topics!
-      # Derive the real topic set from the same source as `rake create_topics`:
-      # per-worker job topics (or fairness ingest/ready), plus the control plane
-      # (events, callbacks, retry tiers, dead_letter). Note: config.jobs_topic is
-      # NOT validated — nothing produces to or consumes from it.
       required = KafkaBatch::Topics.specs.map { |s| s[:name] }.compact.uniq
 
-      # Attempt to list topics via WaterDrop's internal Rdkafka handle
       existing = begin
         producer   = KafkaBatch::Producer.instance
         rd_handle  = producer.respond_to?(:client) ? producer.client : nil
-        if rd_handle.respond_to?(:metadata)
-          rd_handle.metadata(true, nil, 5000).topics.map(&:topic)
-        else
-          nil  # can't introspect – skip
-        end
+        rd_handle.respond_to?(:metadata) ? rd_handle.metadata(true, nil, 5000).topics.map(&:topic) : nil
       rescue => e
         logger.warn("[KafkaBatch] validate_topics!: could not fetch topic list: #{e.message}")
         nil
       end
 
-      return if existing.nil?  # skip if we couldn't fetch
+      return if existing.nil?
 
       missing = required - existing
       unless missing.empty?
@@ -296,63 +168,26 @@ module KafkaBatch
       end
 
       logger.info("[KafkaBatch] All #{required.size} required topics verified.")
-
       validate_fairness_partitions!(strict: true)
     end
 
-    # Number of partitions on the fairness ingest topic, or nil if it can't be
-    # determined (Karafka::Admin unavailable / cluster unreachable / topic missing).
-    def fairness_ingest_partition_count
-      return nil unless defined?(Karafka) && defined?(Karafka::Admin)
-
-      topic = Karafka::Admin.cluster_info.topics
-                            .find { |t| t[:topic_name] == config.fairness_ingest_topic }
-      topic && topic[:partition_count]
-    rescue => e
-      logger.warn("[KafkaBatch] could not read partition count for '#{config.fairness_ingest_topic}': #{e.message}")
-      nil
-    end
-
-    # Ingest partition a tenant_id (Kafka message key) maps to, using the
-    # default murmur2 partitioner. @return [Integer, nil] nil if count unknown.
-    def fairness_ingest_partition_for(tenant_id)
-      count = fairness_ingest_partition_count
-      return nil if count.nil? || count.zero?
-
-      Partition.for_key(tenant_id.to_s, count)
-    end
-
-    # Warn (or raise, when strict) if the fairness ingest topic has too few
-    # partitions. Tenants are spread across partitions by key hash, so too few
-    # means tenants collide onto one partition and fairness degrades — a single
-    # partition gives no fairness at all. No-op unless a worker opts into fairness.
-    # @param strict [Boolean] raise ConfigurationError instead of warning
     def validate_fairness_partitions!(strict: config.validate_topics_on_boot)
       return unless fairness?
-
       count = fairness_ingest_partition_count
-      return if count.nil?  # couldn't determine — don't false-alarm
+      return if count.nil?
 
       min = [config.fairness_min_ingest_partitions.to_i, 2].max
       return if count >= min
 
-      msg = "[KafkaBatch] a worker opts into fairness but ingest topic '#{config.fairness_ingest_topic}' has " \
-            "#{count} partition(s) (recommended >= #{min}). Tenants are hashed to partitions, so too " \
-            "few means tenants share a partition (1 = no fairness at all). Recreate the topic with more " \
-            "partitions (≈ your max concurrent tenant count)."
+      msg = "[KafkaBatch] a worker opts into fairness but ingest topic " \
+            "'#{config.fairness_ingest_topic}' has #{count} partition(s) " \
+            "(recommended >= #{min}). Recreate the topic with more partitions."
 
       raise ConfigurationError, msg if strict
-
       logger.warn(msg)
     end
 
-    # ── Logging ────────────────────────────────────────────────────────────
-
-    def logger
-      config.logger
-    end
-
-    # ── Reset (for tests) ─────────────────────────────────────────────────
+    # ── Reset (full — overrides core.rb's minimal version) ────────────────
 
     def reset!
       @configuration      = nil
@@ -370,15 +205,13 @@ module KafkaBatch
 
     private
 
-    def store_mutex
-      @store_mutex ||= Mutex.new
-    end
-
     def workers_mutex
       @workers_mutex ||= Mutex.new
     end
   end
 end
 
-# Load Rails integration if Rails is available
+# Load Rails integration if Rails is available.
+# (already loaded by kafka_batch/ui.rb if Rails is present; this is a no-op
+# if the railtie has already been required.)
 require_relative "kafka_batch/railtie" if defined?(Rails::Railtie)
