@@ -21,6 +21,7 @@ module KafkaBatch
     #   redelivers the message, allowing the worker to run again (workers must
     #   be idempotent) and try event emission once more.
     class JobConsumer < Karafka::BaseConsumer
+      prepend ConsumptionGate
       # Event-emission retry behaviour is configured via
       # KafkaBatch.config.event_emit_retries / .event_emit_backoff.
 

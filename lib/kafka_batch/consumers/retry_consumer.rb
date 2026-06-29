@@ -27,6 +27,7 @@ module KafkaBatch
     # the same retry partition – that's fine because retries for different jobs
     # are independent.
     class RetryConsumer < Karafka::BaseConsumer
+      prepend ConsumptionGate
       # Maximum time (seconds) to pause per wait cycle.
       # Capped so the consumer isn't suspended for extremely long backoffs in
       # one go; Karafka will re-deliver from the same offset after each pause.

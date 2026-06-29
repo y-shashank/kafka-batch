@@ -46,6 +46,12 @@ module KafkaBatch
     attr_accessor :liveness_ttl                # Integer – seconds; default 30 (staleness window)
     attr_accessor :liveness_heartbeat_interval # Integer – seconds; default 5 (:store write throttle)
 
+    # ── Consumption pause/resume (/lag dashboard) ─────────────────────────────
+    # Karafka consumers reload pause state from Redis (or MySQL when store is
+    # :mysql and Redis is unavailable) at most this often. The Web UI always
+    # reads fresh state.
+    attr_accessor :consumption_control_refresh_interval # Integer – seconds; default 60
+
     # ── Retry behaviour ──────────────────────────────────────────────────────
     # Tiered retries: each delay tier has its own Kafka topic, so a slow tier
     # never head-of-line-blocks a fast one (within a topic, FIFO == due order).
@@ -156,6 +162,7 @@ module KafkaBatch
       @track_running_jobs          = true
       @liveness_ttl                = 30
       @liveness_heartbeat_interval = 5
+      @consumption_control_refresh_interval = 60
       @brokers                  = ["localhost:9092"]
       @jobs_topic               = "kafka_batch.jobs"
       @events_topic             = "kafka_batch.events"

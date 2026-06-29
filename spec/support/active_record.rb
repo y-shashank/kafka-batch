@@ -77,6 +77,16 @@ module KafkaBatchSpec
         end
         add_index :kafka_batch_consumer_heartbeats, :consumer_id, unique: true
         add_index :kafka_batch_consumer_heartbeats, :last_seen
+
+        create_table :kafka_batch_consumption_pauses, force: true do |t|
+          t.string   :consumer_group, null: false
+          t.string   :topic_name,     null: false
+          t.integer  :partition_id,   null: false
+          t.datetime :created_at,     null: false
+        end
+        add_index :kafka_batch_consumption_pauses,
+                  %i[consumer_group topic_name partition_id],
+                  unique: true
       end
     end
 
@@ -87,6 +97,7 @@ module KafkaBatchSpec
       conn.execute("DELETE FROM kafka_batch_consumer_offsets")
       conn.execute("DELETE FROM kafka_batch_failures")
       conn.execute("DELETE FROM kafka_batch_consumer_heartbeats")
+      conn.execute("DELETE FROM kafka_batch_consumption_pauses")
     end
   end
 end

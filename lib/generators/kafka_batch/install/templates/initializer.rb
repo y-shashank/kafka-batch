@@ -39,6 +39,10 @@ KafkaBatch.configure do |config|
   config.liveness_ttl       = 30     # seconds (staleness window)
   config.liveness_heartbeat_interval = 5  # seconds (:store write throttle)
 
+  # Karafka consumers reload pause/resume state from Redis or MySQL at most this
+  # often. The /lag Web UI always reads fresh state.
+  # config.consumption_control_refresh_interval = 60
+
   # ── Retry behaviour ────────────────────────────────────────────────────────
   # Tiered retries: each delay tier has its own Kafka topic
   # (<retry_topic>.short/.medium/.large), so a slow tier never head-of-line-

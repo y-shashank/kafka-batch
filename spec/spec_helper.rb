@@ -47,6 +47,7 @@ RSpec.configure do |config|
 
     KafkaBatchSpec::CallbackDoubles.reset!
     KafkaBatchSpec::WorkerRuns.reset!
+    allow(KafkaBatch::ConsumptionControl).to receive(:available?).and_return(false)
   end
 end
 

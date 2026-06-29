@@ -42,6 +42,10 @@ module KafkaBatch
         html(render_live)
       elsif method == "GET" && path == "/lag"
         html(render_lag(params))
+      elsif method == "POST" && path == "/lag/pause"
+        lag_consumption_control(:pause, params)
+      elsif method == "POST" && path == "/lag/resume"
+        lag_consumption_control(:resume, params)
       elsif method == "GET" && path == "/fairness"
         html(render_fairness)
       elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
@@ -82,8 +86,37 @@ module KafkaBatch
       [404, html_headers, [layout("Not found", "<div class='card'><h2>404</h2><p>Not found.</p></div>")]]
     end
 
+    def redirect_to_lag(tenant_id = nil)
+      qs = tenant_id && !tenant_id.empty? ? "?tenant_id=#{url_encode(tenant_id)}" : ""
+      [302, { "location" => "#{lag_path}#{qs}", "cache-control" => "no-store", "content-type" => "text/html" }, []]
+    end
+
     def redirect_to_index
       [302, { "location" => index_path, "cache-control" => "no-store", "content-type" => "text/html" }, []]
+    end
+
+    def lag_consumption_control(action, params)
+      unless KafkaBatch::ConsumptionControl.available?
+        return redirect_to_lag(non_empty(params["tenant_id"]))
+      end
+
+      scope = params["scope"].to_s
+      group = params["group"].to_s
+      topic = params["topic"].to_s
+      part  = params["partition"]
+
+      case [action, scope]
+      when [:pause, "topic"]
+        KafkaBatch::ConsumptionControl.pause_topic(group: group, topic: topic)
+      when [:resume, "topic"]
+        KafkaBatch::ConsumptionControl.resume_topic(group: group, topic: topic)
+      when [:pause, "partition"]
+        KafkaBatch::ConsumptionControl.pause_partition(group: group, topic: topic, partition: part.to_i)
+      when [:resume, "partition"]
+        KafkaBatch::ConsumptionControl.resume_partition(group: group, topic: topic, partition: part.to_i)
+      end
+
+      redirect_to_lag(non_empty(params["tenant_id"]))
     end
 
     # Full-page auto-reload used by the always-live pages (/live, /lag, /fairness).
@@ -314,24 +347,46 @@ module KafkaBatch
       end
 
       lookup_html = ingest_partition_lookup_widget(tenant_q, lag_rows: rows)
+      paused      = KafkaBatch::ConsumptionControl.available? ? KafkaBatch::ConsumptionControl.snapshot(refresh: true) : nil
 
       total   = KafkaBatch::Lag.total(rows)
       topics  = KafkaBatch::Lag.topics(rows)
       groups  = rows.map { |r| r[:group] }.uniq.size
 
       topic_rows = topics.map do |t|
+        ctrl = lag_topic_control(t[:group], t[:topic], paused, tenant_q)
+        status = lag_topic_status(t[:group], t[:topic], paused)
         "<tr><td class='mono'>#{h(t[:group])}</td><td class='mono'>#{h(t[:topic])}</td>" \
-        "<td>#{t[:partitions]}</td><td>#{lag_badge(t[:lag])}</td></tr>"
+        "<td>#{t[:partitions]}</td><td>#{lag_badge(t[:lag])}</td><td>#{status}</td><td>#{ctrl}</td></tr>"
       end.join
-      topic_rows = "<tr><td colspan='4' class='empty'>No consumed topics found.</td></tr>" if topics.empty?
+      topic_rows = "<tr><td colspan='6' class='empty'>No consumed topics found.</td></tr>" if topics.empty?
 
       part_rows = rows.map do |r|
         committed = r[:never_consumed] ? "<span class='muted'>never consumed</span>" : r[:committed]
         endoff    = r[:end_offset].nil? ? "<span class='muted'>—</span>" : r[:end_offset]
+        ctrl      = lag_partition_control(r[:group], r[:topic], r[:partition], paused, tenant_q)
+        status    = lag_partition_status(r[:group], r[:topic], r[:partition], paused)
         "<tr><td class='mono'>#{h(r[:group])}</td><td class='mono'>#{h(r[:topic])}</td>" \
-        "<td>#{r[:partition]}</td><td>#{committed}</td><td>#{endoff}</td><td>#{lag_badge(r[:lag])}</td></tr>"
+        "<td>#{r[:partition]}</td><td>#{committed}</td><td>#{endoff}</td><td>#{lag_badge(r[:lag])}</td>" \
+        "<td>#{status}</td><td>#{ctrl}</td></tr>"
       end.join
-      part_rows = "<tr><td colspan='6' class='empty'>No partitions found.</td></tr>" if rows.empty?
+      part_rows = "<tr><td colspan='8' class='empty'>No partitions found.</td></tr>" if rows.empty?
+
+      pause_note =
+        if paused
+          refresh = KafkaBatch.config.consumption_control_refresh_interval
+          case KafkaBatch::ConsumptionControl.backend
+          when :redis
+            "<p class='muted'>Pause/resume uses Redis (<code>#{h(KafkaBatch.config.redis_url)}</code>). " \
+            "Karafka consumers refresh pause state every #{refresh}s.</p>"
+          when :mysql
+            "<p class='muted'>Pause/resume uses MySQL (<code>kafka_batch_consumption_pauses</code>). " \
+            "Karafka consumers refresh pause state every #{refresh}s.</p>"
+          end
+        else
+          "<p class='muted'>Pause/resume requires Redis (<code>config.redis_url</code>) or MySQL " \
+          "(<code>config.store = :mysql</code> plus the consumption_pauses migration).</p>"
+        end
 
       <<~HTML
         <p><a class="back" href="#{index_path}">← All batches</a></p>
@@ -344,15 +399,16 @@ module KafkaBatch
         <div class="card">
           <h3>Pending by topic</h3>
           <p class="muted">Lag = messages produced but not yet committed by the consumer group (i.e. pending work). Auto-refreshing every 5s.</p>
+          #{pause_note}
           <table>
-            <thead><tr><th>Group</th><th>Topic</th><th>Partitions</th><th>Pending (lag)</th></tr></thead>
+            <thead><tr><th>Group</th><th>Topic</th><th>Partitions</th><th>Pending (lag)</th><th>Status</th><th>Control</th></tr></thead>
             <tbody>#{topic_rows}</tbody>
           </table>
         </div>
         <div class="card">
           <h3>Pending by partition</h3>
           <table>
-            <thead><tr><th>Group</th><th>Topic</th><th>Partition</th><th>Committed</th><th>End offset</th><th>Pending (lag)</th></tr></thead>
+            <thead><tr><th>Group</th><th>Topic</th><th>Partition</th><th>Committed</th><th>End offset</th><th>Pending (lag)</th><th>Status</th><th>Control</th></tr></thead>
             <tbody>#{part_rows}</tbody>
           </table>
         </div>
@@ -470,6 +526,75 @@ module KafkaBatch
         </div>
         #{auto_reload_script}
       HTML
+    end
+
+    def lag_topic_status(group, topic, paused)
+      return "<span class='muted'>—</span>" unless paused
+      if KafkaBatch::ConsumptionControl.topic_paused?(paused, group, topic)
+        "<span class='badge' style='background:#ef4444'>Paused (topic)</span>"
+      else
+        "<span class='badge' style='background:#10b981'>Running</span>"
+      end
+    end
+
+    def lag_partition_status(group, topic, partition, paused)
+      return "<span class='muted'>—</span>" unless paused
+      if KafkaBatch::ConsumptionControl.topic_paused?(paused, group, topic)
+        "<span class='badge' style='background:#f59e0b'>Topic paused</span>"
+      elsif KafkaBatch::ConsumptionControl.partition_only_paused?(paused, group, topic, partition)
+        "<span class='badge' style='background:#ef4444'>Paused</span>"
+      else
+        "<span class='badge' style='background:#10b981'>Running</span>"
+      end
+    end
+
+    def lag_topic_control(group, topic, paused, tenant_q)
+      return "<span class='muted'>—</span>" unless paused
+
+      lag_control_form(
+        action: KafkaBatch::ConsumptionControl.topic_paused?(paused, group, topic) ? :resume : :pause,
+        scope:  "topic",
+        group:  group,
+        topic:  topic,
+        tenant_q: tenant_q
+      )
+    end
+
+    def lag_partition_control(group, topic, partition, paused, tenant_q)
+      return "<span class='muted'>—</span>" unless paused
+      return "<span class='muted'>topic</span>" if KafkaBatch::ConsumptionControl.topic_paused?(paused, group, topic)
+
+      lag_control_form(
+        action: KafkaBatch::ConsumptionControl.partition_only_paused?(paused, group, topic, partition) ? :resume : :pause,
+        scope:  "partition",
+        group:  group,
+        topic:  topic,
+        partition: partition,
+        tenant_q: tenant_q
+      )
+    end
+
+    def lag_control_form(action:, scope:, group:, topic:, tenant_q:, partition: nil)
+      verb = action == :pause ? "Pause" : "Resume"
+      qs   = lag_control_query(scope: scope, group: group, topic: topic, partition: partition, tenant_q: tenant_q)
+      path = action == :pause ? "#{lag_path}/pause" : "#{lag_path}/resume"
+      cls  = action == :pause ? "btn btn-sm danger-btn" : "btn btn-sm"
+      %(<form class="inline-form" method="post" action="#{path}?#{qs}"><button type="submit" class="#{cls}">#{verb}</button></form>)
+    end
+
+    def lag_control_query(scope:, group:, topic:, tenant_q:, partition: nil)
+      parts = [
+        ["scope", scope],
+        ["group", group],
+        ["topic", topic],
+        ["partition", partition.to_s],
+        ["tenant_id", tenant_q]
+      ].reject { |_, v| v.nil? || v.to_s.empty? }
+      parts.map { |k, v| "#{url_encode(k)}=#{url_encode(v)}" }.join("&")
+    end
+
+    def url_encode(value)
+      CGI.escape(value.to_s)
     end
 
     # Small lookup on /lag: given tenant_id, show which ingest partition Kafka assigns.
@@ -871,6 +996,8 @@ module KafkaBatch
              color: #374151; padding: 5px 12px; border-radius: 7px; font-size: 13px; cursor: pointer; }
       .btn.warn { border-color: #f59e0b; color: #b45309; }
       .btn.danger-btn { border-color: #ef4444; color: #b91c1c; }
+      .btn.btn-sm { padding: 2px 10px; font-size: 12px; }
+      .inline-form { display: inline; margin: 0; }
       .btn.live-on { border-color: #10b981; background: #10b981; color: #fff; }
       .actions { white-space: nowrap; }
       td.danger { color: #b91c1c; font-weight: 600; }

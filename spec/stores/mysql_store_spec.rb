@@ -363,4 +363,24 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
       expect(store.cancelled_batch_ids).to eq([c])
     end
   end
+
+  describe "consumption pause/resume" do
+    it "pauses and resumes a whole topic" do
+      store.pause_consumption_topic(group: "g", topic: "demo")
+      snap = store.consumption_pause_snapshot
+      expect(snap[:topics]).to include(KafkaBatch::ConsumptionControl.topic_key("g", "demo"))
+
+      store.resume_consumption_topic(group: "g", topic: "demo")
+      expect(store.consumption_pause_snapshot[:topics]).to be_empty
+    end
+
+    it "pauses and resumes a single partition" do
+      store.pause_consumption_partition(group: "g", topic: "demo", partition: 2)
+      key = KafkaBatch::ConsumptionControl.partition_key("g", "demo", 2)
+      expect(store.consumption_pause_snapshot[:partitions]).to include(key)
+
+      store.resume_consumption_partition(group: "g", topic: "demo", partition: 2)
+      expect(store.consumption_pause_snapshot[:partitions]).to be_empty
+    end
+  end
 end

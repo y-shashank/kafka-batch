@@ -6,10 +6,10 @@ RSpec.describe KafkaBatch::Web do
     )
   end
 
-  def post(path)
+  def post(path, query: "")
     KafkaBatch::Web.call(
       "REQUEST_METHOD" => "POST", "PATH_INFO" => path,
-      "SCRIPT_NAME" => "/kafka_batch", "QUERY_STRING" => ""
+      "SCRIPT_NAME" => "/kafka_batch", "QUERY_STRING" => query
     )
   end
 
@@ -143,6 +143,28 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("partition 7")
       expect(html).to include("acme")
       expect(html).to include(KafkaBatch.config.fairness_ingest_topic)
+    end
+
+    it "shows pause controls when Redis consumption control is available" do
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      allow(KafkaBatch::Lag).to receive(:partitions).and_return(
+        [{ group: "g-jobs", topic: "demo", partition: 0, committed: 0, end_offset: 1, lag: 1, never_consumed: false }]
+      )
+      allow(KafkaBatch::ConsumptionControl).to receive(:available?).and_return(true)
+      allow(KafkaBatch::ConsumptionControl).to receive(:snapshot).and_return(topics: Set.new, partitions: Set.new)
+
+      html = get("/lag").last.join
+      expect(html).to include("Pause")
+      expect(html).to include("Status")
+    end
+
+    it "pauses a topic via POST and redirects back to /lag" do
+      allow(KafkaBatch::ConsumptionControl).to receive(:available?).and_return(true)
+      expect(KafkaBatch::ConsumptionControl).to receive(:pause_topic).with(group: "g", topic: "demo")
+
+      status, headers, = post("/lag/pause", query: "scope=topic&group=g&topic=demo")
+      expect(status).to eq(302)
+      expect(headers["location"]).to eq("/kafka_batch/lag")
     end
   end
 

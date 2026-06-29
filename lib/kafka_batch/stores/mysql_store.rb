@@ -41,6 +41,14 @@ module KafkaBatch
         end
       end
 
+      def consumption_pause_class
+        @consumption_pause_class ||= begin
+          klass = Class.new(ActiveRecord::Base)
+          klass.table_name = "kafka_batch_consumption_pauses"
+          klass
+        end
+      end
+
       # ── Public interface ──────────────────────────────────────────────────
 
       def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, description: nil, sealed: true)
@@ -297,6 +305,71 @@ module KafkaBatch
 
       def sweep_stale_heartbeats(older_than)
         heartbeat_class.where("last_seen < ?", older_than).delete_all
+      end
+
+      # ── Consumption pause/resume (/lag dashboard) ─────────────────────────────
+
+      TOPIC_PAUSE_PARTITION = -1
+
+      def consumption_pauses_enabled?
+        consumption_pause_class.table_exists?
+      rescue StandardError
+        false
+      end
+
+      def pause_consumption_topic(group:, topic:)
+        consumption_pause_class.create!(
+          consumer_group: group,
+          topic_name:     topic,
+          partition_id:   TOPIC_PAUSE_PARTITION,
+          created_at:     Time.now
+        )
+      rescue ActiveRecord::RecordNotUnique
+        nil
+      end
+
+      def resume_consumption_topic(group:, topic:)
+        consumption_pause_class.where(
+          consumer_group: group,
+          topic_name:     topic,
+          partition_id:   TOPIC_PAUSE_PARTITION
+        ).delete_all
+      end
+
+      def pause_consumption_partition(group:, topic:, partition:)
+        consumption_pause_class.create!(
+          consumer_group: group,
+          topic_name:     topic,
+          partition_id:   partition.to_i,
+          created_at:     Time.now
+        )
+      rescue ActiveRecord::RecordNotUnique
+        nil
+      end
+
+      def resume_consumption_partition(group:, topic:, partition:)
+        consumption_pause_class.where(
+          consumer_group: group,
+          topic_name:     topic,
+          partition_id:   partition.to_i
+        ).delete_all
+      end
+
+      def consumption_pause_snapshot
+        topics     = Set.new
+        partitions = Set.new
+
+        consumption_pause_class.find_each do |r|
+          if r.partition_id == TOPIC_PAUSE_PARTITION
+            topics << KafkaBatch::ConsumptionControl.topic_key(r.consumer_group, r.topic_name)
+          else
+            partitions << KafkaBatch::ConsumptionControl.partition_key(
+              r.consumer_group, r.topic_name, r.partition_id
+            )
+          end
+        end
+
+        { topics: topics, partitions: partitions }
       end
 
       def list_batches(status: nil, limit: 50, offset: 0, search: nil)

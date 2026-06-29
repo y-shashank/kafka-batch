@@ -25,6 +25,7 @@ module KafkaBatch
     #   2. Callback exceptions are also forwarded to the DLT (dlt_type:
     #      "callback_error") so they are not silently lost.
     class CallbackConsumer < Karafka::BaseConsumer
+      prepend ConsumptionGate
       def consume
         messages.each { |msg| process_callback(msg) }
       end

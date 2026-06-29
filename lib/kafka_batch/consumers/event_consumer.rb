@@ -19,6 +19,7 @@ module KafkaBatch
     #     "occurred_at" => "ISO8601"
     #   }
     class EventConsumer < Karafka::BaseConsumer
+      prepend ConsumptionGate
       # Apply a whole poll's completion events in ONE store call (per-poll
       # batching). This collapses N per-event transactions/round-trips into one,
       # which dramatically reduces hot-batch-row lock contention on the MySQL

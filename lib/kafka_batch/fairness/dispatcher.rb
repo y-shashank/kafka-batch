@@ -25,6 +25,7 @@ module KafkaBatch
     # assignment per tenant and similar job sizes) — "good enough" by design.
     # Strict weighted shares would use KafkaBatch::Fairness::Scheduler instead.
     class Dispatcher < Karafka::BaseConsumer
+      prepend KafkaBatch::Consumers::ConsumptionGate
       PAUSE_MS      = 500
       LAG_CACHE_TTL = 1.0  # seconds – Admin lag is polled at most this often per process
 

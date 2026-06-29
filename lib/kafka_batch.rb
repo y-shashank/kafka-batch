@@ -13,6 +13,8 @@ require_relative "kafka_batch/cancellation_cache"
 require_relative "kafka_batch/liveness"
 require_relative "kafka_batch/lag"
 require_relative "kafka_batch/partition"
+require_relative "kafka_batch/consumption_control"
+require_relative "kafka_batch/consumers/consumption_gate"
 require_relative "kafka_batch/topics"
 require_relative "kafka_batch/fairness/scheduler"
 require_relative "kafka_batch/fairness/dispatcher"
@@ -307,6 +309,7 @@ module KafkaBatch
       Producer.reset!
       CancellationCache.reset!
       Liveness.reset!
+      ConsumptionControl.reset!
     end
 
     private
