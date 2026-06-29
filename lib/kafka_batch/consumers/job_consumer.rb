@@ -100,6 +100,11 @@ module KafkaBatch
           KafkaBatch.logger.info(
             "[KafkaBatch][JobConsumer] batch_id=#{batch_id} cancelled – skipping job_id=#{job_id}"
           )
+          KafkaBatch::Instrumentation.job_cancelled(
+            job_id:       job_id,
+            batch_id:     batch_id,
+            worker_class: worker_class
+          )
           mark_as_consumed!(message)
           return
         end

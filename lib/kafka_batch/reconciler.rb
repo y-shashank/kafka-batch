@@ -16,7 +16,7 @@ module KafkaBatch
   # Or schedule with cron / Whenever / a Karafka scheduled consumer.
   module Reconciler
     # @param older_than [Integer] seconds – only inspect batches older than this
-    def self.run(older_than: KafkaBatch.config.reconciliation_interval)
+    def self.run(older_than: KafkaBatch.config.reconciliation_interval, triggered_by: :rake)
       start_time = Time.now
 
       KafkaBatch.store.with_reconciler_lock(ttl: KafkaBatch.config.reconciler_lock_ttl) do
@@ -43,9 +43,10 @@ module KafkaBatch
 
         duration = Time.now - start_time
         KafkaBatch::Instrumentation.reconciler_ran(
-          stale_count: stale.size,
-          lost_count:  lost.size,
-          duration:    duration
+          stale_count:  stale.size,
+          lost_count:   lost.size,
+          duration:     duration,
+          triggered_by: triggered_by
         )
         KafkaBatch.logger.info("[KafkaBatch][Reconciler] Done in #{duration.round(2)}s")
       end

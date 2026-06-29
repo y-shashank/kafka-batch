@@ -23,6 +23,10 @@ module KafkaBatch
           return @priority_last_result
         end
 
+        # Cache the topic/group for yield_to_p0 instrumentation
+        @priority_p0_topic      = p0_topic
+        @priority_consumer_group = consumer_group
+
         @priority_last_check  = now
         @priority_last_result =
           begin
@@ -45,6 +49,12 @@ module KafkaBatch
         KafkaBatch.logger.debug(
           "[KafkaBatch][PriorityGate] #{self.class.name} p0 has lag – " \
           "pausing partition for #{pause_ms}ms"
+        )
+        KafkaBatch::Instrumentation.consumer_priority_yielded(
+          consumer_class: self.class.name,
+          p0_topic:       @priority_p0_topic,
+          consumer_group: @priority_consumer_group,
+          pause_ms:       pause_ms
         )
         pause(pause_ms)
       end

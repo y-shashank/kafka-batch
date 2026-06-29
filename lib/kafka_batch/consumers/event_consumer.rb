@@ -20,6 +20,17 @@ module KafkaBatch
     #   }
     class EventConsumer < Karafka::BaseConsumer
       prepend ConsumptionGate
+
+      # Class-level reconciler scheduling: at most one run per
+      # reconciliation_interval seconds per process.  The distributed lock
+      # inside Reconciler.run handles multi-process safety.
+      RECONCILER_MUTEX  = Mutex.new
+      @last_reconcile_at = nil
+
+      class << self
+        attr_accessor :last_reconcile_at
+      end
+
       # Apply a whole poll's completion events in ONE store call (per-poll
       # batching). This collapses N per-event transactions/round-trips into one,
       # which dramatically reduces hot-batch-row lock contention on the MySQL
@@ -28,6 +39,7 @@ module KafkaBatch
       # this whole batch (if we crash before committing the offset) never
       # double-counts and never drops a job — protecting callback correctness.
       def consume
+        maybe_reconcile
         events = []
         last   = nil
 
@@ -46,6 +58,37 @@ module KafkaBatch
       end
 
       private
+
+      # Trigger the reconciler in a background thread if the configured interval
+      # has elapsed.  Uses a class-level timestamp so all EventConsumer instances
+      # in this process (one per events-topic partition) share one timer — the
+      # effective run frequency matches config.reconciliation_interval regardless
+      # of partition count.  The reconciler's distributed lock (MySQL GET_LOCK /
+      # Redis SET NX EX) deduplicates across multiple app processes.
+      def maybe_reconcile
+        interval = KafkaBatch.config.reconciliation_interval.to_f
+        now      = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+        should_run = RECONCILER_MUTEX.synchronize do
+          last = self.class.last_reconcile_at
+          if last.nil? || (now - last) >= interval
+            self.class.last_reconcile_at = now
+            true
+          else
+            false
+          end
+        end
+
+        return unless should_run
+
+        Thread.new do
+          KafkaBatch::Reconciler.run(triggered_by: :consumer)
+        rescue StandardError => e
+          KafkaBatch.logger.warn(
+            "[KafkaBatch][EventConsumer] reconciler thread error: #{e.class}: #{e.message}"
+          )
+        end
+      end
 
       # Apply the deduped, aggregated counter updates and fire callbacks for any
       # batch that just finished.

@@ -323,7 +323,7 @@ Every option on `KafkaBatch.config`:
 | `slow_p0_topic` | String | `"kafka_batch.jobs.slow_p0"` | Slow-group critical topic |
 | `slow_p1_topic` | String | `"kafka_batch.jobs.slow_p1"` | Slow-group normal topic |
 | `priority_lag_check_interval` | Integer (s) | `2` | How often p1 consumers re-check p0 lag; smaller = faster priority response, more Admin API calls |
-| `reconciliation_interval` | Integer (s) | `300` | Age after which a "running" batch is re-checked by the reconciler |
+| `reconciliation_interval` | Integer (s) | `300` | How often `EventConsumer` auto-triggers the reconciler (no cron needed); also the staleness threshold for stuck-running batches |
 | `reconciler_lock_ttl` | Integer (s) | `600` | Distributed-lock TTL for one reconciler sweep |
 | `producer_config` | Hash | `{}` | Raw rdkafka/WaterDrop producer overrides |
 | `consumer_config` | Hash | `{}` | Raw rdkafka consumer overrides (merged into every consumer) |
@@ -1204,19 +1204,22 @@ The reconciler detects and recovers two classes of stuck batches:
 
 > **Redis store:** the running / lost-callback indexes (`kafka_batch:index:running` and `kafka_batch:index:done` sorted sets) are maintained automatically as batches move through their lifecycle, so the reconciler works on the Redis store too — no app-side bookkeeping required.
 
-**Distributed lock:** `Reconciler.run` acquires a store-level distributed lock before sweeping, so running the rake task from multiple servers concurrently is safe — only one process runs the sweep at a time. MySQL uses `GET_LOCK`/`RELEASE_LOCK`; Redis uses `SET NX EX`.
+**Distributed lock:** `Reconciler.run` acquires a store-level distributed lock before sweeping, so concurrent runs from multiple processes are safe — only one succeeds at a time. MySQL uses `GET_LOCK`/`RELEASE_LOCK`; Redis uses `SET NX EX`.
+
+### Automatic scheduling (no cron required)
+
+The reconciler runs automatically inside `EventConsumer` — no external cron or Whenever config needed. Each time the events topic is polled, `EventConsumer` checks whether `reconciliation_interval` seconds have elapsed since the last run. If so, it fires the reconciler in a background thread so event processing is never delayed.
+
+The check uses a class-level timestamp shared across all event-topic partitions in the same process, so the run frequency matches `config.reconciliation_interval` regardless of partition count. Across multiple app processes the distributed lock ensures only one sweep runs at a time.
+
+```ruby
+config.reconciliation_interval = 300  # seconds between automatic reconciler runs (default)
+```
+
+The rake task is still available for manual one-off runs (e.g. during a deploy, or to force an immediate sweep):
 
 ```bash
 bundle exec rake kafka_batch:reconcile
-```
-
-Schedule with cron or Whenever:
-
-```ruby
-# config/schedule.rb
-every 5.minutes do
-  rake "kafka_batch:reconcile"
-end
 ```
 
 ---
@@ -1230,10 +1233,12 @@ KafkaBatch emits `ActiveSupport::Notifications` events at key lifecycle points s
 | `job.processed.kafka_batch` | `job_id`, `batch_id`, `worker_class`, `duration` |
 | `job.retried.kafka_batch` | `job_id`, `batch_id`, `worker_class`, `attempt`, `next_attempt`, `retry_after` |
 | `job.failed.kafka_batch` | `job_id`, `batch_id`, `worker_class`, `attempt`, `error_class`, `error_message` |
+| `job.cancelled.kafka_batch` | `job_id`, `batch_id`, `worker_class` — fired when a job is skipped because its batch was cancelled |
 | `batch.completed.kafka_batch` | `batch_id`, `outcome`, `total_jobs`, `completed_count`, `failed_count` |
 | `callback.invoked.kafka_batch` | `batch_id`, `callback_class`, `callback_method` |
 | `callback.failed.kafka_batch` | `batch_id`, `callback_class`, `callback_method`, `error_class`, `error_message` |
-| `reconciler.ran.kafka_batch` | `stale_count`, `lost_count`, `duration` |
+| `consumer.priority_yielded.kafka_batch` | `consumer_class`, `p0_topic`, `consumer_group`, `pause_ms` — fired when a p1 consumer pauses for p0 lag |
+| `reconciler.ran.kafka_batch` | `stale_count`, `lost_count`, `duration`, `triggered_by` (`:rake` or `:consumer`) |
 
 Subscribe in an initializer:
 
@@ -1254,6 +1259,14 @@ end
 ActiveSupport::Notifications.subscribe("batch.completed.kafka_batch") do |*args|
   event = ActiveSupport::Notifications::Event.new(*args)
   StatsD.increment("kafka_batch.batch.completed", tags: ["outcome:#{event.payload[:outcome]}"])
+end
+
+# Alert when p1 consumers are being throttled frequently — a sign you need
+# more p0 workers or that a p0 backlog is growing faster than it's consumed.
+ActiveSupport::Notifications.subscribe("consumer.priority_yielded.kafka_batch") do |*args|
+  event = ActiveSupport::Notifications::Event.new(*args)
+  StatsD.increment("kafka_batch.priority.yield",
+    tags: ["consumer:#{event.payload[:consumer_class]}", "p0_topic:#{event.payload[:p0_topic]}"])
 end
 ```
 

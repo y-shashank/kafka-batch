@@ -17,13 +17,15 @@ module KafkaBatch
   # Event name format: "<event>.<component>.kafka_batch"
   #
   # Events emitted:
-  #   job.processed.kafka_batch   – job completed successfully
-  #   job.retried.kafka_batch     – job scheduled for retry
-  #   job.failed.kafka_batch      – job exhausted all retries
-  #   batch.completed.kafka_batch – batch reached terminal state
-  #   callback.invoked.kafka_batch  – on_success / on_complete callback ran
-  #   callback.failed.kafka_batch   – callback raised or was unresolvable
-  #   reconciler.ran.kafka_batch    – reconciler sweep completed
+  #   job.processed.kafka_batch        – job completed successfully
+  #   job.retried.kafka_batch          – job scheduled for retry
+  #   job.failed.kafka_batch           – job exhausted all retries
+  #   job.cancelled.kafka_batch        – job skipped (batch was cancelled)
+  #   batch.completed.kafka_batch      – batch reached terminal state
+  #   callback.invoked.kafka_batch     – on_success / on_complete callback ran
+  #   callback.failed.kafka_batch      – callback raised or was unresolvable
+  #   consumer.priority_yielded.kafka_batch – p1 consumer paused for p0 lag
+  #   reconciler.ran.kafka_batch       – reconciler sweep completed
   #
   module Instrumentation
     NAMESPACE = "kafka_batch"
@@ -62,6 +64,17 @@ module KafkaBatch
         })
       end
 
+      # Fired when a job is skipped because its batch was cancelled.
+      # Useful for tracking how many jobs are being silently drained versus
+      # actually executed (e.g. after an emergency cancel_batch! call).
+      def job_cancelled(job_id:, batch_id:, worker_class:)
+        instrument("job.cancelled", {
+          job_id:       job_id,
+          batch_id:     batch_id,
+          worker_class: worker_class.to_s
+        })
+      end
+
       # ── Batch events ───────────────────────────────────────────────────
 
       def batch_completed(batch_id:, outcome:, total_jobs:, completed_count:, failed_count:)
@@ -94,13 +107,35 @@ module KafkaBatch
         })
       end
 
+      # ── Consumer events ────────────────────────────────────────────────
+
+      # Fired by PriorityGate#yield_to_p0 when a p1 consumer pauses because the
+      # corresponding p0 topic has lag.  Subscribe to this event to measure
+      # priority queue contention and tune lag_check_interval or worker counts.
+      #
+      # Payload keys:
+      #   consumer_class  – e.g. "KafkaBatch::Consumers::FastP1Consumer"
+      #   p0_topic        – topic name the lag was detected on
+      #   consumer_group  – the consumer group owning that topic
+      #   pause_ms        – how long the partition will be paused
+      def consumer_priority_yielded(consumer_class:, p0_topic:, consumer_group:, pause_ms:)
+        instrument("consumer.priority_yielded", {
+          consumer_class: consumer_class.to_s,
+          p0_topic:       p0_topic,
+          consumer_group: consumer_group,
+          pause_ms:       pause_ms
+        })
+      end
+
       # ── Reconciler events ──────────────────────────────────────────────
 
-      def reconciler_ran(stale_count:, lost_count:, duration:)
+      # triggered_by: :consumer (auto-fired by EventConsumer) or :rake (manual run).
+      def reconciler_ran(stale_count:, lost_count:, duration:, triggered_by: :rake)
         instrument("reconciler.ran", {
-          stale_count: stale_count,
-          lost_count:  lost_count,
-          duration:    duration
+          stale_count:  stale_count,
+          lost_count:   lost_count,
+          duration:     duration,
+          triggered_by: triggered_by
         })
       end
 
