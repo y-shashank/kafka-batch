@@ -74,6 +74,15 @@ module KafkaBatch
         sealed:      !block_given?
       )
 
+      # #22: emit batch_created event after the record is durably persisted.
+      KafkaBatch::Instrumentation.batch_created(
+        batch_id:    batch.id,
+        description: description,
+        tenant_id:   tenant_id,
+        on_success:  on_success,
+        on_complete: on_complete
+      )
+
       if block_given?
         yield batch
         batch.send(:seal!)  # population done – open the completion gate
@@ -89,12 +98,15 @@ module KafkaBatch
       data = KafkaBatch.store.find_batch(id)
       raise BatchNotFoundError, "Batch #{id} not found" unless data
 
+      # Bug #13 fix: restore tenant_id from the store record so that jobs pushed
+      # via Batch.open inherit the batch-level tenant without re-specifying it.
       new(
         id:          id,
         on_success:  data[:on_success],
         on_complete: data[:on_complete],
         meta:        data[:meta],
-        description: data[:description]
+        description: data[:description],
+        tenant_id:   data[:tenant_id]
       )
     end
 
@@ -156,7 +168,18 @@ module KafkaBatch
         # On broker failure the idempotent producer will have sent zero or all
         # messages (partial produce is extremely rare with acks:all). Roll back
         # the full reservation; the reconciler will catch any edge-case mismatch.
-        (KafkaBatch.store.add_jobs(@id, -payloads.size) rescue nil)
+        #
+        # Bug #2 fix: if the rollback itself fails, total_jobs is overstated and
+        # the batch can never drain. Force-cancel it so it doesn't hang forever.
+        begin
+          KafkaBatch.store.add_jobs(@id, -payloads.size)
+        rescue StandardError => rollback_err
+          KafkaBatch.logger.error(
+            "[KafkaBatch][Batch] push_many rollback failed for batch_id=#{@id}: " \
+            "#{rollback_err.message}. Cancelling batch to prevent it from hanging."
+          )
+          KafkaBatch.store.update_batch_status(@id, "cancelled") rescue nil
+        end
         raise
       end
 
@@ -206,6 +229,12 @@ module KafkaBatch
       )
     end
 
+    # #27 note: `enqueued_at` is stamped by the producer pod's wall clock (UTC).
+    # Across pods this is subject to NTP jitter (typically ±10–100 ms). For ordering
+    # purposes the Kafka message's broker-assigned timestamp (LogAppendTime) is a
+    # more reliable monotonic reference within a partition. `enqueued_at` is useful
+    # for human display and approximate age, but should not be used for strict
+    # sequencing across concurrent producers.
     def self.build_message(worker_class:, payload:, job_id:, batch_id:, attempt:, tenant_id: nil)
       msg = {
         "job_id"                 => job_id,
@@ -215,7 +244,7 @@ module KafkaBatch
         "attempt"                => attempt,
         "max_retries"            => worker_class.max_retries,
         "complete_after_retries" => worker_class.complete_after_retries,
-        "enqueued_at"            => Time.now.iso8601
+        "enqueued_at"            => Time.now.utc.iso8601
       }
       msg["tenant_id"]  = tenant_id            if tenant_id
       msg["retry_tier"] = worker_class.retry_tier.to_s if worker_class.retry_tier
@@ -252,6 +281,11 @@ module KafkaBatch
       when :done
         produce_callback(result[:batch], result[:outcome])
       end
+      # #22: emit batch_sealed after population is durably committed.
+      KafkaBatch::Instrumentation.batch_sealed(
+        batch_id:   @id,
+        total_jobs: KafkaBatch.store.find_batch(@id)&.dig(:total_jobs) || 0
+      )
       self
     end
 

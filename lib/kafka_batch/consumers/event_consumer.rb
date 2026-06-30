@@ -24,11 +24,14 @@ module KafkaBatch
       # Class-level reconciler scheduling: at most one run per
       # reconciliation_interval seconds per process.  The distributed lock
       # inside Reconciler.run handles multi-process safety.
-      RECONCILER_MUTEX  = Mutex.new
+      RECONCILER_MUTEX   = Mutex.new
       @last_reconcile_at = nil
+      # Bug #14 fix: track whether a reconciler thread is already running so we
+      # never spawn a second one if the first takes longer than the interval.
+      @reconciler_running = false
 
       class << self
-        attr_accessor :last_reconcile_at
+        attr_accessor :last_reconcile_at, :reconciler_running
       end
 
       # Apply a whole poll's completion events in ONE store call (per-poll
@@ -65,14 +68,20 @@ module KafkaBatch
       # effective run frequency matches config.reconciliation_interval regardless
       # of partition count.  The reconciler's distributed lock (MySQL GET_LOCK /
       # Redis SET NX EX) deduplicates across multiple app processes.
+      # Bug #14 fix: guard with @reconciler_running so we never spawn a second
+      # thread if the previous run hasn't finished yet.
       def maybe_reconcile
         interval = KafkaBatch.config.reconciliation_interval.to_f
         now      = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
         should_run = RECONCILER_MUTEX.synchronize do
+          # Skip if a reconciler thread is already in flight.
+          next false if self.class.reconciler_running
+
           last = self.class.last_reconcile_at
           if last.nil? || (now - last) >= interval
-            self.class.last_reconcile_at = now
+            self.class.last_reconcile_at  = now
+            self.class.reconciler_running = true
             true
           else
             false
@@ -87,16 +96,32 @@ module KafkaBatch
           KafkaBatch.logger.warn(
             "[KafkaBatch][EventConsumer] reconciler thread error: #{e.class}: #{e.message}"
           )
+        ensure
+          # Always clear the running flag so the next interval can fire.
+          RECONCILER_MUTEX.synchronize { self.class.reconciler_running = false }
         end
       end
 
       # Apply the deduped, aggregated counter updates and fire callbacks for any
       # batch that just finished.
+      #
+      # Bug #18 fix: log a clear error when trigger_callbacks fails (e.g. broker
+      # outage) before re-raising. Without this the failure was silent in the logs;
+      # the reconciler covers recovery but operators need visibility immediately.
       def apply(events)
         return if events.empty?
 
         KafkaBatch.store.record_completions_batch(events).each do |f|
-          trigger_callbacks(batch: f[:batch], outcome: f[:outcome])
+          begin
+            trigger_callbacks(batch: f[:batch], outcome: f[:outcome])
+          rescue KafkaBatch::ProducerError => e
+            KafkaBatch.logger.error(
+              "[KafkaBatch][EventConsumer] Failed to produce callback for " \
+              "batch_id=#{f[:batch][:id]}: #{e.message} – offset uncommitted, " \
+              "reconciler will retry."
+            )
+            raise  # leave offset uncommitted so Karafka redelivers
+          end
         end
       end
 

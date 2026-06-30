@@ -74,7 +74,19 @@ module KafkaBatch
         return
       end
 
-      unless done >= total && total.positive?
+      # Bug #12 fix: a sealed empty batch (total_jobs == 0, locked_at present)
+      # is degenerate-complete. The guard `done >= total && total.positive?` was
+      # always false for these, leaving them stuck in "running" forever.
+      if total == 0
+        KafkaBatch.logger.info(
+          "[KafkaBatch][Reconciler] batch_id=#{id} is a sealed empty batch – completing as success"
+        )
+        KafkaBatch.store.mark_finished(id, "success")
+        produce_callback(batch.merge("outcome" => "success"))
+        return
+      end
+
+      unless done >= total
         KafkaBatch.logger.warn(
           "[KafkaBatch][Reconciler] batch_id=#{id} genuinely still running – skipping"
         )

@@ -61,6 +61,11 @@ module KafkaBatch
     attr_accessor :retry_jitter            # Float   – +/- fraction of randomization (default 0.1)
     attr_accessor :retry_tiers             # Hash{Symbol=>Integer} – tier => delay seconds
     attr_accessor :retry_tier_progression  # Array<Symbol> – default tier per retry index
+    # Maximum single pause duration (seconds) in RetryConsumer. When a retry is
+    # further in the future than this, the consumer pauses for this long and then
+    # re-checks, so the partition is never suspended for an extreme duration.
+    # Previously this was a hardcoded constant (MAX_PAUSE_SECONDS = 30).
+    attr_accessor :retry_max_pause_seconds # Integer – default 30
 
     # After this many retries a still-failing job counts toward its batch's
     # on_complete (as failed) so the batch needn't wait for the full retry budget
@@ -156,6 +161,13 @@ module KafkaBatch
     # lock. Kept independent of the staleness threshold above.
     attr_accessor :reconciler_lock_ttl      # Integer – seconds; default 600
 
+    # ── Producer safety ──────────────────────────────────────────────────────
+    # Raise a clear ProducerError when an encoded payload exceeds this size so
+    # the caller gets an actionable error instead of an opaque rdkafka failure.
+    # Default 1 MiB (Kafka's typical broker-side message.max.bytes default).
+    # Set to 0 or nil to disable the guard.
+    attr_accessor :max_message_bytes  # Integer – default 1_048_576 (1 MiB); 0 = disabled
+
     # ── Passthrough rdkafka config ───────────────────────────────────────────
     # Merged on top of defaults for the producer.
     attr_accessor :producer_config  # Hash<String, Object>
@@ -192,6 +204,7 @@ module KafkaBatch
       @retry_jitter             = 0.1  # +/- 10%
       @retry_tiers              = { short: 30, medium: 7 * 60, large: 20 * 60 }
       @retry_tier_progression   = %i[short medium large]
+      @retry_max_pause_seconds  = 30
       @complete_after_retries   = 3    # == max_retries default → no early completion by default
       @event_emit_retries       = 3
       @event_emit_backoff       = 2
@@ -216,6 +229,7 @@ module KafkaBatch
       @priority_lag_check_interval = 2
       @reconciliation_interval  = 300
       @reconciler_lock_ttl      = 600
+      @max_message_bytes        = 1_048_576  # 1 MiB; set to 0 to disable
       @producer_config          = {}
       @consumer_config          = {}
       @validate_topics_on_boot  = false

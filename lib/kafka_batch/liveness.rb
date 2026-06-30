@@ -124,13 +124,24 @@ module KafkaBatch
 
       # Throttled upsert: at most one DB write per liveness_heartbeat_interval
       # per process, regardless of job throughput.
+      #
+      # Moderate bug fix: the check + update of @last_heartbeat_at was previously
+      # done outside hb_mutex, causing a TOCTOU race under JRuby / TruffleRuby.
+      # Now the throttle guard and the current_job snapshot are both taken under
+      # hb_mutex so no intermediate state is observable.
       def store_heartbeat(topic: nil)
-        now = monotonic
+        now      = monotonic
         interval = KafkaBatch.config.liveness_heartbeat_interval.to_i
-        return if @last_heartbeat_at && (now - @last_heartbeat_at) < interval
-        @last_heartbeat_at = now
 
-        snapshot = hb_mutex.synchronize { (@current_job || {}).dup }
+        snapshot = hb_mutex.synchronize do
+          if @last_heartbeat_at && (now - @last_heartbeat_at) < interval
+            nil  # sentinel: skip write
+          else
+            @last_heartbeat_at = now
+            (@current_job || {}).dup
+          end
+        end
+        return if snapshot.nil?  # throttled
         data = {
           hostname:          Socket.gethostname,
           pid:               Process.pid,

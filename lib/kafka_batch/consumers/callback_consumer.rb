@@ -144,18 +144,28 @@ module KafkaBatch
           callback_method: method_name,
           error:           e
         )
-        publish_to_dlt(
-          original_message: original_message,
-          data:             batch_summary,
-          error:            e,
-          callback_class:   class_name,
-          callback_method:  method_name,
-          dlt_type:         "callback"
-        )
+        # Bug #3 fix: wrap publish_to_dlt so that a broker outage doesn't
+        # propagate out of invoke_callback and skip the claim_callback call in
+        # process_callback, which would cause infinite redelivery.
+        begin
+          publish_to_dlt(
+            original_message: original_message,
+            data:             batch_summary,
+            error:            e,
+            callback_class:   class_name,
+            callback_method:  method_name,
+            dlt_type:         "callback"
+          )
+        rescue KafkaBatch::ProducerError => pub_err
+          KafkaBatch.logger.error(
+            "[KafkaBatch][CallbackConsumer] DLT publish also failed for NameError path: #{pub_err.message}"
+          )
+        end
       rescue StandardError => e
         # Callback itself raised – forward to DLT with dlt_type "callback_error".
-        # The claim was already made so a retry would not re-invoke the callback,
-        # but forwarding to DLT ensures the failure is visible and replayable.
+        # claim_callback is called by process_callback after we return. If DLT
+        # publish fails here we must NOT let the exception propagate, otherwise
+        # claim_callback is skipped and every redelivery re-runs the callback.
         KafkaBatch.logger.error(
           "[KafkaBatch][CallbackConsumer] #{class_name}##{method_name} raised " \
           "#{e.class}: #{e.message}\n#{e.backtrace&.first(5)&.join("\n")}"
@@ -166,14 +176,21 @@ module KafkaBatch
           callback_method: method_name,
           error:           e
         )
-        publish_to_dlt(
-          original_message: original_message,
-          data:             batch_summary,
-          error:            e,
-          callback_class:   class_name,
-          callback_method:  method_name,
-          dlt_type:         "callback_error"
-        )
+        # Bug #3 fix: wrap publish_to_dlt – see NameError rescue above.
+        begin
+          publish_to_dlt(
+            original_message: original_message,
+            data:             batch_summary,
+            error:            e,
+            callback_class:   class_name,
+            callback_method:  method_name,
+            dlt_type:         "callback_error"
+          )
+        rescue KafkaBatch::ProducerError => pub_err
+          KafkaBatch.logger.error(
+            "[KafkaBatch][CallbackConsumer] DLT publish also failed for StandardError path: #{pub_err.message}"
+          )
+        end
       end
 
       def publish_to_dlt(original_message:, data:, error:, callback_class:, callback_method:,

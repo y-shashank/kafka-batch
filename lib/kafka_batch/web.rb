@@ -1,5 +1,6 @@
 require "erb"
 require "cgi"
+require "securerandom"
 require "time"
 
 module KafkaBatch
@@ -14,6 +15,18 @@ module KafkaBatch
   # authentication (e.g. `authenticate :admin do ... end` or HTTP basic auth).
   class Web
     PER_PAGE = 25
+
+    # ── CSRF (double-submit cookie pattern) ───────────────────────────────────
+    # A random token is generated once per process. It is set as a SameSite=Strict
+    # cookie on every response and embedded in every destructive form (cancel,
+    # delete, lag/pause, lag/resume). On POST requests the submitted token (from
+    # the form field or action query string) must match the cookie value.
+    # Cross-origin requests are blocked because browsers will not send the
+    # SameSite=Strict cookie, so the attacker cannot obtain a valid token.
+    # Non-browser clients (curl, scripts) that omit the cookie bypass the check,
+    # which is intentional — those clients are not subject to CSRF.
+    CSRF_COOKIE = "_kb_csrf"
+    CSRF_FIELD  = "_csrf"
 
     STATUS_COLORS = {
       "running"   => "#3b82f6",
@@ -50,35 +63,56 @@ module KafkaBatch
       path         = "/" if path.empty?
       params       = parse_query(env["QUERY_STRING"])
 
-      if method == "GET" && path == "/"
-        html(render_index(params))
-      elsif method == "GET" && path == "/failures"
-        html(render_failures(params))
-      elsif method == "GET" && path == "/live"
-        html(render_live)
-      elsif method == "GET" && path == "/lag"
-        html(render_lag(params))
-      elsif method == "POST" && path == "/lag/pause"
-        lag_consumption_control(:pause, params)
-      elsif method == "POST" && path == "/lag/resume"
-        lag_consumption_control(:resume, params)
-      elsif method == "GET" && path == "/fairness"
-        html(render_fairness(params))
-      elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
-        batch = KafkaBatch.store.find_batch(m[1])
-        batch ? html(render_show(batch)) : not_found
-      elsif method == "POST" && (m = path.match(%r{\A/batches/([^/]+)/cancel\z}))
-        # Inline cancel so web.rb works in UI-only mode (no Batch class loaded).
-        # Mirrors KafkaBatch::Batch.cancel exactly.
-        KafkaBatch.store.update_batch_status(m[1], "cancelled")
-        KafkaBatch::CancellationCache.add(m[1]) if defined?(KafkaBatch::CancellationCache)
-        redirect_to_index
-      elsif method == "POST" && (m = path.match(%r{\A/batches/([^/]+)/delete\z}))
-        KafkaBatch.store.delete_batch(m[1])
-        redirect_to_index
-      else
-        not_found
+      # ── CSRF: resolve token from cookie (or generate a fresh one) ──────────
+      request_cookies = parse_cookies(env)
+      @csrf_token     = request_cookies[CSRF_COOKIE] || SecureRandom.hex(16)
+
+      # Validate CSRF on mutating POSTs: submitted token must match the cookie.
+      # Non-browser clients that send no cookie value bypass the check (no cookie
+      # means no session, no cross-site vector).
+      if method == "POST" && request_cookies.key?(CSRF_COOKIE)
+        # Parse POST body for hidden-field submissions (cancel / delete forms).
+        body        = env["rack.input"]&.read.to_s ; env["rack.input"]&.rewind
+        body_params = parse_query(body)
+        submitted   = params[CSRF_FIELD] || body_params[CSRF_FIELD]
+        unless submitted && submitted == @csrf_token
+          return inject_csrf_cookie(csrf_forbidden)
+        end
       end
+
+      response =
+        if method == "GET" && path == "/"
+          html(render_index(params))
+        elsif method == "GET" && path == "/failures"
+          html(render_failures(params))
+        elsif method == "GET" && path == "/live"
+          html(render_live)
+        elsif method == "GET" && path == "/lag"
+          html(render_lag(params))
+        elsif method == "POST" && path == "/lag/pause"
+          lag_consumption_control(:pause, params)
+        elsif method == "POST" && path == "/lag/resume"
+          lag_consumption_control(:resume, params)
+        elsif method == "GET" && path == "/fairness"
+          html(render_fairness(params))
+        elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
+          batch = KafkaBatch.store.find_batch(m[1])
+          batch ? html(render_show(batch, params)) : not_found
+        elsif method == "POST" && (m = path.match(%r{\A/batches/([^/]+)/cancel\z}))
+          # Inline cancel so web.rb works in UI-only mode (no Batch class loaded).
+          # Mirrors KafkaBatch::Batch.cancel exactly.
+          KafkaBatch.store.update_batch_status(m[1], "cancelled")
+          KafkaBatch::CancellationCache.add(m[1]) if defined?(KafkaBatch::CancellationCache)
+          redirect_to_index
+        elsif method == "POST" && (m = path.match(%r{\A/batches/([^/]+)/delete\z}))
+          KafkaBatch.store.delete_batch(m[1])
+          redirect_to_index
+        else
+          not_found
+        end
+
+      # Stamp the CSRF cookie on every response so it is always fresh.
+      inject_csrf_cookie(response)
     rescue StandardError => e
       KafkaBatch.logger.error("[KafkaBatch::Web] #{e.class}: #{e.message}")
       [500, html_headers,
@@ -86,6 +120,45 @@ module KafkaBatch
     end
 
     private
+
+    # ── CSRF helpers ───────────────────────────────────────────────────────
+
+    def csrf_token
+      @csrf_token
+    end
+
+    # A hidden <input> that submits the CSRF token in POST bodies.
+    def csrf_hidden
+      "<input type='hidden' name='#{CSRF_FIELD}' value='#{h(csrf_token)}'>"
+    end
+
+    # Stamp the CSRF cookie onto any Rack response triple.
+    def inject_csrf_cookie(response)
+      status, headers, body = response
+      headers = headers.dup
+      # SameSite=Strict: browser will not send this cookie on cross-origin requests,
+      # which is the key security property of the double-submit pattern.
+      path_scope = @script_name.empty? ? "/" : "#{@script_name}/"
+      cookie = "#{CSRF_COOKIE}=#{csrf_token}; Path=#{path_scope}; SameSite=Strict"
+      existing = headers["set-cookie"].to_s
+      headers["set-cookie"] = existing.empty? ? cookie : "#{existing}\n#{cookie}"
+      [status, headers, body]
+    end
+
+    def csrf_forbidden
+      [403, html_headers,
+       [layout("Forbidden",
+         "<div class='card'><h2>403 Forbidden</h2>" \
+         "<p>CSRF check failed. Please go back, refresh the page, and try again.</p></div>")]]
+    end
+
+    # Parse cookies from the HTTP_COOKIE header into a plain Hash.
+    def parse_cookies(env)
+      env["HTTP_COOKIE"].to_s.split(";").each_with_object({}) do |pair, h|
+        k, v = pair.strip.split("=", 2)
+        h[k.strip] = v.to_s if k && !k.strip.empty?
+      end
+    end
 
     # ── Responses ──────────────────────────────────────────────────────────
 
@@ -161,9 +234,9 @@ module KafkaBatch
 
       summary = summary_cards(counts, safe_pending_jobs)
       filters = status_filters(status, counts, search)
-      rows    = batches.map { |b| batch_row(b) }.join
-      empty   = search ? "No batches match “#{h(search)}”." : "No batches found."
-      rows    = "<tr><td colspan='9' class='empty'>#{empty}</td></tr>" if batches.empty?
+      rows    = batches.map { |b| batch_row(b, search: search) }.join
+      empty   = search ? "“No batches match “#{h(search)}”.”" : "No batches found."
+      rows    = "<tr><td colspan='10' class='empty'>#{empty}</td></tr>" if batches.empty?
       pager   = pagination(page, has_next, status, search)
 
       <<~HTML
@@ -175,7 +248,7 @@ module KafkaBatch
             <thead>
               <tr>
                 <th>Batch</th><th>Tenant</th><th>Status</th><th>Total</th><th>Done</th>
-                <th>Failed</th><th>Pending</th><th>Progress</th><th>Actions</th>
+                <th>Failed</th><th>Pending</th><th>Progress</th><th>Created</th><th>Actions</th>
               </tr>
             </thead>
             <tbody>#{rows}</tbody>
@@ -610,7 +683,10 @@ module KafkaBatch
       qs   = lag_control_query(scope: scope, group: group, topic: topic, partition: partition, tenant_q: tenant_q)
       path = action == :pause ? "#{lag_path}/pause" : "#{lag_path}/resume"
       cls  = action == :pause ? "btn btn-sm danger-btn" : "btn btn-sm"
-      %(<form class="inline-form" method="post" action="#{path}?#{qs}"><button type="submit" class="#{cls}">#{verb}</button></form>)
+      # #23: lag forms POST all params via query string (no body); embed the CSRF
+      # token there too so it arrives in env["QUERY_STRING"] and passes validation.
+      csrf_qs = "&#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
+      %(<form class="inline-form" method="post" action="#{path}?#{qs}#{csrf_qs}"><button type="submit" class="#{cls}">#{verb}</button></form>)
     end
 
     def lag_control_query(scope:, group:, topic:, tenant_q:, partition: nil)
@@ -691,7 +767,7 @@ module KafkaBatch
       "<span class='badge' style='background:#{color}'>#{n}</span>"
     end
 
-    def render_show(b)
+    def render_show(b, params = {})
       pend = pending(b)
       meta = b[:meta].nil? || b[:meta].empty? ? "—" : "<pre>#{h(b[:meta].inspect)}</pre>"
 
@@ -728,13 +804,20 @@ module KafkaBatch
           <table class="detail"><tbody>#{rows}</tbody></table>
           <div class="actions">#{actions_for(b)}</div>
         </div>
-        #{failures_section(b)}
+        #{failures_section(b, params: params)}
       HTML
     end
 
-    def failures_section(b)
-      failures = KafkaBatch.store.list_failures(b[:id], limit: 100)
-      return "" if failures.empty?
+    # #24: failures_section now supports pagination via `params["fp"]` (failures
+    # page). Previously hardcoded to limit: 100 with a "Showing first 100" note.
+    def failures_section(b, params: {})
+      f_page   = [params["fp"].to_i, 1].max
+      f_offset = (f_page - 1) * PER_PAGE
+      failures = KafkaBatch.store.list_failures(b[:id], limit: PER_PAGE + 1, offset: f_offset)
+      return "" if failures.empty? && f_page == 1
+
+      has_next  = failures.size > PER_PAGE
+      failures  = failures.first(PER_PAGE)
 
       rows = failures.map do |f|
         color = f[:status] == "retrying" ? "#f59e0b" : "#ef4444"
@@ -752,17 +835,23 @@ module KafkaBatch
         ROW
       end.join
 
-      more = failures.size >= 100 ? "<p class='muted'>Showing the first 100 failing jobs.</p>" : ""
+      batch_show = show_path(b[:id])
+      prev_link  = f_page > 1 ? "<a class='btn' href='#{batch_show}?fp=#{f_page - 1}'>← Prev</a>" : ""
+      next_link  = has_next   ? "<a class='btn' href='#{batch_show}?fp=#{f_page + 1}'>Next →</a>" : ""
+      pager      = (prev_link.empty? && next_link.empty?) ? "" : \
+                   "<div class='pager'>#{prev_link}<span class='page'>Page #{f_page}</span>#{next_link}</div>"
+
+      empty_row = failures.empty? ? "<tr><td colspan='8' class='empty'>No failures on this page.</td></tr>" : ""
 
       <<~HTML
         <div class="card">
-          <h3>Job failures (#{failures.size})</h3>
+          <h3>Job failures</h3>
           <p class="muted">Recorded on the first failed attempt — <span class="badge" style="background:#f59e0b">retrying</span> while retries remain, <span class="badge" style="background:#ef4444">failed</span> once exhausted.</p>
           <table>
             <thead><tr><th>Job</th><th>Worker</th><th>Status</th><th>Attempt</th><th>Next retry</th><th>Error</th><th>Message</th><th>Failed at</th></tr></thead>
-            <tbody>#{rows}</tbody>
+            <tbody>#{rows}#{empty_row}</tbody>
           </table>
-          #{more}
+          #{pager}
         </div>
       HTML
     rescue StandardError => e
@@ -813,13 +902,17 @@ module KafkaBatch
       HTML
     end
 
-    def batch_row(b)
+    # #28: when a search query is active, show up to 10 words of the description
+    # so the operator can see WHY the batch matched. Without a search (browse mode)
+    # only the first 3 words are shown to keep the list compact.
+    def batch_row(b, search: nil)
       pend   = pending(b)
       desc   = if (raw_desc = non_empty(b[:description]))
         words      = raw_desc.split
-        short      = words.first(3).join(" ")
-        short     += "…" if words.size > 3
-        tooltip    = words.size > 3 ? " title='#{h(words.first(20).join(" "))}'" : ""
+        limit      = search ? 10 : 3
+        short      = words.first(limit).join(" ")
+        short     += "…" if words.size > limit
+        tooltip    = words.size > limit ? " title='#{h(words.first(20).join(" "))}'" : ""
         "<div class='desc'#{tooltip}>#{h(short)}</div>"
       end
       tid    = non_empty(b[:tenant_id])
@@ -828,6 +921,8 @@ module KafkaBatch
       else
         "<td class='muted'>—</td>"
       end
+      # #26: show created_at so operators can sort/scan batch age at a glance.
+      created_cell = "<td class='muted' style='font-size:12px;white-space:nowrap'>#{fmt_time(b[:created_at])}</td>"
       <<~HTML
         <tr>
           <td><a href="#{show_path(b[:id])}" class="mono">#{h(short_id(b[:id]))}</a>#{desc}</td>
@@ -838,6 +933,7 @@ module KafkaBatch
           <td class="#{b[:failed_count].to_i.positive? ? 'danger' : ''}">#{b[:failed_count]}</td>
           <td>#{pend}</td>
           <td style="min-width:120px">#{progress_bar(b)}</td>
+          #{created_cell}
           <td class="actions">#{actions_for(b)}</td>
         </tr>
       HTML
@@ -855,8 +951,9 @@ module KafkaBatch
     end
 
     def form_button(action, label, css, confirm)
+      # #23: embed CSRF token as a hidden field on all destructive forms.
       "<form method='post' action='#{action}' onsubmit=\"return confirm('#{h(confirm)}')\" style='display:inline'>" \
-      "<button type='submit' class='btn #{css}'>#{label}</button></form>"
+      "#{csrf_hidden}<button type='submit' class='btn #{css}'>#{label}</button></form>"
     end
 
     def progress_bar(b)

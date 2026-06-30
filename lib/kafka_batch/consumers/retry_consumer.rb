@@ -28,9 +28,9 @@ module KafkaBatch
     # are independent.
     class RetryConsumer < Karafka::BaseConsumer
       prepend ConsumptionGate
-      # Maximum time (seconds) to pause per wait cycle.
-      # Capped so the consumer isn't suspended for extremely long backoffs in
-      # one go; Karafka will re-deliver from the same offset after each pause.
+      # #25 fix: MAX_PAUSE_SECONDS is now a config knob (config.retry_max_pause_seconds,
+      # default 30). The constant is retained as a fallback for callers that read it
+      # directly (e.g. tests), but the consumer reads from config at runtime.
       MAX_PAUSE_SECONDS = 30
 
       def consume
@@ -50,7 +50,24 @@ module KafkaBatch
       # @return [Boolean] true if the message was handled (offset may advance),
       #   false if the partition was paused and the loop must stop.
       def process_retry(message)
-        data        = decode(message.raw_payload)
+        # Bug #11 fix: detect malformed JSON early and DLT with the raw bytes
+        # preserved. The previous code called decode → {} on parse error, then
+        # fell through to the "unroutable" path with data={}, losing raw bytes.
+        raw = message.raw_payload
+        data = begin
+          decode(raw)
+        rescue Oj::ParseError => e
+          KafkaBatch.logger.error(
+            "[KafkaBatch][RetryConsumer] Malformed JSON in retry message – forwarding to DLT: #{e.message}"
+          )
+          publish_to_dlt(
+            data:  { "dlt_raw_payload" => raw.to_s, "dlt_parse_error" => e.message },
+            topic: message.topic
+          )
+          mark_as_consumed!(message)
+          return true
+        end
+
         retry_after = parse_time(data["retry_after"])
         retry_to    = data["retry_to"]
 
@@ -63,7 +80,12 @@ module KafkaBatch
             "– failing job and forwarding to DLT: #{data.inspect}"
           )
           emit_failed_event(data, message)
-          publish_to_dlt(data: data, topic: message.topic)
+          # #30: include raw bytes in the DLT payload so the unroutable message
+          # is fully recoverable even if the decoded `data` is missing fields.
+          publish_to_dlt(
+            data:  data.merge("dlt_raw_payload" => raw.to_s),
+            topic: message.topic
+          )
           mark_as_consumed!(message)
           return true
         end
@@ -76,7 +98,11 @@ module KafkaBatch
           # Not ready yet – pause this partition.
           # Karafka will resume from message.offset after pause_ms milliseconds,
           # at which point we check again.  No thread is blocked.
-          pause_ms = ([wait_seconds, MAX_PAUSE_SECONDS].min * 1000).ceil
+          # #25: read the cap from config (default 30s) so operators can tune it
+          # without patching the gem.
+          max_pause = KafkaBatch.config.retry_max_pause_seconds.to_i
+          max_pause = MAX_PAUSE_SECONDS if max_pause <= 0
+          pause_ms = ([wait_seconds, max_pause].min * 1000).ceil
 
           KafkaBatch.logger.debug(
             "[KafkaBatch][RetryConsumer] job_id=#{data['job_id']} not due for " \
@@ -157,15 +183,22 @@ module KafkaBatch
           ),
           key: data["job_id"]
         )
+        # #22: emit dlt_published instrumentation so operators can track DLT rates.
+        KafkaBatch::Instrumentation.dlt_published(
+          batch_id:     data["batch_id"],
+          job_id:       data["job_id"],
+          dlt_type:     "retry_routing",
+          source_topic: topic
+        )
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error("[KafkaBatch][RetryConsumer] DLT publish failed: #{e.message}")
         raise  # leave offset uncommitted → redelivery
       end
 
+      # Bug #11 fix: let Oj::ParseError propagate so process_retry can DLT the
+      # raw bytes. Previously returning {} caused raw bytes to be lost in the DLT.
       def decode(raw)
         Oj.load(raw)
-      rescue Oj::ParseError
-        {}
       end
 
       def parse_time(str)

@@ -21,9 +21,13 @@ module KafkaBatch
   #   job.retried.kafka_batch          – job scheduled for retry
   #   job.failed.kafka_batch           – job exhausted all retries
   #   job.cancelled.kafka_batch        – job skipped (batch was cancelled)
+  #   job.emit_retried.kafka_batch     – completion-event produce retried inline
+  #   batch.created.kafka_batch        – a new batch was persisted
+  #   batch.sealed.kafka_batch         – block-form population finished; batch sealed
   #   batch.completed.kafka_batch      – batch reached terminal state
   #   callback.invoked.kafka_batch     – on_success / on_complete callback ran
   #   callback.failed.kafka_batch      – callback raised or was unresolvable
+  #   dlt.published.kafka_batch        – a message was forwarded to the dead-letter topic
   #   consumer.priority_yielded.kafka_batch – p1 consumer paused for p0 lag
   #   reconciler.ran.kafka_batch       – reconciler sweep completed
   #
@@ -75,7 +79,42 @@ module KafkaBatch
         })
       end
 
+      # Fired when the JobConsumer retries the completion-event produce inline.
+      # Subscribe to this event to detect Kafka producer instability that is
+      # causing event-emission retries (which block the consumer thread).
+      def job_emit_retried(job_id:, batch_id:, attempt:, error:)
+        instrument("job.emit_retried", {
+          job_id:        job_id,
+          batch_id:      batch_id,
+          attempt:       attempt,
+          error_class:   error.class.name,
+          error_message: error.message
+        })
+      end
+
       # ── Batch events ───────────────────────────────────────────────────
+
+      # Fired immediately after a new batch is persisted in the store. Useful
+      # for tracking batch creation rates and correlating batch_id across systems.
+      def batch_created(batch_id:, description: nil, tenant_id: nil, on_success: nil, on_complete: nil)
+        instrument("batch.created", {
+          batch_id:    batch_id,
+          description: description,
+          tenant_id:   tenant_id,
+          on_success:  on_success,
+          on_complete: on_complete
+        })
+      end
+
+      # Fired when a block-form batch is sealed (population finished). For bare
+      # (non-block) batches the batch is sealed at create time; no separate event
+      # is emitted so as to avoid duplicate signals.
+      def batch_sealed(batch_id:, total_jobs:)
+        instrument("batch.sealed", {
+          batch_id:   batch_id,
+          total_jobs: total_jobs
+        })
+      end
 
       def batch_completed(batch_id:, outcome:, total_jobs:, completed_count:, failed_count:)
         instrument("batch.completed", {
@@ -104,6 +143,22 @@ module KafkaBatch
           callback_method: callback_method.to_s,
           error_class:     error.class.name,
           error_message:   error.message
+        })
+      end
+
+      # ── DLT events ─────────────────────────────────────────────────────
+
+      # Fired whenever any consumer publishes a message to the dead-letter topic.
+      # dlt_type is a short label identifying the publish path, e.g.:
+      #   "retry_routing"   – RetryConsumer could not route the retry
+      #   "callback_failed" – CallbackConsumer failed to invoke the callback
+      #   "job_failed"      – JobConsumer exhausted retries (forwarded by store)
+      def dlt_published(batch_id: nil, job_id: nil, dlt_type:, source_topic:)
+        instrument("dlt.published", {
+          batch_id:     batch_id,
+          job_id:       job_id,
+          dlt_type:     dlt_type,
+          source_topic: source_topic
         })
       end
 

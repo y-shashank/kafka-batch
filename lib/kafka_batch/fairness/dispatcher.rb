@@ -29,40 +29,55 @@ module KafkaBatch
       PAUSE_MS      = 500
       LAG_CACHE_TTL = 1.0  # seconds – Admin lag is polled at most this often per process
 
-      @lag_cache = { value: 0, at: -1.0 }
-      @lag_mutex = Mutex.new
-      class << self; attr_accessor :lag_cache, :lag_mutex; end
+      @lag_cache       = { value: 0, at: -1.0 }
+      @lag_mutex       = Mutex.new
+      # Bug #6 fix: promote @throttled to class-level with its own mutex so all
+      # Dispatcher instances in this pod (one per assigned ingest partition) share
+      # a single consistent throttle state, matching the class-wide lag cache.
+      @throttled       = false
+      @throttled_mutex = Mutex.new
+      class << self
+        attr_accessor :lag_cache, :lag_mutex, :throttled, :throttled_mutex
+      end
 
+      # Bug #7 fix: batch all messages into produce_many_sync (single broker
+      # round-trip) and commit only the last offset, instead of produce_sync +
+      # mark_as_consumed! per message in a loop.
       def consume
         if throttled?
           pause(messages.first.offset, PAUSE_MS)  # ready topic too deep – wait
           return
         end
 
-        messages.each do |message|
-          KafkaBatch::Producer.produce_sync(
+        msgs_to_produce = messages.map do |message|
+          {
             topic:   KafkaBatch.config.fairness_ready_topic,
-            payload: message.raw_payload,           # forward verbatim
+            payload: message.raw_payload,           # forward verbatim (already JSON)
             key:     job_key(message.raw_payload)   # spread across ready partitions
-          )
-          mark_as_consumed!(message)
+          }
         end
+
+        KafkaBatch::Producer.produce_many_sync(msgs_to_produce)
+        mark_as_consumed!(messages.last)
       end
 
       private
 
       # Hysteresis around the ready-topic depth so we don't flap on one threshold.
+      # Bug #6 fix: use class-level throttle state (with mutex) so all Dispatcher
+      # instances in this pod observe the same watermark consistently.
       def throttled?
         lag  = cached_ready_lag
         high = KafkaBatch.config.fairness_ready_lag_high.to_i
         low  = KafkaBatch.config.fairness_ready_lag_low.to_i
-        @throttled = false if @throttled.nil?
-        if @throttled
-          @throttled = false if lag < low
-        elsif lag >= high
-          @throttled = true
+        self.class.throttled_mutex.synchronize do
+          if self.class.throttled
+            self.class.throttled = false if lag < low
+          elsif lag >= high
+            self.class.throttled = true
+          end
+          self.class.throttled
         end
-        @throttled
       end
 
       # Process-wide cached ready-topic lag (avoids an Admin call per poll).

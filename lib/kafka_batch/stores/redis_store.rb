@@ -36,13 +36,17 @@ module KafkaBatch
       # Atomically apply a completion, deduplicating by a monotonic per-partition
       # cursor over the job message's source offset, then check for completion.
       #   KEYS[1] = batch hash, KEYS[2] = offsets hash
+      #   KEYS[3] = RUNNING_INDEX zset, KEYS[4] = DONE_INDEX zset
       #   ARGV[1] = "topic/partition" field, ARGV[2] = source_offset,
-      #   ARGV[3] = counter field, ARGV[4] = ttl, ARGV[5] = now (iso8601)
+      #   ARGV[3] = counter field, ARGV[4] = ttl, ARGV[5] = now (iso8601),
+      #   ARGV[6] = finished_at score (unix float as string, for DONE_INDEX zadd)
       # Returns [code, payload]:
       #   [0, "duplicate"]  – source_offset already applied (dedup)
       #   [0, "not_found"]  – batch hash does not exist
       #   [1, outcome]      – batch just completed; outcome = "success"|"complete"
       #   [2, "continue"]   – still jobs outstanding
+      # Bug #1 fix: index updates (RUNNING→DONE) are now INSIDE the Lua script,
+      # making finalization and index movement a single atomic operation.
       BATCH_DONE_OFFSET_LUA = <<~LUA.freeze
         local last = redis.call('HGET', KEYS[2], ARGV[1])
         if last and tonumber(ARGV[2]) <= tonumber(last) then return {0, 'duplicate'} end
@@ -72,6 +76,13 @@ module KafkaBatch
           redis.call('HSET', KEYS[1], 'status',      outcome)
           redis.call('HSET', KEYS[1], 'finished_at', ARGV[5])
           redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+          -- Atomically move from RUNNING_INDEX to DONE_INDEX so no intermediate
+          -- state is visible if the process crashes after Lua returns.
+          local batch_id = redis.call('HGET', KEYS[1], 'id')
+          if batch_id then
+            redis.call('ZREM', KEYS[3], batch_id)
+            redis.call('ZADD', KEYS[4], tonumber(ARGV[6]), batch_id)
+          end
           return {1, outcome}
         end
 
@@ -246,8 +257,8 @@ module KafkaBatch
 
         result = with_redis do |r|
           r.eval(BATCH_DONE_OFFSET_LUA,
-            keys: [bkey, OFFSETS_KEY],
-            argv: [offset_field, source_offset.to_s, field, @ttl.to_s, now]
+            keys: [bkey, OFFSETS_KEY, RUNNING_INDEX, DONE_INDEX],
+            argv: [offset_field, source_offset.to_s, field, @ttl.to_s, now, Time.now.to_f.to_s]
           )
         end
 
@@ -255,10 +266,7 @@ module KafkaBatch
         case code
         when 0 then { status: payload.to_sym }
         when 1
-          with_redis do |r|
-            r.zrem(RUNNING_INDEX, batch_id)
-            r.zadd(DONE_INDEX, Time.now.to_f, batch_id)
-          end
+          # Index movement now done atomically inside Lua (Bug #1 fix).
           { status: :done, outcome: payload, batch: find_batch(batch_id) }
         when 2 then { status: :continue }
         end
@@ -273,31 +281,41 @@ module KafkaBatch
         return [] if events.empty?
         now = Time.now.iso8601
 
+        now_float = Time.now.to_f.to_s
         results = with_redis do |r|
           r.pipelined do |pipe|
             events.each do |e|
               field        = e[:status] == "success" ? "completed_count" : "failed_count"
               offset_field = "#{e[:source_topic]}/#{e[:source_partition]}"
+              # Bug #1 fix: pass RUNNING_INDEX and DONE_INDEX as KEYS[3]/KEYS[4]
+              # so index movement is atomic with finalization inside Lua.
               pipe.eval(BATCH_DONE_OFFSET_LUA,
-                keys: [batch_key(e[:batch_id]), OFFSETS_KEY],
-                argv: [offset_field, e[:source_offset].to_s, field, @ttl.to_s, now])
+                keys: [batch_key(e[:batch_id]), OFFSETS_KEY, RUNNING_INDEX, DONE_INDEX],
+                argv: [offset_field, e[:source_offset].to_s, field, @ttl.to_s, now, now_float])
             end
           end
         end
 
-        finalized = []
-        results.each_with_index do |res, i|
-          code, payload = res
-          next unless code == 1  # 1 == just finalized
+        # #29 fix: collect (result, index) pairs for batches that just finalized,
+        # then pipeline all their HGETALL calls in ONE round-trip instead of
+        # calling find_batch (one HGETALL each) sequentially inside the loop.
+        finalized_indices = results.each_with_index.select { |(res, _)| res[0] == 1 }
 
-          batch_id = events[i][:batch_id]
-          with_redis do |r|
-            r.zrem(RUNNING_INDEX, batch_id)
-            r.zadd(DONE_INDEX, Time.now.to_f, batch_id)
-          end
-          finalized << { batch: find_batch(batch_id), outcome: payload }
+        if finalized_indices.empty?
+          return []
         end
-        finalized
+
+        batch_hashes = with_redis do |r|
+          r.pipelined do |pipe|
+            finalized_indices.each { |(_, i)| pipe.hgetall(batch_key(events[i][:batch_id])) }
+          end
+        end
+
+        finalized_indices.each_with_index.map do |(res, _i), j|
+          _code, payload = res
+          h = batch_hashes[j]
+          { batch: (h && !h.empty? ? hash_to_batch(h) : nil), outcome: payload }
+        end.compact
       end
 
       def add_jobs(id, count)
@@ -422,13 +440,21 @@ module KafkaBatch
         end
       end
 
-      # Aggregate failures across all (non-expired) batches via the all-index.
+      # Bug #10 fix: pipeline all hvals calls into one round-trip instead of
+      # O(N) sequential round-trips (one per batch ID).
       def list_all_failures(limit: 100, offset: 0, status: nil)
         ids = with_redis { |r| r.zrevrange(ALL_INDEX, 0, -1) }
+        return sort_paginate([], limit, offset) if ids.empty?
+
+        all_vals = with_redis do |r|
+          r.pipelined do |pipe|
+            ids.each { |bid| pipe.hvals(failures_key(bid)) }
+          end
+        end
+
         entries = []
-        ids.each do |bid|
-          vals = with_redis { |r| r.hvals(failures_key(bid)) }
-          next if vals.empty?
+        ids.zip(all_vals).each do |bid, vals|
+          next if vals.nil? || vals.empty?
           vals.each do |v|
             h = deserialize(v)
             next if status && h["status"] != status
@@ -438,18 +464,30 @@ module KafkaBatch
         sort_paginate(entries, limit, offset)
       end
 
+      # Bug #5 fix: pipeline all hgetall calls into a single round-trip instead
+      # of calling find_batch (one HGETALL each) per ID in a Ruby loop.
       def list_batches(status: nil, limit: 50, offset: 0, search: nil)
         ids = with_redis { |r| r.zrevrange(ALL_INDEX, 0, -1) }
+        return [] if ids.empty?
+
+        q = presence(search)&.downcase
+
+        raw_batches = with_redis do |r|
+          r.pipelined do |pipe|
+            ids.each { |id| pipe.hgetall(batch_key(id)) }
+          end
+        end
+
+        expired = []
         result  = []
         skipped = 0
-        q       = presence(search)&.downcase
 
-        ids.each do |id|
-          batch = find_batch(id)
-          if batch.nil?
-            with_redis { |r| r.zrem(ALL_INDEX, id) }  # expired – prune
+        ids.zip(raw_batches).each do |id, h|
+          if h.nil? || h.empty?
+            expired << id
             next
           end
+          batch = hash_to_batch(h)
           next if status && batch[:status] != status
           next if q && !batch_matches?(batch, q)
 
@@ -461,6 +499,9 @@ module KafkaBatch
           result << batch
           break if result.size >= limit
         end
+
+        # Lazily prune expired entries from the index.
+        with_redis { |r| expired.each { |id| r.zrem(ALL_INDEX, id) } } unless expired.empty?
 
         result
       end
@@ -481,18 +522,29 @@ module KafkaBatch
         end
       end
 
+      # Bug #17 fix: pipeline all HGET status calls into one round-trip instead of
+      # calling batch_status (one HGET each) per ID in a Ruby loop.
       def batch_counts
-        ids    = with_redis { |r| r.zrange(ALL_INDEX, 0, -1) }
-        counts = Hash.new(0)
+        ids = with_redis { |r| r.zrange(ALL_INDEX, 0, -1) }
+        return {} if ids.empty?
 
-        ids.each do |id|
-          st = batch_status(id)
+        statuses = with_redis do |r|
+          r.pipelined do |pipe|
+            ids.each { |id| pipe.hget(batch_key(id), "status") }
+          end
+        end
+
+        counts  = Hash.new(0)
+        expired = []
+        ids.zip(statuses).each do |id, st|
           if st.nil?
-            with_redis { |r| r.zrem(ALL_INDEX, id) }  # expired – prune
+            expired << id
           else
             counts[st] += 1
           end
         end
+
+        with_redis { |r| expired.each { |id| r.zrem(ALL_INDEX, id) } } unless expired.empty?
 
         counts
       end

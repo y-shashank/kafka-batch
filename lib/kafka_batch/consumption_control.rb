@@ -22,11 +22,24 @@ module KafkaBatch
       end
 
       # @return [Symbol, nil] :redis or :mysql
+      #
+      # Bug #16 fix: cache the backend probe for 30 seconds. Previously every
+      # call to backend (from pause_topic, load_snapshot, etc.) performed a live
+      # Redis PING, turning every ConsumptionControl call into a network round-trip.
+      #
+      # IMPORTANT: uses a dedicated backend_mutex — NOT cache_mutex — because
+      # cached_snapshot holds cache_mutex while calling load_snapshot → backend.
+      # Ruby mutexes are non-reentrant; locking cache_mutex here would deadlock.
       def backend
-        return :redis if redis_available?
-        return :mysql if mysql_available?
-
-        nil
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        backend_mutex.synchronize do
+          @backend_cache ||= { value: nil, at: -Float::INFINITY }
+          if (now - @backend_cache[:at]) >= 30
+            @backend_cache[:value] = detect_backend
+            @backend_cache[:at]    = now
+          end
+          @backend_cache[:value]
+        end
       end
 
       def pause_topic(group:, topic:)
@@ -98,9 +111,22 @@ module KafkaBatch
         cache_mutex.synchronize do
           @snapshot_cache = { at: -Float::INFINITY, snap: empty_snapshot }
         end
+        backend_mutex.synchronize do
+          @backend_cache = { value: nil, at: -Float::INFINITY }
+        end
       end
 
       private
+
+      def backend_mutex
+        @backend_mutex ||= Mutex.new
+      end
+
+      def detect_backend
+        return :redis if redis_available?
+        return :mysql if mysql_available?
+        nil
+      end
 
       def empty_snapshot
         { topics: Set.new, partitions: Set.new }

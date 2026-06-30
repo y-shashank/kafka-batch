@@ -8,10 +8,14 @@ module KafkaBatch
       # Built on first use so ActiveRecord doesn't need to be booted at
       # require-time (avoids issues in tests and non-Rails environments).
 
+      # Bug #19 fix: set inheritance_column = nil on all anonymous AR models so
+      # ActiveRecord's STI machinery never activates on a "type" column (if any),
+      # and avoids class-name lookup errors on anonymous classes.
       def batch_record_class
         @batch_record_class ||= begin
           klass = Class.new(ActiveRecord::Base)
-          klass.table_name = "kafka_batch_records"
+          klass.table_name        = "kafka_batch_records"
+          klass.inheritance_column = nil
           klass
         end
       end
@@ -19,7 +23,8 @@ module KafkaBatch
       def consumer_offset_class
         @consumer_offset_class ||= begin
           klass = Class.new(ActiveRecord::Base)
-          klass.table_name = "kafka_batch_consumer_offsets"
+          klass.table_name        = "kafka_batch_consumer_offsets"
+          klass.inheritance_column = nil
           klass
         end
       end
@@ -27,7 +32,8 @@ module KafkaBatch
       def failure_class
         @failure_class ||= begin
           klass = Class.new(ActiveRecord::Base)
-          klass.table_name = "kafka_batch_failures"
+          klass.table_name        = "kafka_batch_failures"
+          klass.inheritance_column = nil
           klass
         end
       end
@@ -35,8 +41,9 @@ module KafkaBatch
       def heartbeat_class
         @heartbeat_class ||= begin
           klass = Class.new(ActiveRecord::Base)
-          klass.table_name = "kafka_batch_consumer_heartbeats"
-          klass.primary_key = "consumer_id"
+          klass.table_name        = "kafka_batch_consumer_heartbeats"
+          klass.primary_key       = "consumer_id"
+          klass.inheritance_column = nil
           klass
         end
       end
@@ -44,7 +51,8 @@ module KafkaBatch
       def consumption_pause_class
         @consumption_pause_class ||= begin
           klass = Class.new(ActiveRecord::Base)
-          klass.table_name = "kafka_batch_consumption_pauses"
+          klass.table_name        = "kafka_batch_consumption_pauses"
+          klass.inheritance_column = nil
           klass
         end
       end
@@ -247,6 +255,7 @@ module KafkaBatch
         batch_record_class.where(status: "cancelled").pluck(:id)
       end
 
+      # Bug #4 fix: add a retry cap so RecordNotUnique can't spin forever.
       def record_failure(batch_id:, job_id:, worker_class:, error_class:, error_message:, attempt: 0, status: "failed", next_retry_at: nil)
         attrs = {
           worker_class:  worker_class.to_s,
@@ -257,15 +266,24 @@ module KafkaBatch
           next_retry_at: next_retry_at,
           failed_at:     Time.now
         }
-        # Upsert per (batch_id, job_id): reflect the latest failed attempt.
-        rec = failure_class.find_by(batch_id: batch_id, job_id: job_id)
-        if rec
-          rec.update!(attrs)
-        else
-          failure_class.create!(attrs.merge(batch_id: batch_id, job_id: job_id))
+        retries = 0
+        begin
+          # Upsert per (batch_id, job_id): reflect the latest failed attempt.
+          rec = failure_class.find_by(batch_id: batch_id, job_id: job_id)
+          if rec
+            rec.update!(attrs)
+          else
+            failure_class.create!(attrs.merge(batch_id: batch_id, job_id: job_id))
+          end
+        rescue ActiveRecord::RecordNotUnique
+          # Lost a create race – the row now exists; retry the find+update path.
+          retries += 1
+          retry if retries < 3
+          KafkaBatch.logger.error(
+            "[KafkaBatch][MysqlStore] record_failure upsert failed after #{retries} retries " \
+            "for batch_id=#{batch_id} job_id=#{job_id}"
+          )
         end
-      rescue ActiveRecord::RecordNotUnique
-        retry  # lost a create race – the row now exists, update it
       end
 
       def clear_failure(batch_id, job_id)
@@ -387,8 +405,17 @@ module KafkaBatch
         scope.limit(limit).offset(offset).map { |r| record_to_hash(r) }
       end
 
+      # Bug #9 fix: cache batch_counts for 5 seconds to avoid a full-table GROUP BY
+      # on every web request. The store instance is a singleton so the cache is
+      # process-wide and consistent with the instance's connection.
       def batch_counts
-        batch_record_class.group(:status).count
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        if @batch_counts_cache && (now - @batch_counts_cache[:at]) < 5
+          return @batch_counts_cache[:counts]
+        end
+        counts = batch_record_class.group(:status).count
+        @batch_counts_cache = { counts: counts, at: now }
+        counts
       end
 
       def mark_finished(id, outcome)
@@ -430,17 +457,23 @@ module KafkaBatch
       # Distributed lock using MySQL advisory locks (GET_LOCK / RELEASE_LOCK).
       # GET_LOCK(name, 0) returns 1 if acquired, 0 if another session holds it.
       # Using timeout=0 so we don't block; the reconciler simply skips if locked.
+      #
+      # Bug #15 fix: use with_connection to hold an explicit checkout for the
+      # entire lock lifetime. MySQL advisory locks are connection-scoped; if the
+      # pool recycles `connection` between GET_LOCK and RELEASE_LOCK the lock is
+      # silently orphaned on the recycled connection and we lose mutual exclusion.
       def with_reconciler_lock(ttl: 300)
         lock_name = "kafka_batch_reconciler"
-        conn      = batch_record_class.connection
 
-        acquired = conn.select_value("SELECT GET_LOCK(#{conn.quote(lock_name)}, 0)").to_i
-        return unless acquired == 1
+        batch_record_class.connection_pool.with_connection do |conn|
+          acquired = conn.select_value("SELECT GET_LOCK(#{conn.quote(lock_name)}, 0)").to_i
+          return unless acquired == 1
 
-        begin
-          yield
-        ensure
-          conn.execute("SELECT RELEASE_LOCK(#{conn.quote(lock_name)})")
+          begin
+            yield
+          ensure
+            conn.execute("SELECT RELEASE_LOCK(#{conn.quote(lock_name)})")
+          end
         end
       rescue => e
         KafkaBatch.logger.error("[KafkaBatch][MysqlStore] Reconciler lock error: #{e.message}")

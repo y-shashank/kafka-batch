@@ -11,16 +11,19 @@ module KafkaBatch
   # Consequence: cancellation is eventually-consistent – jobs already queued may
   # still run until the next refresh. That is an accepted trade-off for throughput.
   module CancellationCache
-    @mutex      = Mutex.new
-    @ids        = nil   # Set of cancelled batch ids, or nil before first load
-    @fetched_at = nil   # monotonic seconds of last successful refresh
+    @mutex    = Mutex.new
+    # Bug #8 fix: store ids + timestamp as a single snapshot object so the fast
+    # path reads one reference (atomic on all Ruby runtimes including JRuby /
+    # TruffleRuby) instead of two separate instance-variable reads that could
+    # race on non-MRI runtimes (split-brain: @ids from one epoch, @fetched_at
+    # from another).
+    @snapshot = nil  # { ids: Set<String>, at: Float } or nil before first load
 
     class << self
       # @return [Boolean] whether the batch is known-cancelled as of the last refresh
       def cancelled?(batch_id)
         return false if batch_id.nil?
-        ids = current_ids
-        ids.include?(batch_id)
+        current_ids.include?(batch_id)
       end
 
       # Optimistically add a batch_id to the local cache immediately after an
@@ -31,32 +34,30 @@ module KafkaBatch
       def add(batch_id)
         return if batch_id.nil?
         @mutex.synchronize do
-          @ids = (@ids || Set.new) << batch_id.to_s
+          snap = @snapshot || { ids: Set.new, at: -Float::INFINITY }
+          @snapshot = { ids: snap[:ids].dup.add(batch_id.to_s), at: snap[:at] }
         end
       end
 
       # Drop the cache (tests / after fork).
       def reset!
-        @mutex.synchronize do
-          @ids        = nil
-          @fetched_at = nil
-        end
+        @mutex.synchronize { @snapshot = nil }
       end
 
       private
 
       def current_ids
-        # Fast path: fresh enough, no lock needed.
-        cached = @ids
-        return cached if cached && fresh?(@fetched_at)
+        # Fast path: single atomic reference read – safe on all runtimes.
+        snap = @snapshot
+        return snap[:ids] if snap && fresh?(snap[:at])
 
         @mutex.synchronize do
-          # Re-check under the lock in case another thread just refreshed.
-          return @ids if @ids && fresh?(@fetched_at)
+          snap = @snapshot
+          return snap[:ids] if snap && fresh?(snap[:at])
 
-          @ids        = fetch_ids
-          @fetched_at = now
-          @ids
+          ids = fetch_ids
+          @snapshot = { ids: ids, at: now }
+          ids
         end
       end
 
@@ -66,7 +67,7 @@ module KafkaBatch
         KafkaBatch.logger.warn(
           "[KafkaBatch][CancellationCache] refresh failed: #{e.message} – keeping previous set"
         )
-        @ids || Set.new
+        @snapshot&.dig(:ids) || Set.new
       end
 
       def fresh?(stamp)

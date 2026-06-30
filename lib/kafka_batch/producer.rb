@@ -102,8 +102,20 @@ module KafkaBatch
         end
       end
 
+      # Serialize +payload+ to a UTF-8 string and optionally enforce a maximum
+      # byte size so callers get a clear KafkaBatch::ProducerError instead of an
+      # opaque rdkafka / WaterDrop error when the message exceeds broker limits.
+      #
+      # #21 fix: guard against oversized payloads before handing off to librdkafka.
       def encode(payload)
-        payload.is_a?(String) ? payload : Oj.dump(payload, mode: :compat)
+        encoded = payload.is_a?(String) ? payload : Oj.dump(payload, mode: :compat)
+        max = KafkaBatch.config.max_message_bytes
+        if max && max > 0 && encoded.bytesize > max
+          raise KafkaBatch::ProducerError,
+                "Payload too large: #{encoded.bytesize} bytes exceeds " \
+                "config.max_message_bytes (#{max}). Reduce payload size or raise the limit."
+        end
+        encoded
       end
     end
 
