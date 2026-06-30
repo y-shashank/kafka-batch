@@ -1129,21 +1129,47 @@ See [Scaling consumer groups independently](#scaling-consumer-groups-independent
 
 ### Partitioning & topic sizing (important)
 
-Tenants are mapped to ingest partitions by **Kafka's key-hash partitioner** — the gem sets the message key to `tenant_id`, and the producer/consumer discover the partition count automatically. Consequences:
+The ingest and ready topics have **different sizing constraints** — one is about tenant spread, the other about consumer throughput. Size them independently.
+
+#### Ingest topic — sized for tenant fairness
+
+Tenants are mapped to ingest partitions by **Kafka's key-hash partitioner** (message key = `tenant_id`). Consequences:
 
 - A given tenant **always lands on the same partition** (consistent hashing); tenants spread across partitions by hash.
-- It is **hash-based, not a guaranteed 1-tenant-per-partition mapping.** When you have more tenants than partitions (or on hash collisions), **multiple tenants share a partition** and FIFO-contend with each other — fairness *between those tenants* degrades. So size the ingest topic with **partitions ≈ your max concurrent tenant count** (with headroom). A single-partition topic gives **no fairness at all**.
+- It is **hash-based, not a guaranteed 1-tenant-per-partition mapping.** When you have more tenants than partitions (or on hash collisions), **multiple tenants share a partition** and FIFO-contend with each other — fairness *between those tenants* degrades. A single-partition topic gives **no fairness at all**.
 - **You must pre-create the ingest topic with enough partitions.** The gem does **not** create topics or set partition counts. Relying on Kafka auto-create yields the broker default (often 1 partition).
 
-  ```bash
-  kafka-topics --create --topic <prefix>kafka_batch.ingest --partitions 512 --replication-factor 3
-  kafka-topics --create --topic <prefix>kafka_batch.ready  --partitions 64  --replication-factor 3
-  ```
+Size ingest partitions to your **expected concurrent active tenants**, not your total tenant count — in typical SaaS deployments most tenants are idle at any time:
 
-**Boot safety check:** when any worker opts into fairness, KafkaBatch checks the ingest topic's partition count at Rails boot and again when Karafka starts. It **warns** if the count is below `config.fairness_min_ingest_partitions` (default `2`; a single partition is always flagged). Set `config.validate_topics_on_boot = true` to **raise** instead of warn. Set `fairness_min_ingest_partitions` near your expected concurrent-tenant count to enforce proper sizing:
+> **Ingest partitions ≈ `max(50, total_distinct_tenants / 4)`**
+>
+> At minimum 50; scale to ~25% of total tenants once that is larger. If 1 in 4 tenants is active on average, this gives good per-tenant partition isolation without over-provisioning.
+
+Keep `-dispatch` consumer count equal to ingest partition count — a dispatch consumer without a partition is wasted and adds rebalance overhead.
+
+#### Ready topic — sized for consumer throughput
+
+This is a different constraint. Kafka assigns **at most one partition per consumer** in a group. If `-jobs-fair` has 100 pods and the ready topic has only 64 partitions, 36 pods get assigned zero partitions and sit permanently idle — they joined the group, participated in the rebalance, and do no work.
+
+> **Ready partitions ≥ consumer pod count** — the hard minimum so every pod gets ≥1 partition
+>
+> **Ready partitions = pod count × Karafka concurrency** — for full thread utilization during bursts
+
+With 100 pods and `concurrency = 5`: 500 ready partitions means each pod gets 5 partitions and all 5 threads stay busy under load. There is a natural ceiling though — the dispatcher's throttle (the `fairness_ready_lag_high` watermark) caps how deep the ready topic ever gets, so going much beyond `pods × concurrency` adds broker metadata overhead for no throughput gain.
+
+```bash
+# Example: 400 total tenants, 100 job-consumer pods, concurrency = 5
+kafka-topics --create --topic kafka_batch.ingest --partitions 100 --replication-factor 3
+#            ingest = max(50, 400/4) = 100   (tenant fairness)
+
+kafka-topics --create --topic kafka_batch.ready  --partitions 500 --replication-factor 3
+#            ready  = 100 pods × 5 concurrency  (consumer throughput)
+```
+
+**Boot safety check:** when any worker opts into fairness, KafkaBatch checks the ingest topic's partition count at Rails boot and again when Karafka starts. It **warns** if the count is below `config.fairness_min_ingest_partitions` (default `2`; a single partition is always flagged). Set `config.validate_topics_on_boot = true` to **raise** instead of warn:
 
 ```ruby
-config.fairness_min_ingest_partitions = 128   # warn/raise if the ingest topic has fewer
+config.fairness_min_ingest_partitions = 50  # warn/raise if the ingest topic has fewer
 ```
 
 > For **strict** 1:1 tenant→partition isolation you'd supply a custom WaterDrop partitioner mapping `tenant_id → a dedicated partition`; the gem ships only the standard key-hash partitioning.
