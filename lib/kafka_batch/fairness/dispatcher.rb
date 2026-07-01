@@ -70,6 +70,16 @@ module KafkaBatch
         KafkaBatch::Producer.produce_many_sync(msgs_to_produce)
         mark_as_consumed!(messages.last)
 
+        # Optimistically add the just-forwarded count to the cached lag so that
+        # other Dispatcher threads (on other ingest partitions) see a realistic
+        # estimate immediately — without waiting for the 1-second Admin refresh.
+        # This prevents a burst where every thread sees cached_lag=0 for a full
+        # second and collectively forwards far more than fairness_ready_lag_high
+        # messages. When the next Admin read fires it replaces this estimate with
+        # the real broker value (which also accounts for messages already consumed
+        # from the ready topic by job consumers).
+        optimistically_add_lag(msgs_to_produce.size)
+
         # Register tenant IDs with the optional Scheduler so they surface on
         # the /weights page automatically. Uses a process-local Set to skip
         # tenants already written — avoids a Redis round-trip on every batch
@@ -131,6 +141,8 @@ module KafkaBatch
 
         # Write back under the mutex; skip if a concurrent caller already wrote
         # a fresher value while we were fetching.
+        # Always reset :at to now so the 1-second window restarts from the real
+        # read, even if an optimistic increment bumped :value in the meantime.
         self.class.lag_mutex.synchronize do
           c = self.class.lag_cache
           if now - c[:at] >= LAG_CACHE_TTL
@@ -138,6 +150,19 @@ module KafkaBatch
             c[:at]    = now
           end
           c[:value]
+        end
+      end
+
+      # Immediately increment the cached lag by +count+ after forwarding a batch
+      # to the ready topic. This prevents sibling Dispatcher threads (each on a
+      # different ingest partition) from reading stale lag=0 and collectively
+      # overshooting the high-watermark within the 1-second Admin-read window.
+      # The cache timestamp is intentionally NOT updated so the normal TTL expiry
+      # still triggers a real Admin read within LAG_CACHE_TTL seconds.
+      def optimistically_add_lag(count)
+        self.class.lag_mutex.synchronize do
+          c = self.class.lag_cache
+          c[:value] = c[:value].to_i + count
         end
       end
 

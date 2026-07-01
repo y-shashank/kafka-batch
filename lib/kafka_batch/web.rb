@@ -899,7 +899,7 @@ module KafkaBatch
       <<~HTML
         <div class="card ingest-lookup">
           <h3>Ingest partition lookup</h3>
-          <p class="muted">Fair jobs are keyed by <code>tenant_id</code> on <code>#{h(topic)}</code>. Uses Kafka's default murmur2 partitioner (same as the producer).</p>
+          <p class="muted">Fair jobs are keyed by <code>tenant_id</code> on <code>#{h(topic)}</code>. Uses the murmur2 partitioner (same as the producer — requires <code>partitioner: murmur2_random</code> in producer config). If the producer was previously using a different partitioner (e.g. librdkafka's default CRC32), in-flight jobs from that era landed on different partitions and will not appear here.</p>
           <form class="search" method="get" action="#{action}">
             <input type="text" name="tenant_id" value="#{h(tenant_id.to_s)}" placeholder="tenant_id (e.g. acme)" autocomplete="off">
             <button type="submit" class="btn">Lookup</button>

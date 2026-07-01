@@ -111,17 +111,53 @@ module KafkaBatch
 
     # Partition count of the fairness ingest topic, via Karafka::Admin.
     # Works in both UI-only and full-backend processes; returns nil on error.
+    # Cached for 60s per process to avoid a metadata round-trip on every page load.
+    INGEST_PARTITION_COUNT_TTL = 60 # seconds
+
     def fairness_ingest_partition_count
+      cached = @ingest_partition_count_cache
+      if cached && (Process.clock_gettime(Process::CLOCK_MONOTONIC) - cached[:at]) < INGEST_PARTITION_COUNT_TTL
+        return cached[:value]
+      end
+
+      value = fetch_ingest_partition_count
+      @ingest_partition_count_cache = { value: value, at: Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+      value
+    end
+
+    private
+
+    def fetch_ingest_partition_count
       ensure_karafka_configured!
       return nil unless defined?(Karafka) && defined?(Karafka::Admin)
 
-      topic = Karafka::Admin.cluster_info.topics
-                            .find { |t| t[:topic_name] == config.fairness_ingest_topic }
-      topic && topic[:partition_count]
+      topic_name = config.fairness_ingest_topic
+      info       = Karafka::Admin.cluster_info
+
+      # cluster_info.topics may return an Array of Structs/Hashes or a Hash
+      # keyed by topic name, depending on the rdkafka-ruby version. Handle both.
+      topics = info.topics
+      found  =
+        if topics.is_a?(Hash)
+          topics[topic_name]
+        else
+          topics.find { |t| (t.respond_to?(:topic_name) ? t.topic_name : t[:topic_name]) == topic_name }
+        end
+
+      return nil unless found
+
+      # Struct: found.partitions.size  |  Hash: found[:partition_count] or found[:partitions].size
+      if found.respond_to?(:partitions)
+        found.partitions.size
+      elsif found.is_a?(Hash)
+        found[:partition_count] || found[:partitions]&.size
+      end
     rescue StandardError => e
       logger.warn("[KafkaBatch] could not read partition count for '#{config.fairness_ingest_topic}': #{e.message}")
       nil
     end
+
+    public
 
     # Ingest partition for a given tenant_id, or nil if partition count
     # is unavailable.
