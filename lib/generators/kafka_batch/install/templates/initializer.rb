@@ -67,6 +67,7 @@ KafkaBatch.configure do |config|
   # ── Other settings (sensible defaults; uncomment to tune) ─────────────────────
   # config.consumer_group          = "kafka-batch"   # overrides the prefix-derived name
   # config.liveness_backend        = :redis          # or :off
+  # config.liveness_stats_interval = 15              # RSS/CPU sample period for /live (0 = off)
   # config.complete_after_retries  = 3               # count a job toward its batch after N retries
   # config.reconciliation_interval = 300             # seconds between stuck-batch sweeps
   # config.max_failures_per_batch  = 1000            # 0 = unlimited (dashboard failure log)

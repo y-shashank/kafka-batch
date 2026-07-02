@@ -3,6 +3,7 @@ require "connection_pool"
 require "securerandom"
 require "socket"
 require "oj"
+require_relative "process_stats"
 
 module KafkaBatch
   # Liveness for the dashboard: which jobs are running, on which consumer, and
@@ -13,6 +14,13 @@ module KafkaBatch
   #     :redis – (default) full per-job + per-consumer tracking in Redis with a
   #              short TTL, best-effort behind a circuit breaker.
   #     :off   – disabled.
+  #
+  # Consumer heartbeats run whenever the backend is :redis. Per-job running-state
+  # writes are gated by config.track_running_jobs.
+  #
+  # RSS/CPU for /live are sampled in-process at most once per
+  # config.liveness_stats_interval seconds (default 15s) and piggyback on the
+  # existing Redis heartbeat key — no extra round-trips.
   #
   # All entry points (job_started/job_finished/heartbeat) are best-effort and
   # never raise into the job hot path.
@@ -42,11 +50,13 @@ module KafkaBatch
 
       def job_started(job_id:, batch_id:, worker_class:, topic: nil, partition: nil)
         return unless backend == :redis
+        return unless track_running_jobs?
         redis_job_started(job_id: job_id, batch_id: batch_id, worker_class: worker_class, topic: topic, partition: partition)
       end
 
       def job_finished(job_id)
         return unless backend == :redis
+        return unless track_running_jobs?
         redis_job_finished(job_id)
       end
 
@@ -69,12 +79,16 @@ module KafkaBatch
         @pool&.shutdown(&:close) rescue nil
         @pool = nil
         @circuit_open_until = nil
+        @stats_mutex = nil
+        @stats_cache = nil
+        @stats_sampled_at = nil
+        ProcessStats.reset!
       end
 
       # ── :redis backend ─────────────────────────────────────────────────────
       private
 
-      def redis_enabled?
+      def track_running_jobs?
         KafkaBatch.config.track_running_jobs
       end
 
@@ -83,7 +97,6 @@ module KafkaBatch
       end
 
       def redis_job_started(job_id:, batch_id:, worker_class:, topic:, partition:)
-        return unless redis_enabled?
         payload = dump(
           "job_id" => job_id, "batch_id" => batch_id, "worker_class" => worker_class.to_s,
           "consumer_id" => consumer_id, "topic" => topic, "partition" => partition,
@@ -93,17 +106,41 @@ module KafkaBatch
       end
 
       def redis_job_finished(job_id)
-        return unless redis_enabled?
         redis_with { |r| r.del("#{JOB_PREFIX}#{consumer_id}:#{job_id}") }
       end
 
       def redis_heartbeat(topic:)
-        return unless redis_enabled?
-        payload = dump(
-          "consumer_id" => consumer_id, "hostname" => Socket.gethostname,
-          "pid" => Process.pid, "topic" => topic, "last_seen" => Time.now.iso8601
-        )
-        redis_with { |r| r.set("#{CONSUMER_PREFIX}#{consumer_id}", payload, ex: ttl) }
+        payload = {
+          "consumer_id" => consumer_id,
+          "hostname"    => Socket.gethostname,
+          "pid"         => Process.pid,
+          "topic"       => topic,
+          "last_seen"   => Time.now.iso8601
+        }
+        payload.merge!(current_stats)
+
+        redis_with { |r| r.set("#{CONSUMER_PREFIX}#{consumer_id}", dump(payload), ex: ttl) }
+      end
+
+      # Throttled process stats (RSS + CPU) for the /live page.
+      def current_stats
+        interval = KafkaBatch.config.liveness_stats_interval.to_f
+        return {} if interval <= 0
+
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        stats_mutex.synchronize do
+          if @stats_cache.nil? || (now - @stats_sampled_at.to_f) >= interval
+            @stats_cache       = ProcessStats.sample
+            @stats_sampled_at  = now
+          end
+          @stats_cache || {}
+        end
+      rescue StandardError
+        {}
+      end
+
+      def stats_mutex
+        @stats_mutex ||= Mutex.new
       end
 
       def redis_scan(prefix, limit)

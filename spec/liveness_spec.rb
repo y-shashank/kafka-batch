@@ -30,11 +30,32 @@ RSpec.describe KafkaBatch::Liveness do
       expect(consumers.first["pid"]).to eq(Process.pid)
     end
 
-    it "no-ops when track_running_jobs is false" do
+    it "no-ops job tracking when track_running_jobs is false" do
       KafkaBatch.config.track_running_jobs = false
       described_class.job_started(job_id: "j9", batch_id: "b1", worker_class: "W")
       KafkaBatch.config.track_running_jobs = true
       expect(described_class.running_jobs.map { |j| j["job_id"] }).not_to include("j9")
+    end
+
+    it "still registers heartbeats when track_running_jobs is false" do
+      KafkaBatch.config.track_running_jobs = false
+      described_class.heartbeat(topic: "test.success")
+      KafkaBatch.config.track_running_jobs = true
+      expect(described_class.consumers.map { |c| c["consumer_id"] }).to include(described_class.consumer_id)
+    end
+
+    it "includes throttled rss/cpu stats on heartbeats when enabled" do
+      KafkaBatch.config.liveness_stats_interval = 0
+      described_class.heartbeat(topic: "t")
+      expect(described_class.consumers.first).not_to have_key("rss_bytes")
+
+      KafkaBatch.config.liveness_stats_interval = 15
+      described_class.reset!
+      allow(KafkaBatch::ProcessStats).to receive(:sample).and_return("rss_bytes" => 128_000_000, "cpu_pct" => 12.5)
+      described_class.heartbeat(topic: "t")
+      c = described_class.consumers.first
+      expect(c["rss_bytes"]).to eq(128_000_000)
+      expect(c["cpu_pct"]).to eq(12.5)
     end
   end
 

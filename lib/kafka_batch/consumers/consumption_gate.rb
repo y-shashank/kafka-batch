@@ -6,12 +6,19 @@ module KafkaBatch
     # config.consumption_control_refresh_interval seconds (default 60).
     module ConsumptionGate
       def consume
+        KafkaBatch::Liveness.heartbeat(topic: heartbeat_topic)
         return if apply_consumption_gate!
 
         super
       end
 
       private
+
+      def heartbeat_topic
+        topic.name
+      rescue StandardError
+        nil
+      end
 
       def apply_consumption_gate!
         return false unless KafkaBatch::ConsumptionControl.available?

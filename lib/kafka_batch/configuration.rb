@@ -62,6 +62,9 @@ module KafkaBatch
     attr_accessor :liveness_backend            # Symbol – default :redis
     attr_accessor :track_running_jobs          # Boolean – default true (gates :redis writes)
     attr_accessor :liveness_ttl                # Integer – seconds; default 30 (staleness window)
+    # How often each consumer process re-samples its own RSS/CPU for /live.
+    # 0 disables stats (heartbeats still update last_seen). Default 15s.
+    attr_accessor :liveness_stats_interval     # Integer – seconds; default 15
 
     # ── Consumption pause/resume (/lag dashboard) ─────────────────────────────
     # Karafka consumers reload pause state from Redis (or MySQL when store is
@@ -260,6 +263,7 @@ module KafkaBatch
       @liveness_backend         = :redis
       @track_running_jobs       = true
       @liveness_ttl             = 30
+      @liveness_stats_interval  = 15
       @consumption_control_refresh_interval = 60
       @max_retries              = 3
       @retry_jitter             = 0.1  # +/- 10%
@@ -339,6 +343,10 @@ module KafkaBatch
 
       unless %i[redis off].include?(@liveness_backend)
         raise ConfigurationError, "liveness_backend must be :redis or :off"
+      end
+
+      if @liveness_stats_interval.to_i.negative?
+        raise ConfigurationError, "liveness_stats_interval must be >= 0"
       end
 
       # Redis is a HARD dependency: the multi-tenant fairness scheduler (WFQ ring,

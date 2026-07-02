@@ -6,11 +6,16 @@ RSpec.describe KafkaBatch::Web do
     )
   end
 
-  def post(path, query: "")
-    KafkaBatch::Web.call(
+  def post(path, query: "", body: nil)
+    env = {
       "REQUEST_METHOD" => "POST", "PATH_INFO" => path,
       "SCRIPT_NAME" => "/kafka_batch", "QUERY_STRING" => query
-    )
+    }
+    if body
+      env["rack.input"] = StringIO.new(body)
+      env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
+    end
+    KafkaBatch::Web.call(env)
   end
 
   def seed(total: 3, **opts)
@@ -58,6 +63,18 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("location.reload()")
     end
 
+    it "has bulk select checkboxes and cancel/delete actions" do
+      seed
+      html = get("/").last.join
+      expect(html).to include('id="kb-select-all"')
+      expect(html).to include('id="kb-bulk-form"')
+      expect(html).to include("Cancel selected")
+      expect(html).to include("Delete selected")
+      expect(html).to include("Cancel all")
+      expect(html).to include("Delete all")
+      expect(html).to include('class="kb-batch-check"')
+    end
+
     it "shows the batch description on the list and detail pages" do
       id = seed(description: "Important nightly batch")
       expect(get("/").last.join).to include("Important nightly batch")
@@ -88,6 +105,25 @@ RSpec.describe KafkaBatch::Web do
       html = get("/").last.join
       expect(html).to include("Pending jobs")
       expect(html).to include(">7<")
+    end
+
+    it "shows consumer and running-job counts when liveness is available" do
+      allow(KafkaBatch::Liveness).to receive(:available?).and_return(true)
+      allow(KafkaBatch::Liveness).to receive(:consumers).and_return([{"consumer_id" => "a"}, {"consumer_id" => "b"}])
+      allow(KafkaBatch::Liveness).to receive(:running_jobs).and_return([{"job_id" => "j1"}])
+
+      html = get("/").last.join
+      expect(html).to include("Consumers")
+      expect(html).to include("Running jobs")
+      expect(html).to include('href="/kafka_batch/live"')
+      expect(html).to include("color:#0ea5e9'>2</div>")
+      expect(html).to include("color:#6366f1'>1</div>")
+    end
+
+    it "omits liveness metrics when Redis liveness is unavailable" do
+      allow(KafkaBatch::Liveness).to receive(:available?).and_return(false)
+      html = get("/").last.join
+      expect(html).not_to include("Running jobs")
     end
 
     it "filters by status" do
@@ -209,8 +245,8 @@ RSpec.describe KafkaBatch::Web do
   end
 
   describe "GET /failures (all batches)" do
-    it "does not include the Live toggle (failures page has no live mode)" do
-      expect(get("/failures").last.join).not_to include("kb-live-toggle")
+    it "includes the Live toggle in the header" do
+      expect(get("/failures").last.join).to include('id="kb-live-toggle"')
     end
 
     it "lists failures across batches and the dashboard links to it" do
@@ -280,6 +316,8 @@ RSpec.describe KafkaBatch::Web do
       html = get("/live").last.join
       expect(html).to include("Active consumers")
       expect(html).to include("Running jobs")
+      expect(html).to include("RAM")
+      expect(html).to include("CPU")
       expect(html).to include("ProcessUserWorker")
       expect(html).to include("live-1"[0, 8])
       # dashboard links to it
@@ -292,10 +330,10 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("requires Redis")
     end
 
-    it "/live, /lag and /fairness auto-reload every 5s" do
+    it "/live, /lag and /fairness include the Live toggle" do
       allow(KafkaBatch::Lag).to receive(:available?).and_return(false)
       %w[/live /lag /fairness].each do |path|
-        expect(get(path).last.join).to include("setTimeout(function(){ location.reload(); }, 5000)")
+        expect(get(path).last.join).to include('id="kb-live-toggle"')
       end
     end
   end
@@ -324,6 +362,56 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("Job failures")
       expect(html).to include("RuntimeError")
       expect(html).to include("kaboom")
+    end
+  end
+
+  describe "POST /batches/bulk" do
+    it "cancels multiple batches and redirects back with filters preserved" do
+      a = seed
+      b = seed
+      body = "batch_ids=#{CGI.escape(a)}&batch_ids=#{CGI.escape(b)}&bulk_action=cancel&return_status=running"
+      status, headers, = post("/batches/bulk", body: body)
+
+      expect(status).to eq(302)
+      expect(headers["location"]).to eq("/kafka_batch/?status=running")
+      expect(KafkaBatch.store.find_batch(a)[:status]).to eq("cancelled")
+      expect(KafkaBatch.store.find_batch(b)[:status]).to eq("cancelled")
+    end
+
+    it "deletes multiple batches" do
+      a = seed
+      b = seed
+      body = "batch_ids=#{CGI.escape(a)}&batch_ids=#{CGI.escape(b)}&bulk_action=delete"
+      post("/batches/bulk", body: body)
+
+      expect(KafkaBatch.store.find_batch(a)).to be_nil
+      expect(KafkaBatch.store.find_batch(b)).to be_nil
+    end
+
+    it "cancels all running batches matching the index scope" do
+      running = seed
+      done    = seed(total: 1)
+      KafkaBatch.store.record_completion_by_offset(
+        batch_id: done, source_topic: "t", source_partition: 0,
+        job_id: "j1", source_offset: 1, status: "success"
+      )
+      KafkaBatch.store.seal_batch(done)
+
+      body = "bulk_action=cancel_all&scope_status=running"
+      post("/batches/bulk", body: body)
+
+      expect(KafkaBatch.store.find_batch(running)[:status]).to eq("cancelled")
+      expect(KafkaBatch.store.find_batch(done)[:status]).to eq("success")
+    end
+
+    it "deletes all batches matching the index scope" do
+      a = seed
+      b = seed
+      body = "bulk_action=delete_all"
+      post("/batches/bulk", body: body)
+
+      expect(KafkaBatch.store.find_batch(a)).to be_nil
+      expect(KafkaBatch.store.find_batch(b)).to be_nil
     end
   end
 

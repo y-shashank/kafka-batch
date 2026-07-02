@@ -15,6 +15,7 @@ module KafkaBatch
   # authentication (e.g. `authenticate :admin do ... end` or HTTP basic auth).
   class Web
     PER_PAGE = 25
+    BULK_MAX = 100  # safety cap on batch_ids per bulk request
 
     # ── CSRF (double-submit cookie pattern) ───────────────────────────────────
     # A random token is generated once per process. It is set as a SameSite=Strict
@@ -29,11 +30,13 @@ module KafkaBatch
     CSRF_FIELD  = "_csrf"
 
     STATUS_COLORS = {
-      "running"   => "#3b82f6",
-      "success"   => "#10b981",
-      "complete"  => "#f59e0b",
-      "cancelled" => "#6b7280",
-      "pending"   => "#8b5cf6"
+      "running"      => "#3b82f6",
+      "success"      => "#10b981",
+      "complete"     => "#f59e0b",
+      "cancelled"    => "#6b7280",
+      "pending"      => "#8b5cf6",
+      "consumers"    => "#0ea5e9",
+      "running_jobs" => "#6366f1"
     }.freeze
 
     # Deterministic colour pairs [text, background] for tenant_id chips.
@@ -108,6 +111,8 @@ module KafkaBatch
         elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
           batch = KafkaBatch.store.find_batch(m[1])
           batch ? html(render_show(batch, params)) : not_found
+        elsif method == "POST" && path == "/batches/bulk"
+          bulk_batches(env, params)
         elsif method == "POST" && (m = path.match(%r{\A/batches/([^/]+)/cancel\z}))
           # Inline cancel so web.rb works in UI-only mode (no Batch class loaded).
           # Mirrors KafkaBatch::Batch.cancel exactly.
@@ -188,8 +193,48 @@ module KafkaBatch
       [302, { "location" => "#{lag_path}#{qs}", "cache-control" => "no-store", "content-type" => "text/html" }, []]
     end
 
-    def redirect_to_index
-      [302, { "location" => index_path, "cache-control" => "no-store", "content-type" => "text/html" }, []]
+    def redirect_to_index(params = {})
+      flat = scalarize_params(params)
+      qs = []
+      if (s = form_param(flat, "return_status") || form_param(flat, "status"))
+        qs << "status=#{url_encode(s)}"
+      end
+      if (q = form_param(flat, "return_q") || form_param(flat, "q"))
+        qs << "q=#{url_encode(q)}"
+      end
+      page = (flat["return_page"] || flat["page"]).to_i
+      qs << "page=#{page}" if page > 1
+      loc = qs.empty? ? index_path : "#{index_path}?#{qs.join("&")}"
+      [302, { "location" => loc, "cache-control" => "no-store", "content-type" => "text/html" }, []]
+    end
+
+    # POST /batches/bulk — cancel or delete many batches selected on the index page.
+    def bulk_batches(env, query_params)
+      body   = scalarize_params(body_params_multi(env))
+      ids    = bulk_batch_ids(body)
+      action = form_param(body, "bulk_action").to_s
+
+      case action
+      when "cancel"
+        ids.each do |id|
+          KafkaBatch.store.update_batch_status(id, "cancelled")
+          KafkaBatch::CancellationCache.add(id) if defined?(KafkaBatch::CancellationCache)
+        end
+      when "delete"
+        ids.each { |id| KafkaBatch.store.delete_batch(id) }
+      when "cancel_all"
+        bulk_cancel_all(
+          status: form_param(body, "scope_status"),
+          search: form_param(body, "scope_search")
+        )
+      when "delete_all"
+        bulk_delete_all(
+          status: form_param(body, "scope_status"),
+          search: form_param(body, "scope_search")
+        )
+      end
+
+      redirect_to_index(query_params.merge(body))
     end
 
     def lag_consumption_control(action, params)
@@ -229,12 +274,14 @@ module KafkaBatch
       has_next = batches.size > PER_PAGE
       batches  = batches.first(PER_PAGE)
 
-      summary = summary_cards(counts, safe_pending_jobs)
+      summary = summary_cards(counts, safe_pending_jobs, safe_liveness_snapshot)
       filters = status_filters(status, counts, search)
       rows    = batches.map { |b| batch_row(b, search: search) }.join
       empty   = search ? "“No batches match “#{h(search)}”.”" : "No batches found."
-      rows    = "<tr><td colspan='10' class='empty'>#{empty}</td></tr>" if batches.empty?
+      rows    = "<tr><td colspan='11' class='empty'>#{empty}</td></tr>" if batches.empty?
       pager   = pagination(page, has_next, status, search)
+      bulk    = bulk_batch_toolbar(status: status, search: search, page: page)
+      bulk_all = bulk_all_toolbar(status: status, search: search, page: page)
 
       <<~HTML
         #{summary}
@@ -243,6 +290,7 @@ module KafkaBatch
           <table>
             <thead>
               <tr>
+                <th class="col-check"><input type="checkbox" id="kb-select-all" title="Select all on this page" aria-label="Select all on this page"></th>
                 <th>Batch</th><th>Tenant</th><th>Status</th><th>Total</th><th>Done</th>
                 <th>Failed</th><th>Pending</th><th>Progress</th><th>Created</th><th>Actions</th>
               </tr>
@@ -250,15 +298,19 @@ module KafkaBatch
             <tbody>#{rows}</tbody>
           </table>
         </div>
-        #{pager}
+        <div class="index-bottom">
+          #{bulk}
+          #{pager}
+          #{bulk_all}
+        </div>
+        #{bulk_batch_script}
       HTML
     end
 
-    # Client-side "Live" toggle for the batch-list page: when on, reloads the
-    # page every 5s (full server render, so all counters refresh). The choice is
-    # persisted in localStorage so it survives the reloads and navigation, and a
-    # small countdown is shown on the button. Reload keeps the current URL, so
-    # the active filter / search / page are preserved.
+    # Client-side "Live" toggle: when on, reloads the current page every 5s (full
+    # server render). The choice is persisted in localStorage so it survives
+    # reloads and navigation, and a small countdown is shown on the button.
+    # Reload keeps the current URL, so filters / search / pagination are preserved.
     def live_toggle_script
       <<~'HTML'
         <script>
@@ -366,9 +418,10 @@ module KafkaBatch
 
       consumer_rows = consumers.map do |c|
         "<tr><td class='mono'>#{h(c['consumer_id'])}</td><td>#{h(c['hostname'])}</td>" \
-        "<td>#{h(c['pid'])}</td><td>#{h(c['topic'])}</td><td>#{fmt_time(c['last_seen'])}</td></tr>"
+        "<td>#{h(c['pid'])}</td><td>#{fmt_mem(c['rss_bytes'])}</td><td>#{fmt_cpu(c['cpu_pct'])}</td>" \
+        "<td>#{h(c['topic'])}</td><td>#{fmt_time(c['last_seen'])}</td></tr>"
       end.join
-      consumer_rows = "<tr><td colspan='5' class='empty'>No active consumers seen.</td></tr>" if consumers.empty?
+      consumer_rows = "<tr><td colspan='7' class='empty'>No active consumers seen.</td></tr>" if consumers.empty?
 
       job_rows = jobs.map do |j|
         batch = j["batch_id"] ? "<a class='mono' href='#{show_path(j['batch_id'])}'>#{h(short_id(j['batch_id']))}</a>" : "<span class='muted'>—</span>"
@@ -388,13 +441,13 @@ module KafkaBatch
         <div class="card">
           <h3>Active consumers</h3>
           <table>
-            <thead><tr><th>Consumer</th><th>Host</th><th>PID</th><th>Topic</th><th>Last seen</th></tr></thead>
+            <thead><tr><th>Consumer</th><th>Host</th><th>PID</th><th>RAM</th><th>CPU</th><th>Topic</th><th>Last seen</th></tr></thead>
             <tbody>#{consumer_rows}</tbody>
           </table>
         </div>
         <div class="card">
           <h3>Running jobs</h3>
-          <p class="muted">Backend: <code>#{h(KafkaBatch::Liveness.backend)}</code>. Approximate snapshot — short-lived jobs may not always appear. Auto-refreshing every 5s.</p>
+          <p class="muted">Backend: <code>#{h(KafkaBatch::Liveness.backend)}</code>. RAM/CPU are sampled in each consumer process every <code>#{KafkaBatch.config.liveness_stats_interval}s</code> (process-level, approximate). Auto-refreshing every 5s.</p>
           <table>
             <thead><tr><th>Job</th><th>Batch</th><th>Worker</th><th>Consumer</th><th>Topic/Part</th><th>Started</th></tr></thead>
             <tbody>#{job_rows}</tbody>
@@ -1077,17 +1130,22 @@ module KafkaBatch
 
     # ── Partials ───────────────────────────────────────────────────────────
 
-    def summary_cards(counts, pending_jobs = nil)
+    def summary_cards(counts, pending_jobs = nil, liveness = nil)
       total = counts.values.sum
-      cards = [["Total", total, "#111827"]]
+      cards = [["Total", total, "#111827", nil]]
       %w[running success complete cancelled].each do |s|
-        cards << [s.capitalize, counts[s].to_i, STATUS_COLORS[s]]
+        cards << [s.capitalize, counts[s].to_i, STATUS_COLORS[s], nil]
       end
       # System-wide backlog: jobs pushed but not yet completed/failed.
-      cards << ["Pending jobs", pending_jobs, STATUS_COLORS["pending"]] unless pending_jobs.nil?
-      inner = cards.map do |label, value, color|
+      cards << ["Pending jobs", pending_jobs, STATUS_COLORS["pending"], nil] unless pending_jobs.nil?
+      if liveness
+        cards << ["Consumers", liveness[:consumers], STATUS_COLORS["consumers"], live_path]
+        cards << ["Running jobs", liveness[:running_jobs], STATUS_COLORS["running_jobs"], live_path]
+      end
+      inner = cards.map do |label, value, color, href|
+        label_html = href ? "<a class='metric-link' href='#{href}'>#{h(label)}</a>" : h(label)
         "<div class='metric'><div class='metric-value' style='color:#{color}'>#{value}</div>" \
-        "<div class='metric-label'>#{label}</div></div>"
+        "<div class='metric-label'>#{label_html}</div></div>"
       end.join
       "<div class='metrics'>#{inner}</div>"
     end
@@ -1141,6 +1199,7 @@ module KafkaBatch
       created_cell = "<td class='muted' style='font-size:12px;white-space:nowrap'>#{fmt_time(b[:created_at])}</td>"
       <<~HTML
         <tr>
+          <td class="col-check"><input type="checkbox" form="kb-bulk-form" name="batch_ids" value="#{h(b[:id])}" class="kb-batch-check" aria-label="Select batch #{h(short_id(b[:id]))}"></td>
           <td><a href="#{show_path(b[:id])}" class="mono">#{h(short_id(b[:id]))}</a>#{desc}</td>
           #{t_cell}
           <td>#{status_badge(b[:status])}</td>
@@ -1153,6 +1212,161 @@ module KafkaBatch
           <td class="actions">#{actions_for(b)}</td>
         </tr>
       HTML
+    end
+
+    BULK_FORM_ID = "kb-bulk-form"
+
+    def bulk_batch_toolbar(status:, search:, page:)
+      csrf_qs = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
+      hidden  = +""
+      hidden << %(<input type="hidden" form="#{BULK_FORM_ID}" name="return_status" value="#{h(status)}">) if status
+      hidden << %(<input type="hidden" form="#{BULK_FORM_ID}" name="return_q" value="#{h(search)}">) if search
+      hidden << %(<input type="hidden" form="#{BULK_FORM_ID}" name="return_page" value="#{page}">) if page > 1
+      <<~HTML
+        #{hidden}
+        <form id="#{BULK_FORM_ID}" class="bulk-toolbar" method="post" action="#{bulk_batches_path}?#{csrf_qs}">
+          <button type="submit" name="bulk_action" value="cancel" class="btn warn">Cancel selected</button>
+          <button type="submit" name="bulk_action" value="delete" class="btn danger-btn">Delete selected</button>
+        </form>
+      HTML
+    end
+
+    def bulk_all_toolbar(status:, search:, page:)
+      csrf_qs   = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
+      scope     = bulk_scope_fields(status: status, search: search, page: page)
+      label     = bulk_scope_label(status: status, search: search)
+      cancel_q  = js_string("Cancel all#{label}? Remaining jobs will not run.")
+      delete_q  = js_string("Delete all#{label} permanently? This cannot be undone.")
+      <<~HTML
+        <div class="bulk-all-actions">
+          <form class="inline-form" method="post" action="#{bulk_batches_path}?#{csrf_qs}"
+                onsubmit="return confirm('#{cancel_q}')">
+            #{scope}
+            <button type="submit" name="bulk_action" value="cancel_all" class="btn warn">Cancel all</button>
+          </form>
+          <form class="inline-form" method="post" action="#{bulk_batches_path}?#{csrf_qs}"
+                onsubmit="return confirm('#{delete_q}')">
+            #{scope}
+            <button type="submit" name="bulk_action" value="delete_all" class="btn danger-btn">Delete all</button>
+          </form>
+        </div>
+      HTML
+    end
+
+    def bulk_scope_fields(status:, search:, page:)
+      hidden = +""
+      hidden << %(<input type="hidden" name="scope_status" value="#{h(status)}">) if status
+      hidden << %(<input type="hidden" name="scope_search" value="#{h(search)}">) if search
+      hidden << %(<input type="hidden" name="return_status" value="#{h(status)}">) if status
+      hidden << %(<input type="hidden" name="return_q" value="#{h(search)}">) if search
+      hidden << %(<input type="hidden" name="return_page" value="#{page}">) if page > 1
+      hidden
+    end
+
+    def bulk_scope_label(status:, search:)
+      parts = []
+      parts << " #{status}" if status
+      parts << " matching “#{search}”" if search
+      parts << " batches" if parts.any?
+      parts.empty? ? " batches" : parts.join
+    end
+
+    def bulk_cancel_all(status:, search:)
+      filtered_batch_ids(status: status, search: search).each do |id|
+        batch = KafkaBatch.store.find_batch(id)
+        next unless batch && batch[:status] == "running"
+
+        KafkaBatch.store.update_batch_status(id, "cancelled")
+        KafkaBatch::CancellationCache.add(id) if defined?(KafkaBatch::CancellationCache)
+      end
+    end
+
+    def bulk_delete_all(status:, search:)
+      filtered_batch_ids(status: status, search: search).each do |id|
+        KafkaBatch.store.delete_batch(id)
+      end
+    end
+
+    # All batch ids matching the index filters (every page, not just the current one).
+    def filtered_batch_ids(status: nil, search: nil)
+      ids    = []
+      offset = 0
+      chunk  = 500
+      loop do
+        page = KafkaBatch.store.list_batches(status: status, limit: chunk, offset: offset, search: search)
+        break if page.empty?
+
+        ids.concat(page.map { |b| b[:id] })
+        break if page.size < chunk
+
+        offset += chunk
+      end
+      ids
+    end
+
+    def js_string(text)
+      text.to_s.gsub("\\", "\\\\").gsub("'", "\\'").gsub("\n", " ").gsub("\r", "")
+    end
+
+    def bulk_batch_script
+      <<~'HTML'
+        <script>
+        (function () {
+          var all = document.getElementById("kb-select-all");
+          var form = document.getElementById("kb-bulk-form");
+          if (!form) return;
+          function boxes() { return Array.prototype.slice.call(document.querySelectorAll(".kb-batch-check")); }
+          function syncAll() {
+            if (!all) return;
+            var cbs = boxes();
+            if (!cbs.length) { all.checked = false; all.indeterminate = false; return; }
+            var n = cbs.filter(function (cb) { return cb.checked; }).length;
+            all.checked = n === cbs.length;
+            all.indeterminate = n > 0 && n < cbs.length;
+          }
+          if (all) {
+            all.addEventListener("change", function () {
+              boxes().forEach(function (cb) { cb.checked = all.checked; });
+              all.indeterminate = false;
+            });
+          }
+          boxes().forEach(function (cb) { cb.addEventListener("change", syncAll); });
+          form.addEventListener("submit", function (e) {
+            var btn = e.submitter;
+            if (!btn || !btn.name) return;
+            var n = boxes().filter(function (cb) { return cb.checked; }).length;
+            if (n === 0) { e.preventDefault(); alert("Select at least one batch."); return; }
+            var msg = btn.value === "cancel"
+              ? "Cancel " + n + " batch(es)? Remaining jobs will not run."
+              : "Delete " + n + " batch record(s) permanently?";
+            if (!confirm(msg)) e.preventDefault();
+          });
+        })();
+        </script>
+      HTML
+    end
+
+    def bulk_batches_path
+      "#{@script_name}/batches/bulk"
+    end
+
+    def bulk_batch_ids(params)
+      ids = params["batch_ids"]
+      ids = ids.is_a?(Array) ? ids : Array(ids)
+      ids.map(&:to_s).reject(&:empty?).uniq.first(BULK_MAX)
+    end
+
+    # CGI.parse returns arrays for every key; collapse single-value fields.
+    def scalarize_params(hash)
+      hash.transform_values { |v| v.is_a?(Array) ? (v.size == 1 ? v.first : v) : v }
+    end
+
+    # One scalar form/query value (never an Array — Array#to_s would break redirects).
+    def form_param(params, key)
+      v = params[key]
+      v = v.first if v.is_a?(Array) && v.size == 1
+      return nil if v.is_a?(Array)
+      non_empty(v.to_s)
     end
 
     def actions_for(b)
@@ -1241,6 +1455,18 @@ module KafkaBatch
       nil
     end
 
+    def safe_liveness_snapshot
+      return nil unless KafkaBatch::Liveness.available?
+
+      {
+        consumers:    KafkaBatch::Liveness.consumers.size,
+        running_jobs: KafkaBatch::Liveness.running_jobs.size
+      }
+    rescue StandardError => e
+      KafkaBatch.logger.warn("[KafkaBatch::Web] liveness snapshot failed: #{e.message}")
+      nil
+    end
+
     def short_id(id)
       id.to_s[0, 8]
     end
@@ -1291,6 +1517,17 @@ module KafkaBatch
 
     def parse_query(qs)
       CGI.parse(qs.to_s).transform_values(&:first)
+    end
+
+    # Like body_params but keeps multi-value fields (e.g. batch_ids from checkboxes).
+    def body_params_multi(env)
+      input = env["rack.input"]
+      return {} unless input
+
+      input.rewind
+      CGI.parse(input.read)
+    rescue StandardError
+      {}
     end
 
     # Safely read URL-encoded params from the request body (rack.input).
@@ -1359,27 +1596,30 @@ module KafkaBatch
       h(value.to_s)
     end
 
-    # Auto-refreshing monitoring pages that show live Kafka/Redis state. These
-    # reload on a fixed 5s timer; the batch list uses the interactive toggle.
-    AUTO_RELOAD_PATHS = %w[/live /lag /fairness].freeze
+    def fmt_mem(bytes)
+      b = bytes.to_i
+      return "<span class='muted'>—</span>" if bytes.nil? || b <= 0
+      if b >= 1_073_741_824
+        "#{(b / 1_073_741_824.0).round(1)} GB"
+      elsif b >= 1_048_576
+        "#{(b / 1_048_576.0).round(1)} MB"
+      else
+        "#{(b / 1024.0).round(0)} KB"
+      end
+    end
+
+    def fmt_cpu(pct)
+      return "<span class='muted'>—</span>" if pct.nil? || pct.to_s.empty?
+      n = pct.to_f
+      return "<span class='muted'>—</span>" if n.negative?
+      color = n >= 80.0 ? "#ef4444" : (n >= 50.0 ? "#f59e0b" : nil)
+      return "#{n.round(1)}%" unless color
+      "<span class='badge' style='background:#{color}'>#{n.round(1)}%</span>"
+    end
 
     def layout(title, body)
-      is_index = @path.nil? || @path == "/"
-
-      # The interactive "Live" countdown toggle is only meaningful on the batch
-      # list (index). Monitoring pages (/live, /lag, /fairness) auto-reload on a
-      # fixed 5s timer; other pages (failures, weights, batch detail) are static.
-      live_toggle_button =
-        is_index ? %(<button id="kb-live-toggle" type="button" class="btn">○ Live</button>) : ""
-
-      foot_script =
-        if is_index
-          live_toggle_script
-        elsif AUTO_RELOAD_PATHS.include?(@path)
-          "<script>setTimeout(function(){ location.reload(); }, 5000)</script>"
-        else
-          ""
-        end
+      live_toggle_button = %(<button id="kb-live-toggle" type="button" class="btn">○ Live</button>)
+      foot_script        = live_toggle_script
 
       <<~HTML
         <!DOCTYPE html>
@@ -1431,6 +1671,8 @@ module KafkaBatch
       .metric { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 18px; min-width: 110px; }
       .metric-value { font-size: 26px; font-weight: 700; }
       .metric-label { color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+      .metric-link { color: inherit; text-decoration: none; }
+      .metric-link:hover { color: #2563eb; text-decoration: underline; }
       .chips { margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
       .chip { text-decoration: none; color: #374151; background: #fff; border: 1px solid #e5e7eb;
               padding: 5px 12px; border-radius: 999px; font-size: 13px; }
@@ -1456,6 +1698,15 @@ module KafkaBatch
       .filterbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
       .filterbar .chips { margin-bottom: 0; }
       .filterbar .search { margin-bottom: 0; margin-left: auto; }
+      .index-bottom { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin: 12px 0 24px; }
+      .index-bottom .bulk-toolbar,
+      .index-bottom .bulk-all-actions { display: flex; align-items: center; gap: 8px; margin: 0; flex-wrap: wrap; }
+      .index-bottom .inline-form { display: flex; align-items: center; margin: 0; }
+      .index-bottom .pager { margin: 0; flex: 1; justify-content: center; min-height: 32px; }
+      .index-bottom .btn { min-height: 32px; padding: 6px 12px; line-height: 1.25; box-sizing: border-box; }
+      .bulk-hint { font-size: 13px; }
+      .col-check { width: 32px; text-align: center; padding-left: 4px; padding-right: 4px; }
+      .col-check input[type=checkbox] { cursor: pointer; width: 15px; height: 15px; }
       .search { display: flex; gap: 8px; margin-bottom: 12px; }
       .search input[type=text] { width: 280px; padding: 6px 12px; border: 1px solid #d1d5db;
                                  border-radius: 7px; font-size: 14px; }

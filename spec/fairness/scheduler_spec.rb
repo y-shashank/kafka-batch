@@ -12,6 +12,10 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
     KafkaBatch.config.fairness_ready_window            = 0     # unbounded unless a test sets it
     KafkaBatch.config.fairness_max_inflight_per_tenant = 0
     KafkaBatch.config.fairness_default_weight          = 1.0
+    # Reset after examples that switch to :ingest_lag — otherwise a dev machine with
+    # a live Kafka cluster leaks partition lag into unrelated checkout specs.
+    KafkaBatch.config.fairness_active_count_source = :inflight_plus_ready
+    allow(KafkaBatch::Lag).to receive(:available?).and_return(false)
   end
 
   def drain(n)

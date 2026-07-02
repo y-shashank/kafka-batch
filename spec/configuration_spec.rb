@@ -132,6 +132,7 @@ RSpec.describe KafkaBatch::Configuration do
 
     it "defaults liveness_backend to :redis" do
       expect(config.liveness_backend).to eq(:redis)
+      expect(config.liveness_stats_interval).to eq(15)
     end
 
     it "defaults max_reconcile_per_run to 100" do

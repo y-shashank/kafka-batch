@@ -30,7 +30,6 @@ module KafkaBatch
       WORKER_CACHE_MUTEX = Mutex.new
 
       def consume
-        KafkaBatch::Liveness.heartbeat(topic: (topic.name rescue nil))
         messages.each { |msg| process_message(msg) }
       end
 
