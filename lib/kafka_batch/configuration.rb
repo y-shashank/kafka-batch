@@ -1,3 +1,5 @@
+require_relative "redis_client"
+
 module KafkaBatch
   class Configuration
     # ── Store ────────────────────────────────────────────────────────────────
@@ -105,8 +107,46 @@ module KafkaBatch
     # ── Redis ────────────────────────────────────────────────────────────────
     # Redis is a REQUIRED dependency (fairness scheduler + liveness). The :redis
     # store also keeps all batch state here.
-    attr_accessor :redis_url        # String  e.g. "redis://localhost:6379/0"
+    #
+    # Configure with either:
+    #   config.redis_url = "redis://localhost:6379/0"
+    # or a Rails-style hash (mutually exclusive — setting one clears the other):
+    #   config.redis = { host: "localhost", port: 6379, db: 0 }
+    attr_reader :redis              # Hash — set via #redis=
     attr_accessor :redis_pool_size  # Integer
+
+    def redis_url
+      raw = @redis_url
+      return raw if raw && !raw.to_s.empty?
+      return KafkaBatch::RedisClient.url_for(@redis) if @redis.is_a?(Hash) && !@redis.empty?
+
+      nil
+    end
+
+    def redis_url=(value)
+      @redis_url = value.nil? ? nil : value.to_s
+      @redis     = nil if value && !value.to_s.empty?
+    end
+
+    # Raw URL string when set explicitly (not derived from +redis+ hash).
+    def redis_url_raw
+      v = @redis_url
+      v if v && !v.to_s.empty?
+    end
+
+    def redis=(value)
+      unless value.is_a?(Hash)
+        raise ConfigurationError, "config.redis must be a Hash (got #{value.class})"
+      end
+
+      @redis     = value.transform_keys(&:to_sym)
+      @redis_url = nil
+    end
+
+    def redis_configured?
+      (@redis_url && !@redis_url.to_s.empty?) ||
+        (@redis.is_a?(Hash) && !@redis.empty?)
+    end
 
     # ── TTL for batch metadata in Redis (:redis store) ──────────────────────
     attr_accessor :batch_ttl        # Integer – seconds; default 7 days
@@ -274,6 +314,7 @@ module KafkaBatch
       @event_emit_retries       = 3
       @event_emit_backoff       = 1
       @redis_url                = "redis://localhost:6379/0"
+      @redis                    = nil
       @redis_pool_size          = 5
       @batch_ttl                = 7 * 24 * 3600  # 7 days
       @failures_ttl             = 24 * 3600      # 1 day (metadata only; Kafka is the source of truth)
@@ -351,11 +392,11 @@ module KafkaBatch
 
       # Redis is a HARD dependency: the multi-tenant fairness scheduler (WFQ ring,
       # in-flight counters, per-tenant ready windows) lives entirely in Redis, and
-      # it drives the default fairness path. redis_url must always be set.
-      if @redis_url.nil? || @redis_url.to_s.empty?
+      # it drives the default fairness path.
+      unless redis_configured?
         raise ConfigurationError,
-          "redis_url must be set — Redis is required by KafkaBatch (multi-tenant " \
-          "fairness scheduler + liveness). Set config.redis_url."
+          "Redis is required by KafkaBatch (fairness scheduler + liveness). " \
+          "Set config.redis_url or config.redis."
       end
 
       unless %i[time_fairness job_count_fairness].include?(@fairness_mode.to_sym)

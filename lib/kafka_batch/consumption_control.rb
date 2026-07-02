@@ -210,8 +210,7 @@ module KafkaBatch
       end
 
       def redis_with
-        url = KafkaBatch.config.redis_url
-        return nil if url.nil? || url.empty?
+        return nil unless KafkaBatch.config.redis_configured?
 
         redis_pool.with { |r| yield r }
       rescue StandardError => e
@@ -221,7 +220,8 @@ module KafkaBatch
 
       def redis_pool
         @pool ||= ConnectionPool.new(size: 3, timeout: 1) do
-          Redis.new(url: KafkaBatch.config.redis_url, timeout: 1, reconnect_attempts: 0)
+          KafkaBatch::RedisClient.new(KafkaBatch.config, timeout: 1, reconnect_attempts: 0) ||
+            raise(ConfigurationError, "Redis is not configured")
         end
       end
     end

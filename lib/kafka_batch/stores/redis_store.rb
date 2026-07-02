@@ -230,7 +230,7 @@ module KafkaBatch
       def initialize
         cfg = KafkaBatch.config
         @pool = ConnectionPool.new(size: cfg.redis_pool_size, timeout: 5) do
-          Redis.new(url: cfg.redis_url)
+          KafkaBatch::RedisClient.new(cfg) || raise(ConfigurationError, "Redis is not configured")
         end
         @ttl          = cfg.batch_ttl
         # Failure metadata is a UI convenience (real data lives in Kafka), so it

@@ -169,13 +169,13 @@ module KafkaBatch
 
       def redis_pool
         @pool ||= ConnectionPool.new(size: 3, timeout: 1) do
-          Redis.new(url: KafkaBatch.config.redis_url, timeout: 1, reconnect_attempts: 0)
+          KafkaBatch::RedisClient.new(KafkaBatch.config, timeout: 1, reconnect_attempts: 0) ||
+            raise(ConfigurationError, "Redis is not configured")
         end
       end
 
       def redis_circuit_closed?
-        url = KafkaBatch.config.redis_url
-        return false if url.nil? || url.empty?
+        return false unless KafkaBatch.config.redis_configured?
         @circuit_open_until.nil? || Time.now >= @circuit_open_until
       end
 

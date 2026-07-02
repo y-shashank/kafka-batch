@@ -23,6 +23,8 @@ KafkaBatch.configure do |config|
   # Redis is a hard dependency: it backs the multi-tenant fairness scheduler and
   # the live-activity dashboard (and, with store: :redis, all batch state).
   config.redis_url       = ENV.fetch("REDIS_URL", "redis://localhost:6379/0")
+  # Or a Rails-style hash (mutually exclusive with redis_url):
+  # config.redis = { host: "localhost", port: 6379, db: 0 }
   config.redis_pool_size = 5
 
   # ── Topic namespace ─────────────────────────────────────────────────────────

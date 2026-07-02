@@ -377,7 +377,7 @@ module KafkaBatch
       def initialize(pool: nil)
         cfg               = KafkaBatch.config
         @pool             = pool || ConnectionPool.new(size: cfg.redis_pool_size, timeout: 5) do
-          Redis.new(url: cfg.redis_url)
+          KafkaBatch::RedisClient.new(cfg) || raise(ConfigurationError, "Redis is not configured")
         end
         @window           = cfg.fairness_ready_window.to_i
         @budget           = cfg.fairness_global_concurrency.to_i

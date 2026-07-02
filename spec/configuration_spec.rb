@@ -157,10 +157,13 @@ RSpec.describe KafkaBatch::Configuration do
       expect { config.validate! }.to raise_error(KafkaBatch::ConfigurationError, /brokers/)
     end
 
-    it "requires a redis_url for the redis store" do
+    it "requires Redis via redis_url or redis hash" do
       config.store     = :redis
       config.redis_url = ""
-      expect { config.validate! }.to raise_error(KafkaBatch::ConfigurationError, /redis_url/)
+      expect { config.validate! }.to raise_error(KafkaBatch::ConfigurationError, /redis_url|config\.redis/)
+
+      config.redis = { host: "localhost", port: 6379, db: 0 }
+      expect { config.validate! }.not_to raise_error
     end
 
     it "accepts :off as a valid liveness_backend" do
