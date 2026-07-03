@@ -2,6 +2,8 @@ require "erb"
 require "cgi"
 require "securerandom"
 require "time"
+require_relative "system_info"
+require_relative "weight_shares"
 
 module KafkaBatch
   # A minimal, dependency-free Rack application for inspecting batches –
@@ -91,19 +93,21 @@ module KafkaBatch
         if method == "GET" && path == "/"
           html(render_index(params))
         elsif method == "GET" && path == "/failures"
-          html(render_failures(params))
+          html(render_failures(params), title: "Failures")
         elsif method == "GET" && path == "/live"
-          html(render_live)
+          html(render_live, title: "Consumer Process")
         elsif method == "GET" && path == "/lag"
-          html(render_lag(params))
+          html(render_lag(params), title: "Kafka Lag")
         elsif method == "POST" && path == "/lag/pause"
           lag_consumption_control(:pause, params)
         elsif method == "POST" && path == "/lag/resume"
           lag_consumption_control(:resume, params)
         elsif method == "GET" && path == "/fairness"
-          html(render_fairness(params))
+          html(render_fairness(params), title: "Fairness")
+        elsif method == "GET" && path == "/system"
+          html(render_system, title: "System")
         elsif method == "GET" && path == "/weights"
-          html(render_weights(params))
+          html(render_weights(params), title: "Weights")
         elsif method == "POST" && path == "/weights"
           weights_set(params.merge(body_params(env)))
         elsif method == "POST" && path == "/weights/reset"
@@ -179,9 +183,9 @@ module KafkaBatch
     end
 
     # Wrap an HTML body string in the layout; pass through ready-made responses.
-    def html(body_or_response)
+    def html(body_or_response, title: "Batches")
       return body_or_response if body_or_response.is_a?(Array)
-      [200, html_headers, [layout("Batches", body_or_response)]]
+      [200, html_headers, [layout(title, body_or_response)]]
     end
 
     def not_found
@@ -262,6 +266,15 @@ module KafkaBatch
     end
 
     # ── Pages ──────────────────────────────────────────────────────────────
+
+    def render_system
+      cards = KafkaBatch::SystemInfo.sections.map { |section| system_card(section) }.join
+
+      <<~HTML
+        <p class="muted sys-lead">Read-only view of the active KafkaBatch configuration. Passwords and secrets are masked.</p>
+        <div class="sys-grid">#{cards}</div>
+      HTML
+    end
 
     def render_index(params)
       status   = non_empty(params["status"])
@@ -724,6 +737,8 @@ module KafkaBatch
       end
 
       default_w = sched.default_weight
+      shares    = KafkaBatch::WeightShares.compute(tenants)
+      share_by  = shares.to_h { |s| [s.tenant_id, s] }
 
       tenant_rows = tenants.map do |t|
         tid    = t[:tenant_id]
@@ -732,6 +747,10 @@ module KafkaBatch
         inf    = t[:inflight]
         queued = t[:queued]
         vtime  = t[:vtime]
+        share  = share_by[tid]
+        pct    = share ? KafkaBatch::WeightShares.format_pct(share.share_pct) : "—"
+        fg, _bg = tenant_colors(tid)
+        mini_bar = share ? weight_share_mini_bar(share.share_pct, fg) : ""
 
         custom_badge = custom \
           ? "<span class='badge' style='background:#6366f1'>custom</span>"
@@ -765,11 +784,18 @@ module KafkaBatch
           end
 
         weight_display = "<strong>#{w}</strong>"
+        share_cell = <<~CELL.gsub(/\n\s*/, "")
+          <div class="weight-share-cell">
+            <span class="weight-share-pct">#{pct}</span>
+            #{mini_bar}
+          </div>
+        CELL
 
         <<~ROW.gsub(/\n\s*/, "")
           <tr>
             <td class="mono">#{h(tid)}</td>
             <td class="mono" style="text-align:right">#{weight_display}</td>
+            <td style="text-align:right">#{share_cell}</td>
             <td>#{set_form}</td>
             <td>#{custom_badge}</td>
             <td>#{inf_cell}</td>
@@ -780,7 +806,7 @@ module KafkaBatch
         ROW
       end.join
 
-      tenant_rows = "<tr><td colspan='8' class='empty'>No active tenants yet. Tenants appear automatically as soon as they enqueue their first job.</td></tr>" if tenants.empty?
+      tenant_rows = "<tr><td colspan='9' class='empty'>No active tenants yet. Tenants appear automatically as soon as they enqueue their first job.</td></tr>" if tenants.empty?
 
       csrf_qs = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
       add_form = <<~FORM
@@ -791,6 +817,8 @@ module KafkaBatch
         </form>
       FORM
 
+      capacity_card = weight_share_distribution_card(shares, cfg)
+
       <<~HTML
         #{back}
         <div class="metrics">
@@ -799,6 +827,7 @@ module KafkaBatch
           <div class="metric metric-info" title="Tenants with jobs currently checked out via Scheduler#checkout but not yet completed. Tracks active WFQ concurrency. Always 0 with the Kafka-native Dispatcher — only non-zero when driving the Scheduler directly with checkout/complete."><div class="metric-value">#{tenants.count { |t| t[:inflight].positive? }}</div><div class="metric-label">In-flight now ⓘ</div></div>
           <div class="metric metric-info" title="Tenants currently in the WFQ ring — they have jobs in their Scheduler ready queue awaiting checkout. Always 0 with the Kafka-native Dispatcher — only non-zero when using the Scheduler-based WFQ dispatch path."><div class="metric-value">#{tenants.count { |t| t[:queued] }}</div><div class="metric-label">Queued ⓘ</div></div>
         </div>
+        #{capacity_card}
         <div class="card">
           <p>
             <span class="badge" style="background:#{mode_badge_color}">#{mode_label}</span>
@@ -810,6 +839,8 @@ module KafkaBatch
           <h3>Tenant weights</h3>
           <p class="muted">
             Higher weight = proportionally more throughput.
+            <strong>Capacity share</strong> normalizes all tenant weights to 100% — raising one tenant's weight
+            increases its share and reduces others proportionally.
             Weights are persisted in Redis and propagate to all dispatcher processes within the cache TTL
             (<code>#{cfg.fairness_weight_cache_ttl}s</code>). New tenants appear here automatically.
           </p>
@@ -817,7 +848,8 @@ module KafkaBatch
             <thead>
               <tr>
                 <th>Tenant ID</th>
-                <th style="text-align:right">Current Weight</th>
+                <th style="text-align:right">Weight</th>
+                <th style="text-align:right" title="Share of total configured weight (always sums to 100%)">Capacity share ⓘ</th>
                 <th>Set Weight</th>
                 <th>Override</th>
                 <th title="Jobs currently checked out from the WFQ Scheduler but not yet completed. Always 0 with the Kafka-native Dispatcher.">In-flight ⓘ</th>
@@ -1130,6 +1162,29 @@ module KafkaBatch
 
     # ── Partials ───────────────────────────────────────────────────────────
 
+    def system_card(section)
+      wide = section.wide ? " sys-card-wide" : ""
+      rows = section.rows.map do |r|
+        val_cls = r.masked ? "sys-value masked" : "sys-value"
+        <<~ROW
+          <div class="sys-row">
+            <span class="sys-label">#{h(r.label)}</span>
+            <span class="#{val_cls}">#{h(r.value)}</span>
+          </div>
+        ROW
+      end.join
+
+      <<~HTML
+        <section class="sys-card#{wide}" style="--sys-accent:#{h(section.accent)}">
+          <div class="sys-card-head">
+            <span class="sys-card-icon" aria-hidden="true">#{section.icon}</span>
+            <h2 class="sys-card-title">#{h(section.title)}</h2>
+          </div>
+          <div class="sys-card-body">#{rows}</div>
+        </section>
+      HTML
+    end
+
     def summary_cards(counts, pending_jobs = nil, liveness = nil)
       total = counts.values.sum
       cards = [["Total", total, "#111827", nil]]
@@ -1419,9 +1474,68 @@ module KafkaBatch
     # without needing a legend.
     def tenant_chip(tenant_id)
       return "" if tenant_id.nil? || tenant_id.empty?
-      idx  = tenant_id.bytes.sum % TENANT_COLORS.size
-      fg, bg = TENANT_COLORS[idx]
+      fg, bg = tenant_colors(tenant_id)
       "<span class='tenant-chip' style='color:#{fg};background:#{bg}'>#{h(tenant_id)}</span>"
+    end
+
+    def tenant_colors(tenant_id)
+      idx = tenant_id.to_s.bytes.sum % TENANT_COLORS.size
+      TENANT_COLORS[idx]
+    end
+
+    def weight_share_mini_bar(share_pct, color)
+      width = [[share_pct.to_f, 0].max, 100].min
+      return "" if width <= 0
+
+      %(<div class="weight-share-mini" aria-hidden="true"><span style="width:#{width}%;background:#{color}"></span></div>)
+    end
+
+    def weight_share_distribution_card(shares, cfg)
+      return "" if shares.empty?
+
+      segments = shares.map do |s|
+        fg, bg = tenant_colors(s.tenant_id)
+        pct = s.share_pct.to_f
+        label = "#{s.tenant_id}: #{KafkaBatch::WeightShares.format_pct(pct)}"
+        <<~SEG.gsub(/\n\s*/, "")
+          <div class="weight-share-segment" style="width:#{pct}%;background:#{bg};color:#{fg}"
+               title="#{h(label)}" aria-label="#{h(label)}">
+            <span class="weight-share-segment-label">#{h(KafkaBatch::WeightShares.format_pct(pct))}</span>
+          </div>
+        SEG
+      end.join
+
+      legend = shares.map do |s|
+        fg, bg = tenant_colors(s.tenant_id)
+        pct = KafkaBatch::WeightShares.format_pct(s.share_pct)
+        <<~ITEM.gsub(/\n\s*/, "")
+          <div class="weight-share-legend-item">
+            <span class="weight-share-swatch" style="background:#{bg};color:#{fg}"></span>
+            <span class="mono">#{h(s.tenant_id)}</span>
+            <span class="weight-share-legend-pct">#{pct}</span>
+            <span class="muted weight-share-legend-weight">(w=#{s.weight})</span>
+          </div>
+        ITEM
+      end.join
+
+      concurrency_note =
+        if cfg.fairness_weighted_concurrency
+          "<p class=\"muted\">With <code>fairness_weighted_concurrency</code> enabled, these shares drive per-tenant in-flight caps.</p>"
+        else
+          "<p class=\"muted\">Shares reflect relative weight ratios. Enable <code>fairness_weighted_concurrency</code> to enforce them as in-flight capacity caps; otherwise weights mainly affect selection order under saturation.</p>"
+        end
+
+      <<~HTML
+        <div class="card">
+          <h3>Capacity distribution</h3>
+          <p class="muted">Overall capacity is normalized to <strong>100%</strong>. Each tenant's share is its weight divided by the sum of all tenant weights.</p>
+          #{concurrency_note}
+          <div class="weight-share-track" role="img" aria-label="Tenant capacity share distribution">
+            #{segments}
+          </div>
+          <div class="weight-share-legend">#{legend}</div>
+        </div>
+      HTML
     end
 
     def pagination(page, has_next, status, search = nil)
@@ -1493,6 +1607,10 @@ module KafkaBatch
 
     def weights_path
       "#{@script_name}/weights"
+    end
+
+    def system_path
+      "#{@script_name}/system"
     end
 
     def weights_reset_path
@@ -1634,12 +1752,13 @@ module KafkaBatch
           <header>
             <a href="#{index_path}" class="logo">KafkaBatch</a>
             <nav class="header-nav">
-              <a class="btn" href="#{index_path}">Batches</a>
-              <a class="btn" href="#{failures_path}">⚠ Failures</a>
-              <a class="btn" href="#{live_path}">▶ Consumer Process</a>
-              <a class="btn" href="#{lag_path}">▦ Kafka Lag</a>
-              <a class="btn" href="#{fairness_path}">⚖ Fairness</a>
-              <a class="btn" href="#{weights_path}">⚖ Weights</a>
+              #{nav_btn("/", "Batches")}
+              #{nav_btn("/failures", "⚠ Failures")}
+              #{nav_btn("/live", "▶ Consumer Process")}
+              #{nav_btn("/lag", "▦ Kafka Lag")}
+              #{nav_btn("/fairness", "⚖ Fairness")}
+              #{nav_btn("/weights", "⚖ Weights")}
+              #{nav_btn("/system", "⚙ System")}
               #{live_toggle_button}
             </nav>
           </header>
@@ -1648,6 +1767,13 @@ module KafkaBatch
         </body>
         </html>
       HTML
+    end
+
+    def nav_btn(path_suffix, label)
+      href = path_suffix == "/" ? index_path : "#{@script_name}#{path_suffix}"
+      active = @path == path_suffix
+      cls = active ? "btn nav-active" : "btn"
+      %(<a class="#{cls}" href="#{href}">#{label}</a>)
     end
 
     CSS = <<~CSS
@@ -1659,6 +1785,7 @@ module KafkaBatch
       header .tag { color: #9ca3af; font-size: 13px; }
       .header-nav { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
       header .btn { background: transparent; border-color: #4b5563; color: #e5e7eb; font-size: 12px; padding: 4px 10px; }
+      header .btn.nav-active { border-color: #e5e7eb; background: #374151; color: #fff; }
       header .btn.live-on { border-color: #10b981; background: #10b981; color: #fff; }
       main { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
       .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
@@ -1720,8 +1847,106 @@ module KafkaBatch
       .weight-add-form { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
       .weight-add-id { padding:6px 12px; border:1px solid #d1d5db; border-radius:7px;
                        font-size:14px; width:220px; }
+      .weight-share-track {
+        display: flex; width: 100%; height: 28px; border-radius: 999px; overflow: hidden;
+        border: 1px solid #e5e7eb; background: #f9fafb; margin: 12px 0 14px;
+      }
+      .weight-share-segment {
+        display: flex; align-items: center; justify-content: center; min-width: 0;
+        overflow: hidden; transition: width .2s ease;
+      }
+      .weight-share-segment-label {
+        font-size: 11px; font-weight: 700; padding: 0 6px; white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis;
+      }
+      .weight-share-legend { display: flex; flex-wrap: wrap; gap: 10px 18px; }
+      .weight-share-legend-item { display: flex; align-items: center; gap: 6px; font-size: 13px; min-width: 0; }
+      .weight-share-swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; border: 1px solid rgba(0,0,0,.06); }
+      .weight-share-legend-pct { font-weight: 700; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+      .weight-share-legend-weight { font-size: 12px; }
+      .weight-share-cell { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; min-width: 72px; }
+      .weight-share-pct { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700; }
+      .weight-share-mini { width: 72px; height: 5px; border-radius: 999px; background: #eef0f3; overflow: hidden; }
+      .weight-share-mini span { display: block; height: 100%; border-radius: 999px; }
+      @media (max-width: 640px) {
+        .weight-share-segment-label { display: none; }
+        .weight-share-track { height: 22px; }
+        .weight-share-legend { flex-direction: column; gap: 8px; }
+      }
       .metric-info { cursor:help; }
       th[title] { cursor:help; }
+      .sys-lead { margin: 0 0 16px; font-size: 14px; line-height: 1.5; }
+      main:has(.sys-grid) { max-width: 1280px; }
+      .sys-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 12px;
+        margin-bottom: 24px;
+      }
+      .sys-card {
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        overflow: hidden;
+        border-top: 3px solid var(--sys-accent, #111827);
+        box-shadow: 0 1px 2px rgba(17,24,39,.04);
+        min-width: 0;
+      }
+      .sys-card-wide { grid-column: 1 / -1; }
+      .sys-card-head {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 14px 10px;
+        border-bottom: 1px solid #f3f4f6;
+        background: linear-gradient(180deg, #fafafa 0%, #fff 100%);
+      }
+      .sys-card-icon { font-size: 18px; line-height: 1; opacity: .85; flex-shrink: 0; }
+      .sys-card-title { margin: 0; font-size: 15px; font-weight: 700; color: #111827; line-height: 1.3; }
+      .sys-card-body { padding: 4px 14px 12px; min-width: 0; }
+      .sys-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+        align-items: start;
+        gap: 8px 16px;
+        padding: 8px 0;
+        border-bottom: 1px solid #f9fafb;
+        font-size: 13px;
+      }
+      .sys-row:last-child { border-bottom: none; }
+      .sys-label { color: #6b7280; line-height: 1.4; min-width: 0; }
+      .sys-value {
+        color: #111827;
+        text-align: right;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        line-height: 1.45;
+        min-width: 0;
+      }
+      .sys-value.masked { color: #9ca3af; font-style: italic; }
+      @media (min-width: 480px) {
+        .sys-grid { gap: 14px; }
+        .sys-card-head { padding: 14px 16px 10px; }
+        .sys-card-body { padding: 4px 16px 14px; }
+      }
+      @media (min-width: 640px) {
+        .sys-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+      }
+      @media (min-width: 1024px) {
+        .sys-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .sys-card-wide .sys-card-body {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          column-gap: 28px;
+        }
+      }
+      @media (max-width: 479px) {
+        .sys-row { grid-template-columns: 1fr; gap: 2px; }
+        .sys-value { text-align: left; }
+        .sys-lead { font-size: 13px; margin-bottom: 12px; }
+      }
     CSS
   end
 end

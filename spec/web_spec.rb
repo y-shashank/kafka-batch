@@ -302,6 +302,52 @@ RSpec.describe KafkaBatch::Web do
     end
   end
 
+  describe "GET /weights" do
+    it "shows capacity share percentages that sum to 100%" do
+      sched = instance_double(KafkaBatch::Fairness::Scheduler, default_weight: 1.0)
+      allow(KafkaBatch).to receive(:scheduler).and_return(sched)
+      allow(sched).to receive(:all_tenants).and_return([
+        { tenant_id: "a", weight: 3.0, has_custom_weight: true, inflight: 0, queued: false, vtime: 0.0 },
+        { tenant_id: "b", weight: 1.0, has_custom_weight: false, inflight: 0, queued: false, vtime: 0.0 }
+      ])
+
+      html = get("/weights").last.join
+      expect(html).to include("Capacity distribution")
+      expect(html).to include("weight-share-track")
+      expect(html).to include("75.0%")
+      expect(html).to include("25.0%")
+      expect(html).to include("Capacity share")
+    end
+  end
+
+  describe "GET /system" do
+    it "renders configuration cards with masked secrets" do
+      KafkaBatch.config.redis_url = "redis://user:secret@localhost:6379/0"
+      html = get("/system").last.join
+
+      expect(html).to include("System")
+      expect(html).to include("sys-grid")
+      expect(html).to include("sys-card")
+      expect(html).to include("Overview")
+      expect(html).to include("Kafka")
+      expect(html).to include("Redis")
+      expect(html).to include("Fairness")
+      expect(html).to include("localhost:9092")
+      expect(html).not_to include("user:secret@")
+      expect(html).to include("***")
+    end
+
+    it "links System from the header nav" do
+      expect(get("/").last.join).to include('href="/kafka_batch/system"')
+      expect(get("/").last.join).to include("⚙ System")
+    end
+
+    it "highlights System in the nav when on /system" do
+      html = get("/system").last.join
+      expect(html).to include('class="btn nav-active" href="/kafka_batch/system"')
+    end
+  end
+
   describe "GET /live" do
     it "shows running jobs and consumers when Redis is available" do
       skip "Redis unavailable" unless KafkaBatchSpec::RedisHelper.available?
@@ -332,7 +378,7 @@ RSpec.describe KafkaBatch::Web do
 
     it "/live, /lag and /fairness include the Live toggle" do
       allow(KafkaBatch::Lag).to receive(:available?).and_return(false)
-      %w[/live /lag /fairness].each do |path|
+      %w[/live /lag /fairness /system].each do |path|
         expect(get(path).last.join).to include('id="kb-live-toggle"')
       end
     end
