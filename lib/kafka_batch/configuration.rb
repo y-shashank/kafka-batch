@@ -52,6 +52,14 @@ module KafkaBatch
       define_method(:"#{name}=") { |val| instance_variable_set(:"@#{name}", val) }
     end
 
+    # Custom plain-worker topics a UI-only dashboard (require: "kafka_batch/ui",
+    # which never calls draw_routes and loads no worker classes) should list on
+    # the /lag page. Values are used VERBATIM — matching how workers declare
+    # `kafka_topic "orders.process"` — so this is a plain list, NOT prefix-aware.
+    # Only affects the config-based /lag fallback; worker processes that draw
+    # routes resolve custom topics from the routes directly.
+    attr_accessor :extra_job_topics   # Array<String> – default []
+
     # ── Cancellation ─────────────────────────────────────────────────────────
     # When true, JobConsumer skips execution of jobs whose batch was cancelled.
     # The set of cancelled batch ids is cached per process and refreshed at most
@@ -407,6 +415,7 @@ module KafkaBatch
       @producer_config          = {}
       @consumer_config          = {}
       @validate_topics_on_boot  = false
+      @extra_job_topics         = []
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
 

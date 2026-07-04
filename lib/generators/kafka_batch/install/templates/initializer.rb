@@ -52,6 +52,11 @@ KafkaBatch.configure do |config|
   # consumer group "myapp.kafka-batch"). Leave blank for the bare defaults.
   config.topic_prefix = ENV["KAFKA_PREFIX"].to_s.strip
 
+  # Custom plain-worker topics a UI-only dashboard should show on the /lag page.
+  # Only needed for a dedicated web service (require: "kafka_batch/ui") that never
+  # calls draw_routes — worker processes discover these from their routes. Verbatim.
+  # config.extra_job_topics = %w[orders.process reports.rebuild]
+
   # ── Retries ─────────────────────────────────────────────────────────────────
   # Tiered retries: the Nth retry walks short → medium → large, each on its own
   # Kafka topic so a slow tier never head-of-line-blocks a fast one. A Worker can

@@ -67,6 +67,34 @@ RSpec.describe KafkaBatch::Lag do
       )
       expect(result).not_to have_key("app")
     end
+
+    context "config-based fallback (no gem-owned routes drawn in this process)" do
+      before do
+        KafkaBatch.config.consumer_group = "kb"
+        KafkaBatch.config.topic_prefix   = ""      # bare default topic names
+        # No gem routes → gem_groups_with_topics uses config_based_groups.
+        allow(Karafka::App).to receive(:routes).and_return([])
+      end
+
+      it "folds config.extra_job_topics into the -jobs group" do
+        KafkaBatch.config.extra_job_topics = %w[orders.process]
+        allow(KafkaBatch).to receive(:workers).and_return([]) # registry empty
+
+        result = described_class.gem_groups_with_topics
+        expect(result["kb-jobs"]).to eq(%w[kafka_batch.jobs orders.process])
+      end
+
+      it "folds registry worker topics into -jobs, excluding fair and priority workers" do
+        KafkaBatch.config.extra_job_topics = []
+        plain    = double("plain",    fairness?: false, kafka_topic: "orders.process")
+        fair     = double("fair",     fairness?: true,  kafka_topic: "should.be.ignored")
+        priority = double("priority", fairness?: false, kafka_topic: KafkaBatch.config.fast_p0_topic)
+        allow(KafkaBatch).to receive(:workers).and_return([plain, fair, priority])
+
+        result = described_class.gem_groups_with_topics
+        expect(result["kb-jobs"]).to eq(%w[kafka_batch.jobs orders.process])
+      end
+    end
   end
 
   describe ".read" do

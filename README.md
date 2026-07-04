@@ -390,6 +390,7 @@ Every option on `KafkaBatch.config`:
 | `producer_config` | Hash | `{}` | Raw rdkafka/WaterDrop producer overrides |
 | `consumer_config` | Hash | `{}` | Raw rdkafka consumer overrides (merged into every consumer) |
 | `validate_topics_on_boot` | Boolean | `false` | Raise at boot if required topics are missing |
+| `extra_job_topics` | Array&lt;String&gt; | `[]` | Custom plain-worker topics a **UI-only** dashboard should list on the `/lag` page. Used verbatim (not prefix-aware). Only affects the config-based `/lag` fallback — worker processes that call `draw_routes` resolve custom topics from the routes automatically |
 
 **Per-Worker overrides** (on the worker class, not `config`): `kafka_topic` (optional — defaults to `config.jobs_topic`; set to one of the four priority topic names to enroll in a priority group), `max_retries`, `complete_after_retries`, `retry_tier`, `fairness` (opt into the shared multi-tenant fair lane — takes precedence over `kafka_topic`).
 

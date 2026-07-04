@@ -169,10 +169,35 @@ module KafkaBatch
         groups["#{prefix}-jobs-fair-#{t}"] = [ready]  if ready  && !ready.to_s.empty?
       end
 
-      # Plain jobs group — use the default jobs topic.
-      groups["#{prefix}-jobs"] = [cfg.jobs_topic].compact
+      # Plain jobs group — the default topic PLUS any custom plain-worker topics.
+      # draw_routes was never called in this process, so recover the customs from
+      # (a) the worker registry when the full backend happens to be loaded, and
+      # (b) config.extra_job_topics (the reliable path for a pure UI-only service
+      # that never loads worker classes).
+      priority = [cfg.fast_p0_topic, cfg.fast_p1_topic,
+                  cfg.slow_p0_topic, cfg.slow_p1_topic].compact
+      groups["#{prefix}-jobs"] =
+        ([cfg.jobs_topic] + registry_job_topics(priority) + Array(cfg.extra_job_topics))
+        .compact.uniq
 
       groups.reject { |_, topics| topics.empty? }
+    end
+
+    # Custom plain-worker topics recovered from the in-process worker registry,
+    # if the full backend is loaded (UI-only processes require "kafka_batch/ui"
+    # and have no registry — respond_to? guards that). Fair workers own no topic;
+    # priority topics belong to the fast/slow groups, so both are excluded.
+    # @api private
+    def registry_job_topics(priority)
+      return [] unless KafkaBatch.respond_to?(:workers)
+
+      KafkaBatch.workers
+                .reject { |w| w.respond_to?(:fairness?) && w.fairness? }
+                .map    { |w| begin; w.kafka_topic; rescue StandardError; nil; end }
+                .compact
+                .reject { |t| priority.include?(t) }
+    rescue StandardError
+      []
     end
   end
 end
