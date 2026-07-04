@@ -31,8 +31,13 @@ module KafkaBatch
       retry_topic:           "kafka_batch.jobs.retry",  # base; per-tier is <this>.short/.medium/.large
       scheduled_topic:       "kafka_batch.scheduled",   # durable payload store for perform_in/perform_at
       consumer_group:        "kafka-batch",             # base consumer group (suffixed -control/-dispatch/…)
-      fairness_ingest_topic: "kafka_batch.ingest",      # durable per-tenant intake (fairness)
-      fairness_ready_topic:  "kafka_batch.ready",       # fairly-ordered execution queue (fairness)
+      # Two independent fairness lanes — a worker picks one via `fairness_type`
+      # (:time | :throughput). Each lane has its own ingest → ready topics,
+      # scheduler, and tenant weights, so both run side by side.
+      fair_time_ingest_topic:       "kafka_batch.fair_time_ingest",       # time-fairness intake
+      fair_time_ready_topic:        "kafka_batch.fair_time_ready",        # time-fairness execution queue
+      fair_throughput_ingest_topic: "kafka_batch.fair_throughput_ingest", # throughput-fairness intake
+      fair_throughput_ready_topic:  "kafka_batch.fair_throughput_ready",  # throughput-fairness execution queue
       fast_p0_topic:         "kafka_batch.jobs.fast_p0",
       fast_p1_topic:         "kafka_batch.jobs.fast_p1",
       slow_p0_topic:         "kafka_batch.jobs.slow_p0",
@@ -110,8 +115,13 @@ module KafkaBatch
     #            native per-job cancel/lookup by primary key.
     attr_accessor :schedule_store            # Symbol – :redis (default) | :mysql
     attr_accessor :schedule_poller_enabled   # Boolean – default true (consumer procs poll)
-    attr_accessor :schedule_poll_interval    # Float   – seconds between idle polls; default 5.0
-    attr_accessor :schedule_poll_jitter      # Float   – +/- fraction on the idle sleep; default 0.1
+    attr_accessor :schedule_poll_interval    # Float   – base seconds between polls when work is flowing; default 5.0
+    # When a poll finds nothing due, the poller backs off (doubling the sleep up to
+    # this cap) so idle pods stop hammering the schedule store; it snaps back to
+    # schedule_poll_interval the moment a poll returns work. With many pods this is
+    # the main throttle on idle DB/Redis load. Set == schedule_poll_interval to disable.
+    attr_accessor :schedule_poll_max_interval # Float   – seconds; default 60.0
+    attr_accessor :schedule_poll_jitter      # Float   – +/- fraction on the sleep (de-syncs pods); default 0.1
     attr_accessor :schedule_batch_size       # Integer – max due jobs claimed per tick; default 100
     # In-flight LEASE: a claimed-but-not-dispatched job is reclaimed after this many
     # seconds so a poller/process crash mid-dispatch cannot strand it (at-least-once).
@@ -203,13 +213,34 @@ module KafkaBatch
     #                                forward to the ready topic)
     #     → ready topic → JobConsumer swarm → perform → Scheduler#complete
 
-    # Fairness accounting mode (the REAL, active fairness behaviour):
-    #   :time_fairness      – (default) vtime advances at *completion* by
-    #                         actual_job_seconds / weight. Fair weighted wall-clock
-    #                         time; correct for uneven runtimes (e.g. 20-60s jobs).
-    #   :job_count_fairness – vtime advances by 1/weight at *checkout*. Fair over
-    #                         dispatched job count; use when runtimes are similar.
-    attr_accessor :fairness_mode                    # Symbol – default :time_fairness
+    # ── Two fairness lanes (per-worker, run simultaneously) ──────────────────
+    # Fairness is chosen PER WORKER via `fairness_type` (:time | :throughput);
+    # both lanes run at once and a single batch may contain jobs of both types.
+    #   :time       – vtime advances at *completion* by actual_seconds / weight.
+    #                 Fair weighted wall-clock time; best for uneven runtimes.
+    #   :throughput – vtime advances by 1/weight at *checkout*. Fair over
+    #                 dispatched job count; best when runtimes are similar.
+    # Each lane has its own ingest/ready topics, Redis WFQ scheduler, and tenant
+    # weights. The concurrency/window knobs below apply to EACH lane independently.
+    FAIRNESS_TYPES = %i[time throughput].freeze
+
+    # Deprecated: fairness is now per-worker (`fairness_type`), not a global mode.
+    # Kept as a no-op setter so old initializers don't crash.
+    def fairness_mode=(_value)
+      logger&.warn(
+        "[KafkaBatch] config.fairness_mode is removed — set `fairness_type :time` " \
+        "or `fairness_type :throughput` on each Worker instead. Ignoring."
+      )
+    end
+
+    # Kafka ingest/ready topic for a fairness lane.
+    def fairness_ingest_topic(type)
+      type.to_sym == :throughput ? fair_throughput_ingest_topic : fair_time_ingest_topic
+    end
+
+    def fairness_ready_topic(type)
+      type.to_sym == :throughput ? fair_throughput_ready_topic : fair_time_ready_topic
+    end
 
     # Global in-flight window: max jobs forwarded to the ready topic but not yet
     # completed. Bounds ready-topic depth (keeps fairness dynamic) AND total
@@ -340,6 +371,7 @@ module KafkaBatch
       @schedule_store           = :redis
       @schedule_poller_enabled  = true
       @schedule_poll_interval   = 5.0
+      @schedule_poll_max_interval = 60.0
       @schedule_poll_jitter     = 0.1
       @schedule_batch_size      = 100
       @schedule_lease_seconds   = 60
@@ -353,7 +385,6 @@ module KafkaBatch
       @batch_ttl                = 7 * 24 * 3600  # 7 days
       @failures_ttl             = 24 * 3600      # 1 day (metadata only; Kafka is the source of truth)
       @max_failures_per_batch   = 1000           # cap tracked failing jobs per batch (0 = unlimited)
-      @fairness_mode                    = :time_fairness
       @fairness_global_concurrency      = 50
       @fairness_max_inflight_per_tenant = 0      # 0 = dynamic fair share only (ceil(window/active))
       @fairness_weighted_concurrency    = false  # true = per-tenant cap proportional to weight
@@ -436,21 +467,14 @@ module KafkaBatch
           "Set config.redis_url or config.redis."
       end
 
-      unless %i[time_fairness job_count_fairness].include?(@fairness_mode.to_sym)
+      # The time-fairness lane advances vtime only at completion, so a tenant is
+      # kept from seizing the whole in-flight window by the dynamic fair-share cap
+      # (ceil(global_concurrency / active_tenants)). That requires a finite global
+      # window; if BOTH the window is unbounded (global_concurrency <= 0) AND no
+      # hard per-tenant cap is set, a single tenant could monopolise the time lane.
+      if @fairness_global_concurrency.to_i <= 0 && @fairness_max_inflight_per_tenant.to_i <= 0
         raise ConfigurationError,
-          "fairness_mode must be :time_fairness or :job_count_fairness (got #{@fairness_mode.inspect})"
-      end
-
-      # In time-fairness mode vtime only advances at completion, so a tenant is
-      # kept from seizing the whole in-flight window by the dynamic fair-share
-      # cap (ceil(global_concurrency / active_tenants)). That requires a finite
-      # global window; if BOTH the window is unbounded (global_concurrency <= 0)
-      # AND no hard per-tenant cap is set, a single tenant could monopolise.
-      if @fairness_mode.to_sym == :time_fairness &&
-         @fairness_global_concurrency.to_i <= 0 &&
-         @fairness_max_inflight_per_tenant.to_i <= 0
-        raise ConfigurationError,
-          ":time_fairness requires either fairness_global_concurrency > 0 " \
+          "The time-fairness lane requires either fairness_global_concurrency > 0 " \
           "(recommended — enables the dynamic fair-share cap) or " \
           "fairness_max_inflight_per_tenant > 0. Otherwise a single tenant can " \
           "monopolise the in-flight window (vtime only advances at completion)."

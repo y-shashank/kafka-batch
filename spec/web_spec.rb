@@ -178,7 +178,7 @@ RSpec.describe KafkaBatch::Web do
       html = get("/lag", query: "tenant_id=acme").last.join
       expect(html).to include("partition 7")
       expect(html).to include("acme")
-      expect(html).to include(KafkaBatch.config.fairness_ingest_topic)
+      expect(html).to include(KafkaBatch.config.fairness_ingest_topic(:time))
     end
 
     it "shows pause controls when Redis consumption control is available" do
@@ -204,34 +204,38 @@ RSpec.describe KafkaBatch::Web do
     end
   end
 
-  describe "GET /fairness" do
-    it "shows an inactive notice but still renders lag when no worker opts in" do
-      allow(KafkaBatch).to receive(:fairness?).and_return(false)
+  describe "GET /fairness/time" do
+    it "shows an inactive notice but still renders lag when no worker uses the lane" do
+      allow(KafkaBatch).to receive(:active_fairness_types).and_return([])
       allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
-      ingest_group = KafkaBatch.dispatch_consumer_group
-      fair_group   = KafkaBatch.jobs_fair_consumer_group
-      allow(KafkaBatch::Lag).to receive(:read_group).with(ingest_group, [KafkaBatch.config.fairness_ingest_topic])
-        .and_return(ingest_group => { KafkaBatch.config.fairness_ingest_topic => { 0 => { offset: 0, lag: 3 } } })
-      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [KafkaBatch.config.fairness_ready_topic])
-        .and_return(fair_group => { KafkaBatch.config.fairness_ready_topic => { 0 => { offset: 0, lag: 0 } } })
+      ingest_group = KafkaBatch.dispatch_consumer_group(:time)
+      fair_group   = KafkaBatch.jobs_fair_consumer_group(:time)
+      ingest_t = KafkaBatch.config.fairness_ingest_topic(:time)
+      ready_t  = KafkaBatch.config.fairness_ready_topic(:time)
+      allow(KafkaBatch::Lag).to receive(:read_group).with(ingest_group, [ingest_t])
+        .and_return(ingest_group => { ingest_t => { 0 => { offset: 0, lag: 3 } } })
+      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [ready_t])
+        .and_return(fair_group => { ready_t => { 0 => { offset: 0, lag: 0 } } })
 
-      html = get("/fairness").last.join
-      expect(html).to include("No registered workers opt into")
+      html = get("/fairness/time").last.join
+      expect(html).to include("No registered workers use the")
       expect(html).to include("Active lanes")
       expect(html).to include(">3<")
     end
 
     it "renders lanes, buffer depth and dispatcher status when a worker is fair" do
-      allow(KafkaBatch).to receive(:fairness?).and_return(true)
+      allow(KafkaBatch).to receive(:active_fairness_types).and_return([:time])
       allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
-      ingest_group = KafkaBatch.dispatch_consumer_group
-      fair_group   = KafkaBatch.jobs_fair_consumer_group
-      allow(KafkaBatch::Lag).to receive(:read_group).with(ingest_group, [KafkaBatch.config.fairness_ingest_topic])
-        .and_return(ingest_group => { KafkaBatch.config.fairness_ingest_topic => { 8 => { offset: 0, lag: 40 }, 9 => { offset: 0, lag: 25 } } })
-      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [KafkaBatch.config.fairness_ready_topic])
-        .and_return(fair_group => { KafkaBatch.config.fairness_ready_topic => { 0 => { offset: 0, lag: 12 } } })
+      ingest_group = KafkaBatch.dispatch_consumer_group(:time)
+      fair_group   = KafkaBatch.jobs_fair_consumer_group(:time)
+      ingest_t = KafkaBatch.config.fairness_ingest_topic(:time)
+      ready_t  = KafkaBatch.config.fairness_ready_topic(:time)
+      allow(KafkaBatch::Lag).to receive(:read_group).with(ingest_group, [ingest_t])
+        .and_return(ingest_group => { ingest_t => { 8 => { offset: 0, lag: 40 }, 9 => { offset: 0, lag: 25 } } })
+      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [ready_t])
+        .and_return(fair_group => { ready_t => { 0 => { offset: 0, lag: 12 } } })
 
-      html = get("/fairness").last.join
+      html = get("/fairness/time").last.join
       expect(html).to include("Active lanes")
       expect(html).to include(">2<")    # 2 active lanes
       expect(html).to include(">65<")   # un-dispatched total 40+25
@@ -239,8 +243,10 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("Flowing")
     end
 
-    it "links to /fairness from the dashboard" do
-      expect(get("/").last.join).to include("/kafka_batch/fairness")
+    it "links to the fairness pages from the dashboard nav" do
+      html = get("/").last.join
+      expect(html).to include("/kafka_batch/fairness/time")
+      expect(html).to include("/kafka_batch/fairness/throughput")
     end
   end
 
@@ -317,6 +323,20 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("75.0%")
       expect(html).to include("25.0%")
       expect(html).to include("Capacity share")
+    end
+
+    it "warns that weights only affect ordering when weighted concurrency is off" do
+      sched = instance_double(KafkaBatch::Fairness::Scheduler, default_weight: 1.0, all_tenants: [])
+      allow(KafkaBatch).to receive(:scheduler).and_return(sched)
+
+      KafkaBatch.config.fairness_weighted_concurrency = false
+      html = get("/weights").last.join
+      expect(html).to include("Weights only affect ordering")
+      expect(html).to include("fairness_weighted_concurrency")
+
+      KafkaBatch.config.fairness_weighted_concurrency = true
+      html = get("/weights").last.join
+      expect(html).not_to include("Weights only affect ordering")
     end
   end
 

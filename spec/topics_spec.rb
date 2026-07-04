@@ -39,21 +39,33 @@ RSpec.describe KafkaBatch::Topics do
       expect(tiers.map { |s| s[:partitions] }).to all(eq(KafkaBatch::Topics::DEFAULT_PARTITIONS[:retry]))
     end
 
-    it "adds ingest/ready when a fair worker is present, alongside plain topics" do
+    it "adds the time-lane ingest/ready when a :time fair worker is present" do
       allow(KafkaBatch).to receive(:workers).and_return([FairWorker, SuccessfulWorker])
       names = described_class.specs.map { |s| s[:name] }
 
-      expect(names).to include(KafkaBatch.config.fairness_ingest_topic, KafkaBatch.config.fairness_ready_topic)
+      expect(names).to include(KafkaBatch.config.fairness_ingest_topic(:time), KafkaBatch.config.fairness_ready_topic(:time))
+      # Only the time lane is used, so throughput-lane topics are NOT provisioned.
+      expect(names).not_to include(KafkaBatch.config.fairness_ingest_topic(:throughput))
       expect(names).to include(SuccessfulWorker.kafka_topic)  # plain worker still wired
       expect(names).not_to include(FairWorker.kafka_topic)    # fair worker uses the lane
+    end
+
+    it "adds the throughput-lane topics when a :throughput fair worker is present" do
+      allow(KafkaBatch).to receive(:workers).and_return([ThroughputFairWorker])
+      names = described_class.specs.map { |s| s[:name] }
+
+      expect(names).to include(KafkaBatch.config.fairness_ingest_topic(:throughput), KafkaBatch.config.fairness_ready_topic(:throughput))
+      expect(names).not_to include(KafkaBatch.config.fairness_ingest_topic(:time))
     end
 
     it "omits ingest/ready when no worker opts into fairness" do
       allow(KafkaBatch).to receive(:workers).and_return([SuccessfulWorker])
       names = described_class.specs.map { |s| s[:name] }
 
-      expect(names).not_to include(KafkaBatch.config.fairness_ingest_topic)
-      expect(names).not_to include(KafkaBatch.config.fairness_ready_topic)
+      KafkaBatch::Configuration::FAIRNESS_TYPES.each do |ft|
+        expect(names).not_to include(KafkaBatch.config.fairness_ingest_topic(ft))
+        expect(names).not_to include(KafkaBatch.config.fairness_ready_topic(ft))
+      end
     end
 
     it "forces every topic to the given partition count when provided" do

@@ -72,11 +72,15 @@ RSpec.describe "KafkaBatch::Batch delayed scheduling (perform_in / perform_at)" 
 
   describe "bulk delayed scheduling (one delay for many jobs)" do
     before(:each) do
-      # produce_many_sync records each and returns one delivery report per message.
+      # WaterDrop#produce_many_sync returns an array of Rdkafka DeliveryHANDLES
+      # (not reports) — each responds to #create_result, which yields the report
+      # carrying partition/offset. Mirror that here so delivery_coords is exercised
+      # exactly as in production (a plain report double would hide the handle path).
       allow(KafkaBatch::Producer).to receive(:produce_many_sync) do |messages|
         messages.each_with_index.map do |m, i|
           FakeProducer.record(topic: m[:topic], payload: m[:payload], key: m[:key])
-          double("report", partition: 0, offset: 100 + i)
+          report = double("report", partition: 0, offset: 100 + i)
+          double("handle", create_result: report)
         end
       end
     end
@@ -138,6 +142,19 @@ RSpec.describe "KafkaBatch::Batch delayed scheduling (perform_in / perform_at)" 
     it "Worker.perform_bulk_in delegates to Batch.enqueue_many_in" do
       expect(KafkaBatch::Batch).to receive(:enqueue_many_in).with(60, SuccessfulWorker, [{ "id" => 1 }])
       SuccessfulWorker.perform_bulk_in(60, [{ "id" => 1 }])
+    end
+  end
+
+  describe ".delivery_coords" do
+    it "reads a DeliveryReport directly (produce_sync path)" do
+      report = double("report", partition: 3, offset: 42)
+      expect(KafkaBatch::Batch.delivery_coords(report)).to eq([3, 42])
+    end
+
+    it "resolves a DeliveryHandle via #create_result (produce_many_sync path)" do
+      report = double("report", partition: 1, offset: 7)
+      handle = double("handle", create_result: report)
+      expect(KafkaBatch::Batch.delivery_coords(handle)).to eq([1, 7])
     end
   end
 

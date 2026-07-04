@@ -35,13 +35,11 @@ module KafkaBatch
   class << self
     # ── Fairness scheduler ─────────────────────────────────────────────────
 
-    # Optional Redis-backed WFQ scheduler. Not used by the default fairness
-    # path — standalone engine for custom dispatchers that need strict
-    # weighted fair queuing. Returns nil when redis_url is blank (no Redis).
-    # Alias of KafkaBatch.scheduler (defined in core.rb with double-checked
+    # Redis-backed WFQ scheduler for a fairness lane (:time | :throughput).
+    # Alias of KafkaBatch.scheduler(type) (defined in core.rb with double-checked
     # locking + redis guard). Kept here for backwards-compatibility.
-    def fairness_scheduler
-      scheduler
+    def fairness_scheduler(type = :time)
+      scheduler(type)
     end
 
     # ── Worker registry ────────────────────────────────────────────────────
@@ -59,9 +57,16 @@ module KafkaBatch
       workers_mutex.synchronize { Array(@workers) }
     end
 
-    # True if any registered worker opts into the multi-tenant fair lane.
+    # True if any registered worker opts into a multi-tenant fair lane.
     def fairness?
       workers.any?(&:fairness?)
+    end
+
+    # The fairness lanes actually in use, based on registered workers'
+    # fairness_type. e.g. [:time], [:throughput], or [:time, :throughput].
+    # @return [Array<Symbol>]
+    def active_fairness_types
+      workers.select(&:fairness?).map(&:fairness_type).uniq
     end
 
     # ── Consumer groups ────────────────────────────────────────────────────
@@ -70,7 +75,9 @@ module KafkaBatch
 
     def consumer_groups
       groups   = [control_consumer_group]
-      groups << dispatch_consumer_group << jobs_fair_consumer_group if fairness?
+      active_fairness_types.each do |ft|
+        groups << dispatch_consumer_group(ft) << jobs_fair_consumer_group(ft)
+      end
 
       plain    = workers.reject(&:fairness?)
       fast_set = [config.fast_p0_topic, config.fast_p1_topic]
@@ -93,6 +100,10 @@ module KafkaBatch
       fair_workers = all_workers.select(&:fairness?)
       plain_topics = all_workers.reject(&:fairness?).map(&:kafka_topic).uniq
       any_fair     = fair_workers.any?
+      # Fairness lanes actually in use (a lane's topics/consumers are only wired
+      # when at least one worker opts into it). Captured as a local so it is
+      # visible inside the builder.instance_eval closure below.
+      active_fair_types = active_fairness_types
 
       fast_set = [cfg.fast_p0_topic, cfg.fast_p1_topic]
       slow_set = [cfg.slow_p0_topic, cfg.slow_p1_topic]
@@ -116,13 +127,17 @@ module KafkaBatch
           end
         end
 
-        if any_fair
-          consumer_group "#{cfg.consumer_group}-dispatch" do
+        # Each fairness lane gets its OWN dispatch + jobs-fair consumer groups
+        # (…-dispatch-<lane> / …-jobs-fair-<lane>), so a lane can be isolated in its
+        # own process — dedicated thread pool, dispatcher, and forwarder — via
+        # `karafka server --include-consumer-groups <cg>-jobs-fair-time` etc. The
+        # Dispatcher still derives its lane from the ingest topic name at runtime.
+        active_fair_types.each do |ft|
+          consumer_group "#{cfg.consumer_group}-dispatch-#{ft}" do
             # Karafka OSS concurrency is global (Karafka::App.config.concurrency).
-            # On the dispatch process, set it >= config.fairness_dispatcher_concurrency
+            # On a dispatch process, set it >= config.fairness_dispatcher_concurrency
             # so multiple ingest partitions can forward in parallel.
-
-            topic(cfg.fairness_ingest_topic) do
+            topic(cfg.fairness_ingest_topic(ft)) do
               consumer KafkaBatch::Fairness::Dispatcher
               # Bound how many ingest messages the Dispatcher drains into the
               # Redis WFQ window per consume call. Fairness ordering is done by
@@ -130,8 +145,8 @@ module KafkaBatch
               max_messages cfg.fairness_dispatcher_batch_size
             end
           end
-          consumer_group "#{cfg.consumer_group}-jobs-fair" do
-            topic(cfg.fairness_ready_topic) { consumer KafkaBatch::Consumers::JobConsumer }
+          consumer_group "#{cfg.consumer_group}-jobs-fair-#{ft}" do
+            topic(cfg.fairness_ready_topic(ft)) { consumer KafkaBatch::Consumers::JobConsumer }
           end
         end
 
@@ -216,18 +231,20 @@ module KafkaBatch
 
     def validate_fairness_partitions!(strict: config.validate_topics_on_boot)
       return unless fairness?
-      count = fairness_ingest_partition_count
-      return if count.nil?
-
       min = [config.fairness_min_ingest_partitions.to_i, 2].max
-      return if count >= min
 
-      msg = "[KafkaBatch] a worker opts into fairness but ingest topic " \
-            "'#{config.fairness_ingest_topic}' has #{count} partition(s) " \
-            "(recommended >= #{min}). Recreate the topic with more partitions."
+      # Check each active lane's ingest topic independently.
+      active_fairness_types.each do |type|
+        count = fairness_ingest_partition_count(type)
+        next if count.nil? || count >= min
 
-      raise ConfigurationError, msg if strict
-      logger.warn(msg)
+        msg = "[KafkaBatch] a worker uses the #{type} fairness lane but ingest topic " \
+              "'#{config.fairness_ingest_topic(type)}' has #{count} partition(s) " \
+              "(recommended >= #{min}). Recreate the topic with more partitions."
+
+        raise ConfigurationError, msg if strict
+        logger.warn(msg)
+      end
     end
 
     # ── Reset (full — overrides core.rb's minimal version) ────────────────
@@ -235,7 +252,8 @@ module KafkaBatch
     def reset!
       @configuration   = nil
       @store           = nil
-      @scheduler       = nil   # shared with core.rb via fairness_scheduler alias
+      @schedulers      = nil   # per-lane, shared with core.rb via fairness_scheduler alias
+      @ingest_partition_count_cache = nil
       @schedule_store_instance = nil
       @schedule_store_mutex    = nil
       @workers         = []

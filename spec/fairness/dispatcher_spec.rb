@@ -3,7 +3,7 @@ RSpec.describe KafkaBatch::Fairness::Dispatcher do
   let(:scheduler) { instance_double(KafkaBatch::Fairness::Scheduler) }
 
   before do
-    KafkaBatch.config.fairness_ingest_topic = "test.ingest"
+    KafkaBatch.config.fair_time_ingest_topic = "test.ingest"
     # Isolate from any real forwarder thread / scheduler.
     allow(KafkaBatch::Fairness::Forwarder).to receive(:ensure_running!)
     allow(KafkaBatch).to receive(:scheduler).and_return(scheduler)
@@ -13,7 +13,7 @@ RSpec.describe KafkaBatch::Fairness::Dispatcher do
     payload = { "job_id" => job_id, "worker_class" => "W", "payload" => {} }
     payload["tenant_id"] = tenant if tenant
     payload["batch_id"]  = batch_id if batch_id
-    FakeMessage.new(topic: KafkaBatch.config.fairness_ingest_topic, offset: offset, payload: payload)
+    FakeMessage.new(topic: KafkaBatch.config.fair_time_ingest_topic, offset: offset, payload: payload)
   end
 
   it "starts the forwarder and enqueues each ingest job into the scheduler keyed by tenant" do

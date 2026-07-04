@@ -2,92 +2,97 @@ require "oj"
 
 module KafkaBatch
   module Fairness
-    # Per-process background thread that turns config.fairness_mode into real,
-    # active fairness. It repeatedly pulls the fairest next job from the Redis
-    # WFQ Scheduler (#checkout) and forwards it to the Kafka ready topic, where
-    # the JobConsumer swarm executes it.
-    #
-    # This is the engine half of the default fairness path:
+    # Per-process background thread(s) that turn a fairness lane's Redis WFQ
+    # Scheduler into real dispatch: repeatedly #checkout the fairest next job and
+    # forward it to that lane's Kafka ready topic, where the JobConsumer swarm
+    # executes it.
     #
     #   ingest topic → Dispatcher (Scheduler#enqueue → bounded Redis window)
     #                → Forwarder  (Scheduler#checkout → ready topic)   ← this file
     #                → ready topic → JobConsumer → perform → Scheduler#complete
     #
-    # Fairness modes (Scheduler decides ordering; the Forwarder just drains it):
-    #   :job_count_fairness – #checkout advances a tenant's vtime by 1/weight, so
-    #                         forwards are shared by weighted job count.
-    #   :time_fairness      – #checkout only reserves an in-flight slot; vtime is
-    #                         advanced by duration/weight when the JobConsumer
-    #                         calls #complete after perform. Forwards are shared by
-    #                         weighted wall-clock time.
-    #
-    # Concurrency control (both modes) comes from the Scheduler:
-    #   * fairness_global_concurrency      – total forwarded-but-not-completed jobs
-    #                                        (bounds ready-topic depth; keeps
-    #                                        fairness dynamic).
-    #   * fairness_max_inflight_per_tenant – per-tenant slice of that window
-    #                                        (enforces interleaving in time mode).
-    #
-    # Safe to run in MANY processes at once: #checkout is a single atomic Redis
-    # Lua call, so concurrent forwarders share one WFQ ring and never double-pick
-    # a job. The Dispatcher lazily starts one forwarder per process that is
-    # assigned ingest partitions.
+    # Two lanes (:time, :throughput) run at once — this manages ONE thread per
+    # active lane in the process (started lazily by the lane's Dispatcher). Each
+    # thread is bound to its lane's Scheduler(type) and ready topic. Safe in many
+    # processes at once: #checkout is a single atomic Redis Lua call.
     class Forwarder
       DEFAULT_IDLE_SLEEP = 0.05  # seconds
       DEFAULT_BURST      = 50    # max forwards per loop iteration before yielding
 
       @mutex   = Mutex.new
-      @running = false
-      @thread  = nil
+      @threads = {}   # type => Thread
+      @running = {}   # type => Boolean
 
       class << self
-        attr_reader :thread
+        # The running thread for a lane (nil if none).
+        def thread(type = :time)
+          @threads[type.to_sym]
+        end
 
-        # Start the singleton forwarder thread for this process (idempotent).
-        def ensure_running!
+        # Start the singleton forwarder thread for +type+ in this process (idempotent).
+        def ensure_running!(type = :time)
+          type = type.to_sym
           @mutex.synchronize do
-            return if @running && @thread&.alive?
-            @running = true
-            @thread  = Thread.new { new.run }
-            @thread.name = "kafka-batch-fairness-forwarder" if @thread.respond_to?(:name=)
+            return if @running[type] && @threads[type]&.alive?
+            @running[type] = true
+            t = Thread.new { new(type).run }
+            t.name = "kafka-batch-fairness-forwarder-#{type}" if t.respond_to?(:name=)
+            @threads[type] = t
           end
         end
 
-        # Signal the forwarder loop to stop and (optionally) join it.
-        def stop!(timeout: 5)
-          t = nil
+        # Stop one lane's forwarder, or all when type is nil.
+        def stop!(type = nil, timeout: 5)
+          targets = nil
           @mutex.synchronize do
-            @running = false
-            t = @thread
-            @thread = nil
+            targets = type ? [type.to_sym] : @running.keys.dup
+            targets.each do |ty|
+              @running[ty] = false
+            end
           end
-          t&.join(timeout)
-          nil
+          joined = targets.map do |ty|
+            th = nil
+            @mutex.synchronize { th = @threads.delete(ty) }
+            th&.join(timeout)
+          end
+          @mutex.synchronize { targets.each { |ty| @running.delete(ty) } }
+          joined
         end
 
-        def running?
-          @running && @thread&.alive?
+        def running?(type = nil)
+          if type
+            ty = type.to_sym
+            !!(@running[ty] && @threads[ty]&.alive?)
+          else
+            @running.any? { |ty, on| on && @threads[ty]&.alive? }
+          end
         end
 
-        # Test/reset seam: forget any thread reference without joining.
+        # Test/reset seam: forget all thread references without joining.
         def reset!
           @mutex.synchronize do
-            @running = false
-            @thread  = nil
+            @running = {}
+            @threads = {}
           end
+        end
+
+        def running_types
+          @mutex.synchronize { @threads.keys.select { |ty| @running[ty] && @threads[ty]&.alive? } }
         end
       end
 
+      def initialize(type = :time)
+        @type = type.to_sym
+      end
+
       def running?
-        self.class.running?
+        self.class.running?(@type)
       end
 
       # Main loop: forward a burst of fairly-selected jobs, then sleep briefly if
       # nothing was ready (or the global in-flight window is full).
       def run
-        KafkaBatch.logger.info(
-          "[KafkaBatch][Fairness::Forwarder] started (mode=#{KafkaBatch.config.fairness_mode})"
-        )
+        KafkaBatch.logger.info("[KafkaBatch][Fairness::Forwarder] started (lane=#{@type})")
         idle  = idle_sleep
         burst = DEFAULT_BURST
 
@@ -98,20 +103,20 @@ module KafkaBatch
             sleep(idle) if forwarded.zero?
           rescue StandardError => e
             KafkaBatch.logger.error(
-              "[KafkaBatch][Fairness::Forwarder] loop error: #{e.class}: #{e.message}"
+              "[KafkaBatch][Fairness::Forwarder] lane=#{@type} loop error: #{e.class}: #{e.message}"
             )
             sleep(idle)
           end
         end
 
-        KafkaBatch.logger.info("[KafkaBatch][Fairness::Forwarder] stopped")
+        KafkaBatch.logger.info("[KafkaBatch][Fairness::Forwarder] stopped (lane=#{@type})")
       end
 
-      # Check out one fairly-selected job and forward it to the ready topic.
+      # Check out one fairly-selected job and forward it to this lane's ready topic.
       # @return [Boolean] true if a job was forwarded; false when nothing is
       #   ready or the global in-flight window is full.
       def forward_once
-        sched = KafkaBatch.scheduler
+        sched = KafkaBatch.scheduler(@type)
         return false unless sched
 
         job = sched.checkout
@@ -119,7 +124,7 @@ module KafkaBatch
 
         payload = mark_slot(job[:payload], job[:tenant_id])
         KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.fairness_ready_topic,
+          topic:   KafkaBatch.config.fairness_ready_topic(@type),
           payload: payload,
           key:     job_key(payload)
         )
@@ -133,12 +138,13 @@ module KafkaBatch
         v.positive? ? v : DEFAULT_IDLE_SLEEP
       end
 
-      # Stamp the fair-slot marker + tenant_id into the raw job JSON so the
-      # JobConsumer knows this ready message holds one Scheduler in-flight slot
-      # and must release it (Scheduler#complete) exactly once when done.
+      # Stamp the fair-slot marker, tenant_id, and lane type into the raw job JSON
+      # so the JobConsumer knows this ready message holds one Scheduler in-flight
+      # slot on the CORRECT lane, and releases it (Scheduler(type)#complete) once.
       def mark_slot(raw, tenant_id)
         data = Oj.load(raw)
         data["_fair_slot"] = true
+        data["_fair_type"] = @type.to_s
         data["tenant_id"] ||= tenant_id
         Oj.dump(data, mode: :compat)
       rescue StandardError

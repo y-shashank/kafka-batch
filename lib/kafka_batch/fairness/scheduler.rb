@@ -3,32 +3,29 @@ require "connection_pool"
 
 module KafkaBatch
   module Fairness
-    # OPTIONAL Redis-backed Weighted Fair Queuing (WFQ) scheduler for STRICT
-    # weighted multi-tenant fairness. It is NOT used by the default fairness path
-    # (the Kafka-only Dispatcher needs no Redis) — it's a standalone engine to
-    # build a custom dispatcher/worker around when you need precise weighted
-    # shares. Design:
+    # Redis-backed Weighted Fair Queuing (WFQ) scheduler for one FAIRNESS LANE.
+    # Two lanes run simultaneously, one instance each, selected per-worker via
+    # `fairness_type` (:time | :throughput):
     #
-    #   * the durable backlog stays in Kafka;
+    #   * the durable backlog stays in Kafka (the lane's ingest topic);
     #   * a dispatcher copies jobs into a BOUNDED per-tenant "ready" window here;
-    #   * workers pull the next job via #checkout, which picks fairly across
-    #     tenants and respects a single global concurrency budget.
+    #   * a forwarder pulls the next job via #checkout (fair across tenants,
+    #     global concurrency budget) onto the lane's ready topic.
     #
-    # ── Fairness mode ──────────────────────────────────────────────────────────
+    # ── Lane / fairness type ───────────────────────────────────────────────────
     #
-    # Two modes, selected via config.fairness_mode:
+    # :time (recommended for uneven runtimes)
+    #   Virtual time advances at job *completion* by actual_seconds / weight, so
+    #   each tenant gets roughly equal (weighted) slot-time. Callers MUST pass
+    #   `duration:` to #complete.
     #
-    # :time_fairness (recommended default)
-    #   Virtual time advances at job *completion* by actual_seconds / weight.
-    #   Tenants with slow jobs (20-60s) are charged proportionally for the
-    #   wall-clock time they consume. Over any rolling hour, each tenant gets
-    #   roughly equal slot-time (weighted). Callers MUST pass `duration:` to
-    #   #complete so the actual run time is recorded.
+    # :throughput (original job-count behaviour)
+    #   Virtual time advances by 1/weight at *dispatch*. Fair over job count.
     #
-    # :job_count_fairness (original behaviour)
-    #   Virtual time advances by 1/weight at *dispatch*. Fair over job count,
-    #   not duration. Correct when all tenants' jobs have similar runtimes;
-    #   over-rewards tenants that dispatch fast-finishing jobs otherwise.
+    # Each lane keeps its state under its own Redis namespace
+    # (kafka_batch:fair_time:* / kafka_batch:fair_throughput:*) and its own tenant
+    # weights (Redis hash, or the kafka_batch_tenant_weights table filtered by
+    # fairness_type), so the two lanes never interfere.
     #
     # ── Virtual-time WFQ invariant ────────────────────────────────────────────
     #
@@ -40,44 +37,11 @@ module KafkaBatch
     # ── Process-local weight cache ────────────────────────────────────────────
     #
     # Weights are cached in each dispatcher process for
-    # config.fairness_weight_cache_ttl seconds (default 120s). Weight changes
-    # propagate to all processes within that window. Because weights are
-    # infrequently changed admin config (not per-job data), 120s is intentional:
-    # it eliminates backend reads on every checkout / completion without making
-    # the UI feel unresponsive.
-    #
-    # Redis backend  – cache is populated from the WEIGHT Redis hash (HGETALL).
-    # MySQL backend  – cache is populated from kafka_batch_tenant_weights table.
-    #                  Redis is NOT read or written for weights in this path.
-    #
-    # ── Bounded ring scan (fetch_n) ───────────────────────────────────────────
-    #
-    # CHECKOUT_LUA_* scripts use ZRANGE ring 0 (fetch_n-1) instead of 0 -1 to
-    # avoid transferring the full ring (up to 500 tenants) on every call.
-    # fetch_n = max(budget * 3, 60) covers all realistic scenarios where tenants
-    # at their per-tenant cap need to be skipped.
-    #
-    # ── Job-count fairness + MySQL weight backend ─────────────────────────────
-    #
-    # CHECKOUT_LUA_COUNT_REDIS reads the Redis WEIGHT hash via HGET inside Lua
-    # (one extra Redis read per dispatch). This is not acceptable when weights
-    # live in MySQL and Redis should not be a weight dependency.
-    #
-    # CHECKOUT_LUA_COUNT_MYSQL solves this by accepting all weight overrides as
-    # inline ARGV pairs (tenant_id, weight, …). Ruby serialises the process cache
-    # into the call; Lua builds a local weight table from those pairs. The result
-    # is a single Redis round-trip with zero Redis reads for weights — the process
-    # cache is the only inter-call caching layer for the MySQL backend.
+    # config.fairness_weight_cache_ttl seconds. Redis backend populates it from
+    # the lane's WEIGHT hash; MySQL backend from kafka_batch_tenant_weights
+    # (WHERE fairness_type = this lane).
     #
     class Scheduler
-      NS             = "kafka_batch:fair".freeze
-      RING           = "#{NS}:ring".freeze            # ZSET tenant => vtime (ready tenants only)
-      VTIME          = "#{NS}:vtime".freeze           # HASH tenant => remembered vtime
-      WEIGHT         = "#{NS}:weight".freeze          # HASH tenant => weight override
-      INFLIGHT       = "#{NS}:inflight".freeze        # HASH tenant => in-flight count
-      INFLIGHT_TOTAL = "#{NS}:inflight_total".freeze  # global in-flight counter
-      READY_PREFIX   = "#{NS}:ready:".freeze          # LIST per tenant
-
       # Append to a tenant's bounded ready window. Re-admits an idle tenant into
       # the ring at the current minimum vtime so it starts on an equal footing.
       # Returns 1 if stored, 0 if the window is full (caller should apply
@@ -105,7 +69,7 @@ module KafkaBatch
         return 1
       LUA
 
-      # ── Job-count fairness checkout ────────────────────────────────────────
+      # ── Job-count (throughput) fairness checkout ───────────────────────────
       # Vtime advances by 1/weight at dispatch. Fair over dispatch count.
       # Weight is looked up from the WEIGHT hash inside Lua (one HGET per
       # successful checkout — acceptable since the Lua call is already one
@@ -326,7 +290,7 @@ module KafkaBatch
         return {0, 'none'}
       LUA
 
-      # ── Job-count mode completion ──────────────────────────────────────────
+      # ── Throughput (job-count) mode completion ─────────────────────────────
       # Just release the in-flight slot. Vtime was already advanced at checkout.
       COMPLETE_LUA_COUNT = <<~LUA.freeze
         local tin = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '0')
@@ -374,8 +338,24 @@ module KafkaBatch
         return 1
       LUA
 
-      def initialize(pool: nil)
+      # @param type [Symbol] :time | :throughput — the fairness lane this
+      #   scheduler instance drives. Determines the Redis namespace, the vtime
+      #   accounting mode, and which tenant-weight set is used.
+      def initialize(type: :time, pool: nil)
         cfg               = KafkaBatch.config
+        @type             = type.to_sym
+        @time_mode        = (@type == :time)
+        @fairness_type    = @type.to_s
+
+        # Per-lane Redis namespace + keys.
+        @ns               = "kafka_batch:fair_#{@type}"
+        @ring             = "#{@ns}:ring"            # ZSET tenant => vtime (ready tenants only)
+        @vtime            = "#{@ns}:vtime"           # HASH tenant => remembered vtime
+        @weight           = "#{@ns}:weight"          # HASH tenant => weight override
+        @inflight         = "#{@ns}:inflight"        # HASH tenant => in-flight count
+        @inflight_total   = "#{@ns}:inflight_total"  # global in-flight counter
+        @ready_prefix     = "#{@ns}:ready:"          # LIST per tenant
+
         @pool             = pool || ConnectionPool.new(size: cfg.redis_pool_size, timeout: 5) do
           KafkaBatch::RedisClient.new(cfg) || raise(ConfigurationError, "Redis is not configured")
         end
@@ -386,45 +366,30 @@ module KafkaBatch
         @weighted         = cfg.fairness_weighted_concurrency ? 1 : 0
         @active_count_ttl    = cfg.fairness_active_count_ttl.to_f
         @active_count_source = cfg.fairness_active_count_source.to_sym
-        @fairness_mode    = cfg.fairness_mode.to_sym   # :time_fairness | :job_count_fairness
         @weight_cache_ttl = cfg.fairness_weight_cache_ttl.to_f
 
-        # Weight backend: where custom tenant weights are durably stored.
-        #   :mysql  – kafka_batch_tenant_weights table (v1 migration). Redis is
-        #             NOT required for weight reads or writes; the 60s process
-        #             cache is the only layer in front of MySQL. CHECKOUT_LUA_COUNT
-        #             (job-count mode) falls back to the default weight since the
-        #             Redis WEIGHT hash is not populated in this path.
-        #   :redis  – kafka_batch:fair:weight hash. Weights are read/written
-        #             directly in Redis; no extra table needed.
-        # Mirrors config.store so callers need not configure this separately.
+        # Weight backend mirrors config.store (:mysql uses kafka_batch_tenant_weights
+        # filtered by fairness_type; :redis uses the lane's WEIGHT hash).
         @weight_backend   = cfg.store  # :mysql | :redis
 
-        # How many ring entries to scan per checkout. Must exceed the number of
-        # simultaneously-capped tenants in the worst case. With budget B and
-        # per-tenant cap C, at most floor(B/C) + headroom tenants can be at cap.
-        # budget * 3 is a generous bound that covers all practical scenarios
-        # while reducing ZRANGE data transfer from O(N_tenants) to O(budget*3).
         @fetch_n          = [(@budget * 3), 60].max
 
-        # Process-local weight cache (see cached_weights / weight_for).
         @weights_mutex    = Mutex.new
         @weights_cache    = nil
         @weights_cache_at = 0.0
 
-        # Process-local smoothed active-tenant view (see active_view).
         @active_mutex     = Mutex.new
         @active_view      = nil
         @active_view_at   = 0.0
       end
 
+      # The fairness lane this instance drives (:time | :throughput).
+      attr_reader :type
+
+      # Per-lane Redis key names (exposed for tooling / tests).
+      attr_reader :ns, :ring, :vtime, :weight, :inflight, :inflight_total, :ready_prefix
+
       # Smoothed active-tenant view used as the cap denominator in #checkout.
-      # Returns { count:, sum_weight: }, refreshed at most once per
-      # fairness_active_count_ttl seconds (default 5s) per process so the cap
-      # tracks the real active set instead of the flickering instantaneous ring.
-      # `count` is used as a floor (max with ZCARD(ring)) inside the Lua so it is
-      # responsive to load increases but stable against transient drains.
-      # @return [Hash{count: Integer, sum_weight: Float}]
       def active_view
         now = monotonic
         @active_mutex.synchronize do
@@ -441,8 +406,8 @@ module KafkaBatch
       def enqueue(tenant_id, payload)
         ok = with do |r|
           r.eval(ENQUEUE_LUA,
-            keys: [RING, VTIME],
-            argv: [tenant_id.to_s, payload, @window.to_s, READY_PREFIX])
+            keys: [@ring, @vtime],
+            argv: [tenant_id.to_s, payload, @window.to_s, @ready_prefix])
         end
         ok == 1 ? :ok : :full
       end
@@ -456,14 +421,14 @@ module KafkaBatch
         ahint = view[:count].to_s
         shint = view[:sum_weight].to_s
         res = with do |r|
-          if @fairness_mode == :time_fairness
+          if @time_mode
             r.eval(CHECKOUT_LUA_TIME,
-              keys: [RING, INFLIGHT, INFLIGHT_TOTAL, WEIGHT],
-              argv: [@budget.to_s, @cap.to_s, READY_PREFIX, @fetch_n.to_s, @default_weight.to_s, @weighted.to_s, ahint, shint])
+              keys: [@ring, @inflight, @inflight_total, @weight],
+              argv: [@budget.to_s, @cap.to_s, @ready_prefix, @fetch_n.to_s, @default_weight.to_s, @weighted.to_s, ahint, shint])
           else
             r.eval(CHECKOUT_LUA_COUNT,
-              keys: [RING, VTIME, INFLIGHT, INFLIGHT_TOTAL, WEIGHT],
-              argv: [@budget.to_s, @cap.to_s, READY_PREFIX, @default_weight.to_s, @fetch_n.to_s, @weighted.to_s, ahint, shint])
+              keys: [@ring, @vtime, @inflight, @inflight_total, @weight],
+              argv: [@budget.to_s, @cap.to_s, @ready_prefix, @default_weight.to_s, @fetch_n.to_s, @weighted.to_s, ahint, shint])
           end
         end
         code, a, b = res
@@ -472,89 +437,72 @@ module KafkaBatch
 
       # Release the in-flight slot held by a tenant's finished job.
       #
-      # In :time_fairness mode, pass `duration:` (actual wall-clock seconds the
-      # job ran). The scheduler advances vtime by duration/weight so the tenant
-      # is charged for the time it consumed. Omitting duration treats the job as
-      # zero-duration (tenant gets a free pass for that slot — avoid this).
-      #
-      # In :job_count_fairness mode, duration is ignored — vtime was already
-      # advanced at checkout.
+      # In the :time lane, pass `duration:` (actual wall-clock seconds the job
+      # ran). vtime advances by duration/weight. In the :throughput lane duration
+      # is ignored — vtime was already advanced at checkout.
       #
       # @param tenant_id [String]
-      # @param duration  [Numeric, nil]  seconds the job ran (required in :time_fairness)
+      # @param duration  [Numeric, nil]  seconds the job ran (required in :time)
       def complete(tenant_id, duration: nil)
         t = tenant_id.to_s
-        if @fairness_mode == :time_fairness
+        if @time_mode
           dur = (duration || 0).to_f
           w   = weight_for(t)
           inc = w > 0 ? dur / w : dur
           with do |r|
             r.eval(COMPLETE_LUA_TIME,
-              keys: [INFLIGHT, INFLIGHT_TOTAL, VTIME, RING],
-              argv: [t, inc.to_s, READY_PREFIX])
+              keys: [@inflight, @inflight_total, @vtime, @ring],
+              argv: [t, inc.to_s, @ready_prefix])
           end
         else
           with do |r|
-            r.eval(COMPLETE_LUA_COUNT, keys: [INFLIGHT, INFLIGHT_TOTAL], argv: [t])
+            r.eval(COMPLETE_LUA_COUNT, keys: [@inflight, @inflight_total], argv: [t])
           end
         end
         nil
       end
 
-      # Set a per-tenant weight override. Persists to the configured weight
-      # backend (MySQL table or Redis hash) and immediately busts this process's
-      # cache so weight_for returns the new value on the next call.
-      # Other dispatcher processes pick up the change on their next cache expiry
-      # (within fairness_weight_cache_ttl seconds, default 60s).
+      # Set a per-tenant weight override for THIS lane.
       def set_weight(tenant_id, weight)
         write_weight_to_backend(tenant_id.to_s, weight.to_f)
         bust_weight_cache!
         nil
       end
 
-      # Remove a tenant's custom weight override (reverts to default_weight).
+      # Remove a tenant's custom weight override for THIS lane.
       def delete_weight(tenant_id)
         remove_weight_from_backend(tenant_id.to_s)
         bust_weight_cache!
         nil
       end
 
-      # Register a batch of tenant IDs as "seen" without touching WFQ mechanics
-      # (ring position, inflight counts, vtime advancement). Uses HSETNX so
-      # existing entries (with real accumulated vtime) are never overwritten.
-      # Called by the Dispatcher whenever it forwards ingest → ready so that
-      # tenants appear on the /weights page automatically on their first job.
+      # Register tenant IDs as "seen" without touching WFQ mechanics (HSETNX so
+      # existing accumulated vtime is never overwritten). Called by the Dispatcher
+      # so tenants appear on the weights page on their first job.
       def touch_tenants(tenant_ids)
         return if tenant_ids.empty?
 
         with do |r|
           r.pipelined do |pipe|
-            tenant_ids.each { |t| pipe.hsetnx(VTIME, t.to_s, 0) }
+            tenant_ids.each { |t| pipe.hsetnx(@vtime, t.to_s, 0) }
           end
         end
       end
 
-      # All tenants currently known to the scheduler — union of tenants with
-      # custom weights (from the configured backend), active inflight jobs,
-      # queued ready jobs, and tenants seen via touch_tenants (from the
-      # Kafka-native Dispatcher) — enriched with runtime state from Redis.
-      # Used by the weights dashboard to populate the table dynamically.
+      # All tenants known to THIS lane — union of custom weights, in-flight,
+      # queued, and touched tenants — enriched with runtime state.
       # @return [Array<Hash>]
       def all_tenants
-        # Weights from the configured backend (MySQL table or Redis hash).
         backend_weights = fetch_all_weights_from_backend
 
-        # Runtime counters always live in Redis (ring, inflight, vtime).
         inflight, ring_members, vtimes = with do |r|
           r.pipelined do |pipe|
-            pipe.hgetall(INFLIGHT)
-            pipe.zrange(RING, 0, -1)
-            pipe.hgetall(VTIME)
+            pipe.hgetall(@inflight)
+            pipe.zrange(@ring, 0, -1)
+            pipe.hgetall(@vtime)
           end
         end
 
-        # Include vtimes.keys so tenants registered via touch_tenants (Kafka-
-        # native Dispatcher path) appear even before any Scheduler checkout.
         all_ids = (backend_weights.keys + inflight.keys + ring_members + vtimes.keys).uniq.sort
         all_ids.map do |t|
           custom_w = backend_weights[t]
@@ -571,37 +519,34 @@ module KafkaBatch
 
       # Depth of a single tenant's ready queue.
       def ready_depth(tenant_id)
-        with { |r| r.llen("#{READY_PREFIX}#{tenant_id}") }
+        with { |r| r.llen("#{@ready_prefix}#{tenant_id}") }
       end
 
       # Snapshot for dashboards / metrics.
       def stats
-        active, total = with { |r| r.multi { |m| m.zcard(RING); m.get(INFLIGHT_TOTAL) } }
+        active, total = with { |r| r.multi { |m| m.zcard(@ring); m.get(@inflight_total) } }
         {
+          type:           @type,
           active_tenants: active.to_i,
           inflight_total: total.to_i,
           budget:         @budget,
           window:         @window,
-          fairness_mode:  @fairness_mode,
           weight_backend: @weight_backend
         }
       end
 
       # In-flight count per tenant (for the fairness dashboard).
       def inflight_by_tenant
-        with { |r| r.hgetall(INFLIGHT) }.transform_values(&:to_i).reject { |_, v| v.zero? }
+        with { |r| r.hgetall(@inflight) }.transform_values(&:to_i).reject { |_, v| v.zero? }
       end
-
-      # Configured fairness mode.
-      attr_reader :fairness_mode
 
       # Configured default weight (used when a tenant has no override).
       attr_reader :default_weight
 
-      # Remove all scheduler state (tests / full reset). Does NOT touch Kafka.
+      # Remove all scheduler state for THIS lane (tests / full reset).
       def reset!
         with do |r|
-          keys = r.scan_each(match: "#{NS}*").to_a
+          keys = r.scan_each(match: "#{@ns}*").to_a
           r.del(*keys) unless keys.empty?
         end
         bust_weight_cache!
@@ -610,27 +555,6 @@ module KafkaBatch
       private
 
       # ── Weight cache ─────────────────────────────────────────────────────────
-      #
-      # The process-level cache is always the first layer regardless of backend.
-      # It holds all custom weights as a Hash{ tenant_id => Float } and is
-      # refreshed at most once per @weight_cache_ttl seconds (default 60s).
-      # This eliminates a backend round-trip on every job completion (time
-      # fairness) without sacrificing responsiveness: a weight change written via
-      # the UI propagates to all dispatcher processes within the TTL window.
-      #
-      # The Mutex prevents concurrent refreshes on JRuby / TruffleRuby. On MRI
-      # the GIL already prevents races; the mutex is a no-cost safety net.
-      #
-      # MySQL backend specifics
-      # ───────────────────────
-      # Redis is NOT required for weight reads or writes. The process cache is
-      # the sole optimization layer in front of MySQL. CHECKOUT_LUA_COUNT (job-
-      # count fairness mode) reads the Redis WEIGHT hash inside Lua — when MySQL
-      # is the backend that hash stays empty and Lua falls back to `dw` (the
-      # default weight passed as ARGV). If Redis happens to be configured you can
-      # opt in to populating the WEIGHT hash by calling sync_weights_to_redis
-      # explicitly, but the scheduler does NOT do so automatically so that Redis
-      # remains a pure WFQ-mechanics dependency and not a weight-storage one.
       def cached_weights
         now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         @weights_mutex.synchronize do
@@ -648,9 +572,6 @@ module KafkaBatch
       end
 
       def bust_weight_cache!
-        # Nil the cache — do not rely on (now - cache_at) >= ttl. On fresh
-        # containers monotonic time can be < ttl, so zeroing cache_at alone
-        # would leave stale weights visible after set_weight / bust.
         @weights_mutex.synchronize do
           @weights_cache    = nil
           @weights_cache_at = 0.0
@@ -658,20 +579,14 @@ module KafkaBatch
       end
 
       # ── Active-tenant view ─────────────────────────────────────────────────
-      # Compute the current active-tenant count (and, for weighted mode, the sum
-      # of their weights). Called at most once per fairness_active_count_ttl.
       def compute_active_view
         if @active_count_source == :ingest_lag
-          # Kafka-backlog notion: number of ingest partitions with lag > 0.
-          # Cannot supply per-tenant weights → sum_weight 0 (weighted mode then
-          # falls back to the ring weight sum inside the Lua).
           { count: ingest_active_count, sum_weight: 0.0 }
         else
-          # Default: distinct tenants with in-flight OR queued (ready) work.
           ring_members, inflight = with do |r|
             r.pipelined do |pipe|
-              pipe.zrange(RING, 0, -1)
-              pipe.hgetall(INFLIGHT)
+              pipe.zrange(@ring, 0, -1)
+              pipe.hgetall(@inflight)
             end
           end
           active_ids = ring_members.to_a
@@ -685,13 +600,12 @@ module KafkaBatch
         { count: 0, sum_weight: 0.0 }
       end
 
-      # Count of ingest-topic partitions with lag > 0 (≈ tenants with Kafka-side
-      # backlog). Requires the Karafka Admin API; returns 0 if unavailable.
+      # Count of this lane's ingest-topic partitions with lag > 0.
       def ingest_active_count
         return 0 unless defined?(KafkaBatch::Lag) && KafkaBatch::Lag.available?
 
-        group = KafkaBatch.dispatch_consumer_group
-        topic = KafkaBatch.config.fairness_ingest_topic
+        group = KafkaBatch.dispatch_consumer_group(@type)
+        topic = KafkaBatch.config.fairness_ingest_topic(@type)
         data  = KafkaBatch::Lag.read_group(group, [topic])
         parts = (data[group] || {})[topic] || {}
         parts.values.count { |i| i[:lag].to_i > 0 }
@@ -704,90 +618,75 @@ module KafkaBatch
         Process.clock_gettime(Process::CLOCK_MONOTONIC)
       end
 
-      # ── Weight backend helpers ────────────────────────────────────────────────
+      # ── Weight backend helpers (per fairness_type) ─────────────────────────
 
       def mysql_weight_backend?
         @weight_backend == :mysql
       end
 
-      # Read all custom weight overrides from the configured backend.
-      # MySQL path: SELECT * FROM kafka_batch_tenant_weights (small table).
-      # Redis path: HGETALL kafka_batch:fair:weight.
-      # Returns Hash{ tenant_id_string => Float }.
+      # Read all custom weight overrides for THIS lane.
+      # MySQL: SELECT ... WHERE fairness_type = <lane>. Redis: HGETALL lane hash.
       def fetch_all_weights_from_backend
         if mysql_weight_backend?
-          weight_record_class.all.each_with_object({}) do |r, h|
+          weight_record_class.where(fairness_type: @fairness_type).each_with_object({}) do |r, h|
             h[r.tenant_id.to_s] = r.weight.to_f
           end
         else
-          with { |r| r.hgetall(WEIGHT) }.transform_values(&:to_f)
+          with { |r| r.hgetall(@weight) }.transform_values(&:to_f)
         end
       rescue => e
         KafkaBatch.logger.warn("[KafkaBatch][Scheduler] fetch_all_weights failed: #{e.message}")
         {}
       end
 
-      # Persist a single weight override to the configured backend.
-      # MySQL: raw ON DUPLICATE KEY UPDATE — bypasses AR's index-reflection so the
-      #   anonymous model works correctly in all environments (AR's upsert/unique_by
-      #   can fail to reflect indexes on anonymous models in some AR versions).
-      #   Does NOT touch Redis — the process cache is the only caching layer.
-      # Redis: HSET kafka_batch:fair:weight — also serves CHECKOUT_LUA_COUNT.
+      # Persist a single weight override for THIS lane.
       def write_weight_to_backend(tenant_id, weight)
         if mysql_weight_backend?
           conn = weight_record_class.connection
           qt   = conn.quote(tenant_id.to_s)
+          qty  = conn.quote(@fairness_type)
           qw   = conn.quote(weight.to_f)
           qnow = conn.quote(Time.now.utc.strftime("%Y-%m-%d %H:%M:%S"))
           conn.execute(<<~SQL)
-            INSERT INTO kafka_batch_tenant_weights (tenant_id, weight, updated_at)
-            VALUES (#{qt}, #{qw}, #{qnow})
+            INSERT INTO kafka_batch_tenant_weights (tenant_id, fairness_type, weight, updated_at)
+            VALUES (#{qt}, #{qty}, #{qw}, #{qnow})
             ON DUPLICATE KEY UPDATE weight = VALUES(weight), updated_at = VALUES(updated_at)
           SQL
-          # Mirror to the Redis WEIGHT hash so the WFQ Lua (checkout) can read the
-          # weight directly. Without this, weighting (selection order AND weighted
-          # concurrency) would silently no-op on the MySQL backend. Best-effort.
           mirror_weight_to_redis(tenant_id, weight)
         else
-          with { |r| r.hset(WEIGHT, tenant_id, weight) }
+          with { |r| r.hset(@weight, tenant_id, weight) }
         end
       rescue => e
         KafkaBatch.logger.error("[KafkaBatch][Scheduler] write_weight failed for #{tenant_id}: #{e.message}")
         raise
       end
 
-      # Remove a weight override from the configured backend.
+      # Remove a weight override for THIS lane.
       def remove_weight_from_backend(tenant_id)
         if mysql_weight_backend?
-          weight_record_class.where(tenant_id: tenant_id).delete_all
+          weight_record_class.where(tenant_id: tenant_id, fairness_type: @fairness_type).delete_all
           mirror_weight_delete_to_redis(tenant_id)
         else
-          with { |r| r.hdel(WEIGHT, tenant_id) }
+          with { |r| r.hdel(@weight, tenant_id) }
         end
       rescue => e
         KafkaBatch.logger.error("[KafkaBatch][Scheduler] remove_weight failed for #{tenant_id}: #{e.message}")
         raise
       end
 
-      # Mirror a custom weight into the Redis WEIGHT hash (MySQL backend only, so
-      # the Lua can read it). Failures are logged, not fatal — the durable value
-      # is already in MySQL.
       def mirror_weight_to_redis(tenant_id, weight)
-        with { |r| r.hset(WEIGHT, tenant_id, weight) }
+        with { |r| r.hset(@weight, tenant_id, weight) }
       rescue => e
         KafkaBatch.logger.warn("[KafkaBatch][Scheduler] weight Redis mirror failed for #{tenant_id}: #{e.message}")
       end
 
       def mirror_weight_delete_to_redis(tenant_id)
-        with { |r| r.hdel(WEIGHT, tenant_id) }
+        with { |r| r.hdel(@weight, tenant_id) }
       rescue => e
         KafkaBatch.logger.warn("[KafkaBatch][Scheduler] weight Redis unmirror failed for #{tenant_id}: #{e.message}")
       end
 
       # Anonymous ActiveRecord model for kafka_batch_tenant_weights.
-      # Only instantiated when @weight_backend == :mysql.
-      # inheritance_column = nil suppresses STI activation (same pattern used
-      # throughout the rest of the codebase).
       def weight_record_class
         @weight_record_class ||= Class.new(ActiveRecord::Base) do
           self.table_name         = "kafka_batch_tenant_weights"

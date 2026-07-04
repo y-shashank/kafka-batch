@@ -143,7 +143,7 @@ RSpec.describe KafkaBatch::Batch do
       batch = described_class.create(tenant_id: "acme")
       batch.push(FairWorker, { "x" => 1 })
 
-      ingest = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic)
+      ingest = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic(:time))
       expect(ingest.size).to eq(1)
       expect(ingest.first.key).to eq("acme")
       expect(ingest.first.payload["tenant_id"]).to eq("acme")
@@ -155,7 +155,7 @@ RSpec.describe KafkaBatch::Batch do
       batch.push(SuccessfulWorker, { "x" => 1 })
 
       expect(FakeProducer.for_topic("test.success").size).to eq(1)
-      expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic)).to be_empty
+      expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic(:time))).to be_empty
     end
 
     it "lets fair and plain workers coexist in one batch" do
@@ -163,7 +163,7 @@ RSpec.describe KafkaBatch::Batch do
       batch.push(FairWorker, { "x" => 1 })
       batch.push(SuccessfulWorker, { "y" => 2 })
 
-      expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic).size).to eq(1)
+      expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic(:time)).size).to eq(1)
       expect(FakeProducer.for_topic("test.success").size).to eq(1)
     end
   end
@@ -248,7 +248,7 @@ RSpec.describe KafkaBatch::Batch do
       batch = described_class.create(tenant_id: "batch-tenant")
       batch.push(FairWorker, {})
 
-      msg = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic).first
+      msg = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic(:time)).first
       expect(msg.key).to eq("batch-tenant")
       expect(msg.payload["tenant_id"]).to eq("batch-tenant")
     end
@@ -257,7 +257,7 @@ RSpec.describe KafkaBatch::Batch do
       batch = described_class.create(tenant_id: "acme")
       batch.push_many(FairWorker, [{}, {}])
 
-      msgs = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic)
+      msgs = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic(:time))
       expect(msgs.size).to eq(2)
       expect(msgs.map { |m| m.payload["tenant_id"] }.uniq).to eq(["acme"])
     end

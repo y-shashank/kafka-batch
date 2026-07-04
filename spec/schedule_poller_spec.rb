@@ -132,4 +132,41 @@ RSpec.describe KafkaBatch::SchedulePoller do
       expect(store.acked).to be_empty
     end
   end
+
+  # Adaptive idle backoff keeps many pods from hammering the schedule store while
+  # nothing is due (the main throttle on idle DB/Redis load with a large fleet).
+  describe "#run — adaptive idle backoff" do
+    # Run the loop for exactly n iterations, capturing each sleep duration.
+    def run_iterations(poller, n)
+      sleeps = []
+      allow(poller).to receive(:sleep) { |s| sleeps << s }
+      i = 0
+      allow(poller).to receive(:running?) { (i += 1) <= n }
+      poller.run
+      sleeps
+    end
+
+    before do
+      KafkaBatch.config.schedule_poll_interval     = 1.0
+      KafkaBatch.config.schedule_poll_max_interval = 8.0
+      KafkaBatch.config.schedule_poll_jitter       = 0.0
+    end
+
+    it "doubles the idle sleep each empty poll, capped at schedule_poll_max_interval" do
+      poller = described_class.new(store: FakeScheduleStore.new(due: []), reader: FakeReader.new)
+      expect(run_iterations(poller, 5)).to eq([1.0, 2.0, 4.0, 8.0, 8.0])
+    end
+
+    it "snaps back to the base cadence the moment a poll returns work" do
+      store = instance_double("store", reclaim: 0, ack: nil)
+      # idle, idle, work, idle
+      allow(store).to receive(:claim_due).and_return([], [], ["jw:0:5"], [])
+      reader = FakeReader.new(found: { "0:5" => payload_for(job_id: "jw") })
+      poller = described_class.new(store: store, reader: reader)
+
+      # iter1 idle→sleep 1 (wait→2); iter2 idle→sleep 2 (wait→4);
+      # iter3 work→NO sleep (wait→1); iter4 idle→sleep 1
+      expect(run_iterations(poller, 4)).to eq([1.0, 2.0, 1.0])
+    end
+  end
 end

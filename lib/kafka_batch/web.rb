@@ -102,18 +102,26 @@ module KafkaBatch
           lag_consumption_control(:pause, params)
         elsif method == "POST" && path == "/lag/resume"
           lag_consumption_control(:resume, params)
-        elsif method == "GET" && path == "/fairness"
-          html(render_fairness(params), title: "Fairness")
+        elsif method == "GET" && (path == "/fairness" || path == "/fairness/time")
+          html(render_fairness(params, type: :time), title: "Time Fairness")
+        elsif method == "GET" && path == "/fairness/throughput"
+          html(render_fairness(params, type: :throughput), title: "Throughput Fairness")
         elsif method == "GET" && path == "/scheduled"
           html(render_scheduled(params), title: "Scheduled")
         elsif method == "GET" && path == "/system"
           html(render_system, title: "System")
-        elsif method == "GET" && path == "/weights"
-          html(render_weights(params), title: "Weights")
-        elsif method == "POST" && path == "/weights"
-          weights_set(params.merge(body_params(env)))
-        elsif method == "POST" && path == "/weights/reset"
-          weights_reset(params.merge(body_params(env)))
+        elsif method == "GET" && (path == "/weights" || path == "/weights/time")
+          html(render_weights(params, type: :time), title: "Time Fairness Weights")
+        elsif method == "GET" && path == "/weights/throughput"
+          html(render_weights(params, type: :throughput), title: "Throughput Fairness Weights")
+        elsif method == "POST" && (path == "/weights" || path == "/weights/time")
+          weights_set(params.merge(body_params(env)), type: :time)
+        elsif method == "POST" && path == "/weights/throughput"
+          weights_set(params.merge(body_params(env)), type: :throughput)
+        elsif method == "POST" && (path == "/weights/reset" || path == "/weights/time/reset")
+          weights_reset(params.merge(body_params(env)), type: :time)
+        elsif method == "POST" && path == "/weights/throughput/reset"
+          weights_reset(params.merge(body_params(env)), type: :throughput)
         elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
           batch = KafkaBatch.store.find_batch(m[1])
           batch ? html(render_show(batch, params)) : not_found
@@ -686,37 +694,40 @@ module KafkaBatch
       secs >= 60 ? "~#{secs / 60}m" : "~#{secs}s"
     end
 
-    def render_fairness(params = {})
+    def render_fairness(params = {}, type: :time)
+      lane_label = type == :throughput ? "Throughput Fairness" : "Time Fairness"
       tenant_q = non_empty(params["tenant_id"])
       back = "<p><a class=\"back\" href=\"#{index_path}\">← All batches</a></p>"
 
       inactive_notice =
-        unless KafkaBatch.fairness?
-          "<div class='card'><p class='muted'>No registered workers opt into multi-tenant fairness yet (set <code>fairness true</code> on a Worker class). Lag below reflects the configured ingest/ready topics.</p></div>"
+        unless KafkaBatch.active_fairness_types.include?(type)
+          "<div class='card'><p class='muted'>No registered workers use the <code>#{type}</code> fairness lane yet (set <code>fairness true</code> and <code>fairness_type :#{type}</code> on a Worker class). Lag below reflects the lane's ingest/ready topics.</p></div>"
         end
       unless KafkaBatch::Lag.available?
-        return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path)}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>"
+        return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path(type), type: type)}<div class='card'><h2>#{lane_label}</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>"
       end
 
       cfg            = KafkaBatch.config
+      ingest_topic   = cfg.fairness_ingest_topic(type)
+      ready_topic    = cfg.fairness_ready_topic(type)
       ingest, ready =
         begin
-          [lag_partitions(KafkaBatch.dispatch_consumer_group, cfg.fairness_ingest_topic),
-           lag_partitions(KafkaBatch.jobs_fair_consumer_group, cfg.fairness_ready_topic)]
+          [lag_partitions(KafkaBatch.dispatch_consumer_group(type), ingest_topic),
+           lag_partitions(KafkaBatch.jobs_fair_consumer_group(type), ready_topic)]
         rescue StandardError => e
           KafkaBatch.logger.warn("[KafkaBatch::Web] fairness lag read failed: #{e.message}")
-          return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path)}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>"
+          return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path(type), type: type)}<div class='card'><h2>#{lane_label}</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>"
         end
 
       # Augment ingest rows with :group and :topic so ingest_partition_lookup_result
       # can match against them (same shape as KafkaBatch::Lag.partitions rows).
       full_ingest_rows = ingest.map do |p|
-        { group:     KafkaBatch.dispatch_consumer_group,
-          topic:     cfg.fairness_ingest_topic,
+        { group:     KafkaBatch.dispatch_consumer_group(type),
+          topic:     ingest_topic,
           partition: p[:partition],
           lag:       p[:lag] }
       end
-      lookup_html = ingest_partition_lookup_widget(tenant_q, lag_rows: full_ingest_rows, action: fairness_path)
+      lookup_html = ingest_partition_lookup_widget(tenant_q, lag_rows: full_ingest_rows, action: fairness_path(type), type: type)
 
       ingest_total = ingest.sum { |p| p[:lag] }
       ready_total  = ready.sum { |p| p[:lag] }
@@ -749,7 +760,8 @@ module KafkaBatch
           <div class="metric"><div class="metric-value">#{status_html}</div><div class="metric-label">Dispatcher</div></div>
         </div>
         <div class="card">
-          <p class="muted">Jobs land on the ingest topic (keyed one-tenant-per-partition), the Dispatcher stages them into the Redis WFQ scheduler, and the Forwarder checks out the fairest jobs onto the ready topic (bounded by the in-flight window <code>fairness_global_concurrency=#{window}</code>), which the JobConsumer swarm drains. Auto-refreshing every 5s.</p>
+          <h2>#{lane_label} <span class="muted" style="font-size:13px">(lane: <code>#{type}</code>)</span></h2>
+          <p class="muted">Jobs land on <code>#{h(ingest_topic)}</code> (keyed one-tenant-per-partition), the Dispatcher stages them into the <code>#{type}</code> Redis WFQ scheduler, and the Forwarder checks out the fairest jobs onto <code>#{h(ready_topic)}</code> (bounded by the in-flight window <code>fairness_global_concurrency=#{window}</code>), which the JobConsumer swarm drains. Auto-refreshing every 5s.</p>
         </div>
         <div class="card">
           <h3>Ingest backlog by lane (un-dispatched, ≈ per tenant)</h3>
@@ -773,14 +785,15 @@ module KafkaBatch
     # GET /weights — shows all known tenants with their current weight and
     # runtime state (in-flight, queued, accumulated vtime). Tenants appear
     # automatically as soon as they enqueue their first job — no manual setup.
-    def render_weights(_params = {})
+    def render_weights(_params = {}, type: :time)
       back = "<p><a class=\"back\" href=\"#{index_path}\">← All batches</a></p>"
       cfg  = KafkaBatch.config
 
-      mode_label = cfg.fairness_mode == :time_fairness ? "Time fairness" : "Job-count fairness"
-      mode_badge_color = cfg.fairness_mode == :time_fairness ? "#10b981" : "#3b82f6"
+      time_mode  = (type != :throughput)
+      mode_label = time_mode ? "Time fairness" : "Throughput fairness"
+      mode_badge_color = time_mode ? "#10b981" : "#3b82f6"
       mode_desc =
-        if cfg.fairness_mode == :time_fairness
+        if time_mode
           "Vtime advances at <strong>completion</strong> by <code>actual_seconds / weight</code>. " \
           "Each tenant receives proportional wall-clock time per hour (recommended for 20–60s jobs)."
         else
@@ -788,13 +801,13 @@ module KafkaBatch
           "Fair over job count, not duration. Correct when all tenants' jobs have similar runtimes."
         end
 
-      sched = KafkaBatch.scheduler
+      sched = KafkaBatch.scheduler(type)
 
       unless sched
         return <<~HTML
           #{back}
           <div class="card">
-            <h2>Tenant Weights</h2>
+            <h2>#{mode_label} — Tenant Weights</h2>
             <p class="muted">The Redis-backed Scheduler is not available in this process. Ensure
             <code>config.redis_url</code> is set and <code>kafka_batch/fairness/scheduler</code>
             is loaded.</p>
@@ -837,7 +850,7 @@ module KafkaBatch
         csrf_qs = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
 
         set_form = <<~FORM.gsub(/\n\s*/, "")
-          <form class="inline-form" method="POST" action="#{weights_path}?#{csrf_qs}">
+          <form class="inline-form" method="POST" action="#{weights_path(type)}?#{csrf_qs}">
             <input type="hidden" name="tenant_id" value="#{h(tid)}">
             <input type="number" name="weight" value="#{w}" step="0.1" min="0.1" class="weight-input">
             <button type="submit" class="btn btn-sm">Set</button>
@@ -847,7 +860,7 @@ module KafkaBatch
         reset_form =
           if custom
             <<~FORM.gsub(/\n\s*/, "")
-              <form class="inline-form" method="POST" action="#{weights_reset_path}?#{csrf_qs}">
+              <form class="inline-form" method="POST" action="#{weights_reset_path(type)}?#{csrf_qs}">
                 <input type="hidden" name="tenant_id" value="#{h(tid)}">
                 <button type="submit" class="btn btn-sm">Reset</button>
               </form>
@@ -883,7 +896,7 @@ module KafkaBatch
 
       csrf_qs = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
       add_form = <<~FORM
-        <form class="weight-add-form" method="POST" action="#{weights_path}?#{csrf_qs}">
+        <form class="weight-add-form" method="POST" action="#{weights_path(type)}?#{csrf_qs}">
           <input type="text" name="tenant_id" placeholder="Tenant ID" required class="weight-add-id">
           <input type="number" name="weight" value="#{default_w}" step="0.1" min="0.1" class="weight-input">
           <button type="submit" class="btn">Set weight</button>
@@ -892,8 +905,29 @@ module KafkaBatch
 
       capacity_card = weight_share_distribution_card(shares, cfg)
 
+      # Loud, actionable warning: without weighted concurrency, weights only bias
+      # selection ORDER — under saturation every tenant gets an equal in-flight cap,
+      # so throughput is ~equal regardless of weight. This is the #1 "my weights do
+      # nothing" gotcha.
+      weighted_warning =
+        unless cfg.fairness_weighted_concurrency
+          <<~HTML.gsub(/\n\s*/, " ")
+            <div class="card" style="border-left:4px solid #f59e0b;background:#fffbeb">
+              <strong>⚠ Weights only affect ordering right now.</strong>
+              <code>config.fairness_weighted_concurrency</code> is <code>false</code>, so under load every
+              active tenant gets an <em>equal</em> in-flight share (<code>ceil(global_concurrency / active)</code>)
+              and throughput is roughly equal no matter the weight. Set
+              <code>config.fairness_weighted_concurrency = true</code> to make weights control the
+              throughput/concurrency split. (Weights still change selection order, most visibly in the
+              throughput lane; they only change <em>totals</em> while tenants are contended, not once a
+              finite backlog fully drains.)
+            </div>
+          HTML
+        end
+
       <<~HTML
         #{back}
+        #{weighted_warning}
         <div class="metrics">
           <div class="metric"><div class="metric-value">#{tenants.size}</div><div class="metric-label">Known tenants</div></div>
           <div class="metric"><div class="metric-value">#{tenants.count { |t| t[:has_custom_weight] }}</div><div class="metric-label">Custom weights</div></div>
@@ -942,13 +976,14 @@ module KafkaBatch
       HTML
     end
 
-    # POST /weights — set a tenant weight, then redirect back to /weights.
-    def weights_set(params)
+    # POST /weights/<type> — set a tenant weight for a lane, then redirect back.
+    def weights_set(params, type: :time)
       tid    = non_empty(params["tenant_id"])
       weight = params["weight"].to_f
+      loc    = weights_path(type)
 
       if tid.nil?
-        return [302, { "location" => weights_path, "cache-control" => "no-store", "content-type" => "text/html" }, []]
+        return [302, { "location" => loc, "cache-control" => "no-store", "content-type" => "text/html" }, []]
       end
 
       if weight <= 0
@@ -956,23 +991,23 @@ module KafkaBatch
       end
 
       begin
-        KafkaBatch.scheduler&.set_weight(tid, weight)
+        KafkaBatch.scheduler(type)&.set_weight(tid, weight)
       rescue => e
-        KafkaBatch.logger.error("[KafkaBatch::Web] weights_set failed: #{e.message}")
+        KafkaBatch.logger.error("[KafkaBatch::Web] weights_set(#{type}) failed: #{e.message}")
       end
 
-      [302, { "location" => weights_path, "cache-control" => "no-store", "content-type" => "text/html" }, []]
+      [302, { "location" => loc, "cache-control" => "no-store", "content-type" => "text/html" }, []]
     end
 
-    # POST /weights/reset — remove a custom weight override (revert to default).
-    def weights_reset(params)
+    # POST /weights/<type>/reset — remove a custom weight override for a lane.
+    def weights_reset(params, type: :time)
       tid = non_empty(params["tenant_id"])
       begin
-        KafkaBatch.scheduler&.delete_weight(tid) if tid
+        KafkaBatch.scheduler(type)&.delete_weight(tid) if tid
       rescue => e
-        KafkaBatch.logger.error("[KafkaBatch::Web] weights_reset failed: #{e.message}")
+        KafkaBatch.logger.error("[KafkaBatch::Web] weights_reset(#{type}) failed: #{e.message}")
       end
-      [302, { "location" => weights_path, "cache-control" => "no-store", "content-type" => "text/html" }, []]
+      [302, { "location" => weights_path(type), "cache-control" => "no-store", "content-type" => "text/html" }, []]
     end
 
     def lag_topic_status(group, topic, paused)
@@ -1048,14 +1083,14 @@ module KafkaBatch
     end
 
     # Small lookup on /lag (or /fairness): given tenant_id, show which ingest partition Kafka assigns.
-    def ingest_partition_lookup_widget(tenant_id, lag_rows: nil, action: nil)
+    def ingest_partition_lookup_widget(tenant_id, lag_rows: nil, action: nil, type: :time)
       action ||= lag_path
-      topic = KafkaBatch.config.fairness_ingest_topic
+      topic = KafkaBatch.config.fairness_ingest_topic(type)
       result =
         if tenant_id.nil?
           ""
         else
-          ingest_partition_lookup_result(tenant_id, topic, lag_rows)
+          ingest_partition_lookup_result(tenant_id, topic, lag_rows, type)
         end
 
       <<~HTML
@@ -1071,8 +1106,8 @@ module KafkaBatch
       HTML
     end
 
-    def ingest_partition_lookup_result(tenant_id, topic, lag_rows)
-      count = KafkaBatch.fairness_ingest_partition_count
+    def ingest_partition_lookup_result(tenant_id, topic, lag_rows, type = :time)
+      count = KafkaBatch.fairness_ingest_partition_count(type)
       unless count
         return "<p class='muted'>Could not read partition count for <code>#{h(topic)}</code>.</p>"
       end
@@ -1095,7 +1130,7 @@ module KafkaBatch
 
       lag_row = lag_rows&.find do |r|
         r[:topic] == topic && r[:partition].to_i == partition &&
-          r[:group] == KafkaBatch.dispatch_consumer_group
+          r[:group] == KafkaBatch.dispatch_consumer_group(type)
       end
 
       lag_note =
@@ -1674,12 +1709,12 @@ module KafkaBatch
       "#{@script_name}/lag"
     end
 
-    def fairness_path
-      "#{@script_name}/fairness"
+    def fairness_path(type = :time)
+      "#{@script_name}/fairness/#{type}"
     end
 
-    def weights_path
-      "#{@script_name}/weights"
+    def weights_path(type = :time)
+      "#{@script_name}/weights/#{type}"
     end
 
     def system_path
@@ -1690,8 +1725,8 @@ module KafkaBatch
       "#{@script_name}/scheduled"
     end
 
-    def weights_reset_path
-      "#{@script_name}/weights/reset"
+    def weights_reset_path(type = :time)
+      "#{@script_name}/weights/#{type}/reset"
     end
 
     def show_path(id)
@@ -1834,8 +1869,10 @@ module KafkaBatch
               #{nav_btn("/live", "▶ Consumer Process")}
               #{nav_btn("/lag", "▦ Kafka Lag")}
               #{nav_btn("/scheduled", "⏰ Scheduled")}
-              #{nav_btn("/fairness", "⚖ Fairness")}
-              #{nav_btn("/weights", "⚖ Weights")}
+              #{nav_btn("/fairness/time", "⏱ Time Fairness")}
+              #{nav_btn("/weights/time", "⚖ Time Weights")}
+              #{nav_btn("/fairness/throughput", "⚡ Throughput Fairness")}
+              #{nav_btn("/weights/throughput", "⚖ Throughput Weights")}
               #{nav_btn("/system", "⚙ System")}
               #{live_toggle_button}
             </nav>

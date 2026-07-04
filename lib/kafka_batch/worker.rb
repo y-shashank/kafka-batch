@@ -78,6 +78,29 @@ module KafkaBatch
         fairness
       end
 
+      # Which fairness LANE this worker's jobs flow through when `fairness true`:
+      #   :time       – weighted wall-clock-time fairness (default). Best for
+      #                 uneven runtimes (e.g. 20-60s jobs).
+      #   :throughput – weighted job-count fairness. Best when runtimes are similar.
+      # Both lanes run simultaneously, so a single batch may contain jobs of both
+      # types. Ignored unless the worker also sets `fairness true`.
+      #
+      #   fairness true
+      #   fairness_type :throughput
+      #
+      # @return [Symbol] :time (default) | :throughput
+      def fairness_type(type = :__unset__)
+        if type == :__unset__
+          @fairness_type || :time
+        else
+          t = type&.to_sym
+          unless KafkaBatch::Configuration::FAIRNESS_TYPES.include?(t)
+            raise ArgumentError, "fairness_type must be :time or :throughput (got #{type.inspect})"
+          end
+          @fairness_type = t
+        end
+      end
+
       # ── Sidekiq-compatible enqueue API ────────────────────────────────────
       # Convenience wrappers so a worker reads like a Sidekiq job:
       #

@@ -63,18 +63,23 @@ class CreateKafkaBatchTables < ActiveRecord::Migration[6.0]
     # ── kafka_batch_tenant_weights ───────────────────────────────────────────
     # Per-tenant WFQ weight overrides for the Fairness::Scheduler.
     # Only used when store: :mysql. When store: :redis, weights live in the
-    # kafka_batch:fair:weight Redis hash instead.
+    # kafka_batch:fair_<type>:weight Redis hash instead.
+    #
+    # Weights are PER FAIRNESS LANE: fairness_type is 'time' or 'throughput', so a
+    # tenant can carry a different weight in each lane. The unique key is
+    # (tenant_id, fairness_type).
     # The Scheduler caches this table in-process for fairness_weight_cache_ttl
     # seconds (default 60s) to avoid a MySQL round-trip per job completion.
     create_table :kafka_batch_tenant_weights do |t|
-      t.string  :tenant_id, limit: 255, null: false
+      t.string  :tenant_id,     limit: 255, null: false
+      t.string  :fairness_type, limit: 16,  null: false, default: "time"  # "time" | "throughput"
       # DECIMAL(10,4): supports weights like 1.0000, 1.5000, 0.2500.
       # Values <= 0 are rejected by the application layer before insertion.
       t.decimal :weight, precision: 10, scale: 4, null: false, default: "1.0"
       t.datetime :updated_at, null: false
     end
 
-    add_index :kafka_batch_tenant_weights, :tenant_id,
-              unique: true, name: "uq_kb_tenant_weights_tenant_id"
+    add_index :kafka_batch_tenant_weights, %i[tenant_id fairness_type],
+              unique: true, name: "uq_kb_tenant_weights_tenant_type"
   end
 end

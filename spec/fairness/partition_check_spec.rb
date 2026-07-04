@@ -1,7 +1,8 @@
 RSpec.describe "KafkaBatch.validate_fairness_partitions!" do
   before do
-    # At least one worker opts into fairness so the check is active.
+    # At least one worker opts into fairness (the :time lane) so the check is active.
     allow(KafkaBatch).to receive(:fairness?).and_return(true)
+    allow(KafkaBatch).to receive(:active_fairness_types).and_return([:time])
     KafkaBatch.config.fairness_min_ingest_partitions = 4
   end
 

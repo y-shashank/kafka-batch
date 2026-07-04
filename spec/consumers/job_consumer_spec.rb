@@ -362,7 +362,7 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
 
     def fair_message(worker:, tenant:, batch_id: nil, attempt: 0, job_id: "j1")
       FakeMessage.new(
-        topic:   KafkaBatch.config.fairness_ready_topic,
+        topic:   KafkaBatch.config.fairness_ready_topic(:time),
         offset:  1,
         payload: {
           "job_id"       => job_id,

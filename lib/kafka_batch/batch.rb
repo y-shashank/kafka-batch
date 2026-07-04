@@ -144,13 +144,7 @@ module KafkaBatch
 
       reserve!(payloads.size)
 
-      tid      = tenant_id || @tenant_id
-      fair     = worker_class.fairness?
-      topic    = fair ? KafkaBatch.config.fairness_ingest_topic : worker_class.kafka_topic
-
-      # Resolve explicit partition once for the whole batch (all messages share
-      # the same tenant_id, so the partition is constant across the batch).
-      explicit_partition = fair ? KafkaBatch.tenant_ingest_partition(tid) : nil
+      tid = tenant_id || @tenant_id
 
       job_ids  = []
       messages = payloads.map do |payload|
@@ -160,17 +154,16 @@ module KafkaBatch
           worker_class: worker_class, payload: payload,
           job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tid
         )
-        if fair
-          if explicit_partition
-            # Explicit map: bypass partitioner — partition number is definitive.
-            { topic: topic, payload: message, partition: explicit_partition }
-          else
-            # Key-hash fallback: murmur2_random ensures widget and producer agree.
-            { topic: topic, payload: message, key: (tid || @id).to_s }
-          end
+        # route_for picks the right lane (per fairness_type) / plain topic and the
+        # partition key, identically to #push and #enqueue.
+        route = self.class.route_for(worker_class, job_id: job_id, tenant_id: tid, batch_id: @id)
+        msg   = { topic: route[:topic], payload: message }
+        if route[:partition]
+          msg[:partition] = route[:partition]
         else
-          { topic: topic, payload: message, key: job_id }
+          msg[:key] = route[:key]
         end
+        msg
       end
 
       begin
@@ -333,12 +326,13 @@ module KafkaBatch
     # @return [Hash] { topic:, key:, partition: }
     def self.route_for(worker_class, job_id:, tenant_id: nil, batch_id: nil)
       if worker_class.fairness?
-        explicit = KafkaBatch.tenant_ingest_partition(tenant_id)
+        type   = worker_class.fairness_type
+        ingest = KafkaBatch.config.fairness_ingest_topic(type)
+        explicit = KafkaBatch.tenant_ingest_partition(tenant_id, type)
         if explicit
-          { topic: KafkaBatch.config.fairness_ingest_topic, key: nil, partition: explicit }
+          { topic: ingest, key: nil, partition: explicit }
         else
-          { topic: KafkaBatch.config.fairness_ingest_topic,
-            key: (tenant_id || batch_id || job_id).to_s, partition: nil }
+          { topic: ingest, key: (tenant_id || batch_id || job_id).to_s, partition: nil }
         end
       else
         { topic: worker_class.kafka_topic, key: job_id, partition: nil }
@@ -408,7 +402,7 @@ module KafkaBatch
 
       unless reports.is_a?(Array) && reports.size == messages.size
         raise KafkaBatch::ProducerError,
-          "scheduled bulk produce returned #{reports.inspect} (expected #{messages.size} delivery reports)"
+          "scheduled bulk produce returned #{reports.inspect} (expected #{messages.size} delivery results)"
       end
 
       entries = messages.each_with_index.map do |m, i|
@@ -424,13 +418,19 @@ module KafkaBatch
       messages.map { |m| m["job_id"] }
     end
 
-    # Extract (partition, offset) from a WaterDrop/rdkafka delivery report.
-    def self.delivery_coords(report)
+    # Extract (partition, offset) from a WaterDrop/rdkafka delivery result.
+    #
+    # produce_sync returns a Rdkafka::Producer::DeliveryReport (responds to
+    # #partition/#offset directly), but produce_many_sync returns an array of
+    # Rdkafka::Producer::DeliveryHandle — each already in its final state, whose
+    # #create_result yields the DeliveryReport. Normalize a handle to its report.
+    def self.delivery_coords(result)
+      report = result.respond_to?(:create_result) ? result.create_result : result
       if report.respond_to?(:partition) && report.respond_to?(:offset)
         [report.partition, report.offset]
       else
         raise KafkaBatch::ProducerError,
-          "scheduled produce did not return delivery coordinates (got #{report.class})"
+          "scheduled produce did not return delivery coordinates (got #{result.class})"
       end
     end
 

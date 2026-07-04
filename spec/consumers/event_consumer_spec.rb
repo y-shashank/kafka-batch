@@ -1,6 +1,19 @@
 RSpec.describe KafkaBatch::Consumers::EventConsumer do
   let(:consumer) { build_consumer(described_class) }
 
+  # EventConsumer#consume fires a detached maybe_reconcile background thread that
+  # can outlive an example and produce a duplicate callback into a later one
+  # (order-dependent flake). Neutralize it for the non-watchdog examples by
+  # resetting the process-global gate and stubbing the reconciler body to a no-op.
+  # The "#maybe_reconcile dead-thread watchdog" describe re-stubs Reconciler.run
+  # and resets this state for its own tests, so it is unaffected.
+  before do
+    described_class.last_reconcile_at  = nil
+    described_class.reconciler_running = false
+    described_class.reconciler_thread  = nil
+    allow(KafkaBatch::Reconciler).to receive(:run)
+  end
+
   # Completion events carry the job message's source coordinates and are
   # deduplicated by job_id.
   def event(id:, status:, src_offset:, src_partition: 0, src_topic: "wt")

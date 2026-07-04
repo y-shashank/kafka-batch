@@ -3,20 +3,41 @@ require "rails/generators"
 module KafkaBatch
   module Generators
     class InstallGenerator < Rails::Generators::Base
+      # Two source roots: initializer template + the gem's migrations, so we can
+      # copy only the migration(s) the chosen stores actually need.
+      def self.source_paths
+        [
+          File.expand_path("templates", __dir__),
+          File.expand_path("../../../../db/migrate", __dir__)
+        ]
+      end
       source_root File.expand_path("templates", __dir__)
       namespace "kafka_batch:install"
 
       desc "Creates a KafkaBatch initializer, copies the topic-creation shell " \
-           "script, and (when --store mysql) copies migrations."
+           "script, and copies the migrations required by the chosen --store / " \
+           "--schedule-store (mysql)."
 
       class_option :store, type: :string, default: "redis",
-                           desc: "State store: redis (default) or mysql (failures/pauses in MySQL)"
+                           desc: "Batch-ledger store: redis (default) or mysql (failures/pauses/weights in MySQL)"
 
-      def validate_store_option
-        unless %w[mysql redis].include?(options[:store])
-          raise ArgumentError, "--store must be 'mysql' or 'redis', got '#{options[:store]}'"
+      class_option :schedule_store, type: :string, default: "redis",
+                                    desc: "Delayed-job (perform_in/at) index store: redis (default) or mysql. " \
+                                          "Independent of --store."
+
+      # Migration filenames per store (kept verbatim so they stay idempotent/skippable).
+      LEDGER_MIGRATION    = "20240101000001_create_kafka_batch_tables.rb".freeze
+      SCHEDULED_MIGRATION = "20240101000002_create_kafka_batch_scheduled_jobs.rb".freeze
+
+      def validate_store_options
+        %i[store schedule_store].each do |opt|
+          val = options[opt]
+          unless %w[mysql redis].include?(val)
+            raise ArgumentError, "--#{opt.to_s.tr('_', '-')} must be 'mysql' or 'redis', got '#{val}'"
+          end
         end
-        @store = options[:store]
+        @store          = options[:store]
+        @schedule_store = options[:schedule_store]
       end
 
       def create_initializer
@@ -30,15 +51,17 @@ module KafkaBatch
       end
 
       def copy_migrations
-        if @store == "mysql"
-          rake "kafka_batch:install_migrations"
-        end
+        # Copy only what each chosen store needs:
+        #   --store mysql          → failures / pauses / tenant-weights tables
+        #   --schedule-store mysql → kafka_batch_scheduled_jobs table
+        copy_file LEDGER_MIGRATION,    "db/migrate/#{LEDGER_MIGRATION}"    if @store == "mysql"
+        copy_file SCHEDULED_MIGRATION, "db/migrate/#{SCHEDULED_MIGRATION}" if @schedule_store == "mysql"
       end
 
       def show_next_steps
         say "\n"
         say "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", :green
-        say "  KafkaBatch installed  (store: #{@store})", :green
+        say "  KafkaBatch installed  (store: #{@store}, schedule_store: #{@schedule_store})", :green
         say "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", :green
 
         say "\n1. Add KafkaBatch routes to your karafka.rb:\n"
@@ -51,8 +74,11 @@ module KafkaBatch
           end
         ROUTES
 
-        if @store == "mysql"
-          say "\n2. Run the migrations:\n"
+        if @store == "mysql" || @schedule_store == "mysql"
+          copied = []
+          copied << "failures / pauses / tenant-weights" if @store == "mysql"
+          copied << "scheduled-jobs index"               if @schedule_store == "mysql"
+          say "\n2. Run the migrations (#{copied.join(' + ')}):\n"
           say "     rails db:migrate\n"
           say "\n3. Create Kafka topics (choose one):\n"
         else
@@ -79,14 +105,12 @@ module KafkaBatch
 
         say "\n5. Review config/initializers/kafka_batch.rb and tune:\n"
         say "   - retry_tiers / max_retries\n"
-        say "   - fairness_mode  (:time_fairness or :job_count_fairness)\n"
+        say "   - per-worker fairness: `fairness true` + `fairness_type :time | :throughput`\n"
+        say "   - schedule_store (:redis / :mysql) + max_schedule_horizon (perform_in/at)\n"
         say "   - max_message_bytes  (1 MiB default; match your broker limit)\n"
         say "   - reconciliation_interval / max_reconcile_per_run\n"
         say "   - liveness_backend  (:redis / :off)\n"
         say "   - redis_url / redis_pool_size / batch_ttl / all_index_max_size  (required)\n"
-        if @store == "mysql"
-          say "   - run rails db:migrate (failures, pauses, tenant weights)\n"
-        end
         say "\n"
       end
     end

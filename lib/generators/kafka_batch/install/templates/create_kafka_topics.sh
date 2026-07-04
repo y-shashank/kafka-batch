@@ -69,13 +69,20 @@ TOPICS=(
   "${PREFIX}kafka_batch.jobs.fast_p1:6"
   "${PREFIX}kafka_batch.jobs.slow_p0:6"
   "${PREFIX}kafka_batch.jobs.slow_p1:6"
+
+  # ── Delayed jobs (perform_in / perform_at) durable payload store ───────────
+  "${PREFIX}kafka_batch.scheduled:6"
 )
 
-# Fairness lane: ingest topic needs many partitions (≈ max concurrent tenants)
+# Fairness lanes (time + throughput). A worker picks one via `fairness_type`;
+# both lanes run at once, each with its own ingest → ready topics. Ingest topics
+# need many partitions (≈ max concurrent tenants).
 if [ "${INCLUDE_FAIRNESS}" = "true" ]; then
   TOPICS+=(
-    "${PREFIX}kafka_batch.ingest:12"
-    "${PREFIX}kafka_batch.ready:6"
+    "${PREFIX}kafka_batch.fair_time_ingest:12"
+    "${PREFIX}kafka_batch.fair_time_ready:6"
+    "${PREFIX}kafka_batch.fair_throughput_ingest:12"
+    "${PREFIX}kafka_batch.fair_throughput_ready:6"
   )
 fi
 

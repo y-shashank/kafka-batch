@@ -186,8 +186,8 @@ module KafkaBatch
         Section.new(
           id: "fairness", title: "Fairness", icon: "⚖", accent: "#7c3aed", wide: true,
           rows: [
-            row("Mode", config.fairness_mode),
-            row("Global concurrency", config.fairness_global_concurrency),
+            row("Lanes", "per-worker fairness_type (:time / :throughput)"),
+            row("Global concurrency (per lane)", config.fairness_global_concurrency),
             row("Max inflight / tenant", config.fairness_max_inflight_per_tenant.zero? ? "dynamic fair share" : config.fairness_max_inflight_per_tenant),
             row("Weighted concurrency", fmt_bool(config.fairness_weighted_concurrency)),
             row("Active count TTL", fmt_duration(config.fairness_active_count_ttl)),

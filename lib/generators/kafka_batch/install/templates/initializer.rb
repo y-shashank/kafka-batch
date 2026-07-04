@@ -16,6 +16,25 @@ KafkaBatch.configure do |config|
   #          then `rails db:migrate` for failures / pause / weight tables.
   config.store = :<%= @store %>
 
+  # ── Delayed-job (perform_in / perform_at) index store ─────────────────────────
+  # Detached from `store` — the main ledger can be Redis while the (potentially
+  # huge) schedule index lives on cheap MySQL disk.
+  # :redis – (default) ZSET-based index, RAM-resident, lowest latency.
+  # :mysql – kafka_batch_scheduled_jobs table; run with
+  #          `rails g kafka_batch:install --schedule-store mysql` then `rails db:migrate`.
+  config.schedule_store = :<%= @schedule_store %>
+
+  # Delayed-job poller. Every consumer pod runs one poller thread by default, which
+  # is fine for the Redis backend (atomic Lua). For the :mysql backend at high pod
+  # counts, DEDICATE a few pods to polling and turn it OFF elsewhere so 150 pods
+  # don't all query MySQL — set KB_SCHEDULE_POLLER=false on non-scheduler pods:
+  # config.schedule_poller_enabled = ENV.fetch("KB_SCHEDULE_POLLER", "true") == "true"
+  #
+  # Idle pods back off automatically (schedule_poll_interval → schedule_poll_max_interval)
+  # so they don't hammer the store when nothing is due; jitter de-syncs them.
+  # config.schedule_poll_interval     = 5.0    # base poll cadence when work is flowing
+  # config.schedule_poll_max_interval = 60.0   # idle backoff ceiling (per pod)
+
   # ── Kafka brokers ─────────────────────────────────────────────────────────────
   config.brokers = ENV.fetch("KAFKA_BROKERS", "localhost:9092").split(",")
 
@@ -40,16 +59,33 @@ KafkaBatch.configure do |config|
   config.max_retries = 3
   # config.retry_tiers = { short: 30, medium: 7 * 60, large: 20 * 60 }  # seconds
 
-  # ── Multi-tenant fairness (opt in per-worker with `fairness true`) ────────────
-  # Redis-backed Weighted-Fair-Queuing. One active tenant uses 100% of the
-  # in-flight window; N active tenants split it evenly (work-conserving).
-  #   :time_fairness      – (default) fair weighted wall-clock time (uneven runtimes)
-  #   :job_count_fairness – fair weighted job count (similar runtimes)
-  config.fairness_mode               = :time_fairness
-  config.fairness_global_concurrency = 50   # in-flight window (bounds ready depth + concurrency)
-  # config.fairness_max_inflight_per_tenant = 0   # optional hard per-tenant ceiling (0 = dynamic share)
+  # ── Multi-tenant fairness (opt in per-worker) ─────────────────────────────────
+  # Redis-backed Weighted-Fair-Queuing. There are TWO lanes; a worker opts into
+  # one and both run simultaneously (a single batch may mix both):
   #
-  # Pin specific tenants to ingest partitions (optional; others use hash routing):
+  #   class MyWorker
+  #     include KafkaBatch::Worker
+  #     fairness true
+  #     fairness_type :time        # weighted wall-clock time (default; uneven runtimes)
+  #     # fairness_type :throughput  # weighted job count (similar runtimes)
+  #   end
+  #
+  # One active tenant uses 100% of the in-flight window; N split it evenly
+  # (work-conserving). The knobs below apply to EACH lane independently.
+  config.fairness_global_concurrency = 50   # in-flight window per lane (ready depth + concurrency)
+  # config.fairness_max_inflight_per_tenant = 0   # optional hard per-tenant ceiling (0 = dynamic share)
+
+  # ⚠ Make per-tenant weights actually control THROUGHPUT (edit them live on
+  # /kafka_batch/weights). The library default is FALSE, which means weights only
+  # bias selection order — under load every active tenant gets an EQUAL in-flight
+  # cap, so throughput stays ~equal no matter the weight (the #1 "my weights do
+  # nothing" gotcha). With this ON, a weight-N tenant gets ~N× the concurrency of a
+  # weight-1 tenant. It's a no-op when all weights are equal, so it's safe to leave on.
+  config.fairness_weighted_concurrency = true
+  # config.fairness_weight_cache_ttl = 60   # secs before a weight change propagates across pods
+
+  # Pin specific tenants to ingest partitions (common to both lanes; others use
+  # hash routing):
   # config.fairness_tenant_partitions = { "acme" => 0, "globex" => 1 }
 
   # ── Producer safety ───────────────────────────────────────────────────────────

@@ -65,12 +65,14 @@ module KafkaBatch
       "#{config.consumer_group}-control"
     end
 
-    def dispatch_consumer_group
-      "#{config.consumer_group}-dispatch"
+    # Fair pipeline groups are PER LANE (:time | :throughput) so each lane can run
+    # and scale in its own process (its own thread pool, dispatcher, forwarder).
+    def dispatch_consumer_group(type)
+      "#{config.consumer_group}-dispatch-#{type}"
     end
 
-    def jobs_fair_consumer_group
-      "#{config.consumer_group}-jobs-fair"
+    def jobs_fair_consumer_group(type)
+      "#{config.consumer_group}-jobs-fair-#{type}"
     end
 
     def jobs_consumer_group
@@ -111,16 +113,21 @@ module KafkaBatch
     # failure", so we rebuild on the next call rather than caching the nil
     # (caching nil would make reset! — or a momentary Redis blip at boot —
     # permanently disable fairness for the process).
-    def scheduler
-      return @scheduler if @scheduler
+    def scheduler(type = :time)
+      type = type.to_sym
+      cached = (@schedulers ||= {})[type]
+      return cached if cached
+
       scheduler_mutex.synchronize do
-        return @scheduler if @scheduler
-        @scheduler =
+        @schedulers ||= {}
+        return @schedulers[type] if @schedulers[type]
+
+        @schedulers[type] =
           if defined?(Fairness::Scheduler)
             begin
-              Fairness::Scheduler.new
+              Fairness::Scheduler.new(type: type)
             rescue => e
-              logger.warn("[KafkaBatch] Fairness::Scheduler init failed: #{e.message}")
+              logger.warn("[KafkaBatch] Fairness::Scheduler(#{type}) init failed: #{e.message}")
               nil
             end
           end
@@ -138,29 +145,38 @@ module KafkaBatch
       false
     end
 
-    # Partition count of the fairness ingest topic, via Karafka::Admin.
+    # Fairness lanes in use. UI-only processes have no worker registry, so the
+    # dashboard assumes both lanes may exist. Overridden by kafka_batch.rb
+    # (full backend) with the real worker-registry-driven list.
+    def active_fairness_types
+      Configuration::FAIRNESS_TYPES.dup
+    end
+
+    # Partition count of a fairness lane's ingest topic, via Karafka::Admin.
     # Works in both UI-only and full-backend processes; returns nil on error.
-    # Cached for 60s per process to avoid a metadata round-trip on every page load.
+    # Cached per-type for 60s per process to avoid a metadata round-trip per page.
     INGEST_PARTITION_COUNT_TTL = 60 # seconds
 
-    def fairness_ingest_partition_count
-      cached = @ingest_partition_count_cache
+    def fairness_ingest_partition_count(type = :time)
+      type   = type.to_sym
+      cache  = (@ingest_partition_count_cache ||= {})
+      cached = cache[type]
       if cached && (Process.clock_gettime(Process::CLOCK_MONOTONIC) - cached[:at]) < INGEST_PARTITION_COUNT_TTL
         return cached[:value]
       end
 
-      value = fetch_ingest_partition_count
-      @ingest_partition_count_cache = { value: value, at: Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+      value = fetch_ingest_partition_count(type)
+      cache[type] = { value: value, at: Process.clock_gettime(Process::CLOCK_MONOTONIC) }
       value
     end
 
     private
 
-    def fetch_ingest_partition_count
+    def fetch_ingest_partition_count(type = :time)
       ensure_karafka_configured!
       return nil unless defined?(Karafka) && defined?(Karafka::Admin)
 
-      topic_name = config.fairness_ingest_topic
+      topic_name = config.fairness_ingest_topic(type)
       info       = Karafka::Admin.cluster_info
 
       # cluster_info.topics may return an Array of Structs/Hashes or a Hash
@@ -182,16 +198,16 @@ module KafkaBatch
         found[:partition_count] || found[:partitions]&.size
       end
     rescue StandardError => e
-      logger.warn("[KafkaBatch] could not read partition count for '#{config.fairness_ingest_topic}': #{e.message}")
+      logger.warn("[KafkaBatch] could not read partition count for '#{config.fairness_ingest_topic(type)}': #{e.message}")
       nil
     end
 
     public
 
-    # Ingest partition for a given tenant_id, or nil if partition count
+    # Ingest partition for a given tenant_id on a lane, or nil if partition count
     # is unavailable.
-    def fairness_ingest_partition_for(tenant_id)
-      count = fairness_ingest_partition_count
+    def fairness_ingest_partition_for(tenant_id, type = :time)
+      count = fairness_ingest_partition_count(type)
       return nil if count.nil? || count.zero?
 
       Partition.for_key(tenant_id.to_s, count)
@@ -207,7 +223,10 @@ module KafkaBatch
     # The configured value is validated against the actual partition count so a
     # mis-configured entry (e.g. partition 11 on an 8-partition topic) never
     # causes a broker error — it silently falls back to murmur2_random instead.
-    def tenant_ingest_partition(tenant_id)
+    #
+    # The fairness_tenant_partitions map is COMMON to both lanes, so it is
+    # validated against the given lane's ingest-topic partition count.
+    def tenant_ingest_partition(tenant_id, type = :time)
       return nil if tenant_id.nil?
 
       map = config.fairness_tenant_partitions
@@ -221,7 +240,7 @@ module KafkaBatch
       # Bounds-check: reject if out of range for the actual topic.
       # On failure to read count we let the configured value through — the broker
       # will error if it's truly invalid and the caller will see a ProducerError.
-      count = fairness_ingest_partition_count
+      count = fairness_ingest_partition_count(type)
       if count && n >= count
         logger.warn(
           "[KafkaBatch] fairness_tenant_partitions[#{tenant_id}]=#{n} is out of range " \
@@ -284,8 +303,9 @@ module KafkaBatch
       @configuration    = nil
       @store            = nil
       @store_mutex      = nil
-      @scheduler        = nil
+      @schedulers       = nil
       @scheduler_mutex  = nil
+      @ingest_partition_count_cache = nil
       @schedule_store_instance = nil
       @schedule_store_mutex    = nil
       @node_id          = nil

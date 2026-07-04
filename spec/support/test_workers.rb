@@ -46,6 +46,18 @@ class FairWorker
   end
 end
 
+# Worker on the THROUGHPUT fairness lane (job-count fairness).
+class ThroughputFairWorker
+  include KafkaBatch::Worker
+  kafka_topic "test.fair_throughput"
+  fairness true
+  fairness_type :throughput
+
+  def perform(payload)
+    KafkaBatchSpec::WorkerRuns.record(:fair_throughput, payload)
+  end
+end
+
 # Always-failing worker that pins every retry to the :large tier.
 class TierPinnedWorker
   include KafkaBatch::Worker

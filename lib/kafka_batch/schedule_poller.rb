@@ -87,17 +87,29 @@ module KafkaBatch
       KafkaBatch.logger.info(
         "[KafkaBatch][SchedulePoller] started (backend=#{KafkaBatch.config.schedule_store})"
       )
-      idle = poll_interval
+      base = poll_interval
+      cap  = [max_poll_interval, base].max
+      wait = base
 
       while running?
         begin
           dispatched = tick
-          sleep(jittered(idle)) if dispatched.zero?
+          if dispatched.zero?
+            # Nothing was due — back off (exponentially, capped) so idle pods stop
+            # hammering the schedule store. With N pods this is the main throttle on
+            # idle DB/Redis load; jitter de-syncs them so they don't poll in lockstep.
+            sleep(jittered(wait))
+            wait = [wait * 2, cap].min
+          else
+            # Work is flowing — poll at full speed to drain the backlog.
+            wait = base
+          end
         rescue StandardError => e
           KafkaBatch.logger.error(
             "[KafkaBatch][SchedulePoller] loop error: #{e.class}: #{e.message}"
           )
-          sleep(jittered(idle))
+          sleep(jittered(wait))
+          wait = [wait * 2, cap].min
         end
       end
 
@@ -261,6 +273,11 @@ module KafkaBatch
     def poll_interval
       v = KafkaBatch.config.schedule_poll_interval.to_f
       v.positive? ? v : DEFAULT_POLL_INTERVAL
+    end
+
+    def max_poll_interval
+      v = KafkaBatch.config.schedule_poll_max_interval.to_f
+      v.positive? ? v : poll_interval
     end
 
     def lease_seconds

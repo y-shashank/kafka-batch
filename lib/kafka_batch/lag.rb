@@ -161,10 +161,12 @@ module KafkaBatch
       groups["#{prefix}-jobs-fast"] = [cfg.fast_p0_topic, cfg.fast_p1_topic].compact
       groups["#{prefix}-jobs-slow"] = [cfg.slow_p0_topic, cfg.slow_p1_topic].compact
 
-      # Fair lane — include when the ingest topic is configured.
-      if cfg.fairness_ingest_topic && !cfg.fairness_ingest_topic.to_s.empty?
-        groups["#{prefix}-dispatch"]  = [cfg.fairness_ingest_topic]
-        groups["#{prefix}-jobs-fair"] = [cfg.fairness_ready_topic].compact
+      # Fair lanes — each lane has its OWN dispatch / jobs-fair groups.
+      KafkaBatch::Configuration::FAIRNESS_TYPES.each do |t|
+        ingest = cfg.fairness_ingest_topic(t)
+        ready  = cfg.fairness_ready_topic(t)
+        groups["#{prefix}-dispatch-#{t}"]  = [ingest] if ingest && !ingest.to_s.empty?
+        groups["#{prefix}-jobs-fair-#{t}"] = [ready]  if ready  && !ready.to_s.empty?
       end
 
       # Plain jobs group — use the default jobs topic.

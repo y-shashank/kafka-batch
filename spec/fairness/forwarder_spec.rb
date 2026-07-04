@@ -2,7 +2,7 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
   let(:scheduler) { instance_double(KafkaBatch::Fairness::Scheduler) }
 
   before do
-    KafkaBatch.config.fairness_ready_topic = "test.ready"
+    KafkaBatch.config.fair_time_ready_topic = "test.ready"
     allow(KafkaBatch).to receive(:scheduler).and_return(scheduler)
   end
 

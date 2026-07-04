@@ -165,7 +165,8 @@ module KafkaBatch
         desc "Print all registered KafkaBatch workers"
         task workers: :environment do
           KafkaBatch.workers.each do |w|
-            puts "  #{w.name} → topic: #{w.kafka_topic}  retries: #{w.max_retries}"
+            lane = w.fairness? ? "  fairness: #{w.fairness_type}" : ""
+            puts "  #{w.name} → topic: #{w.kafka_topic}  retries: #{w.max_retries}#{lane}"
           end
         end
 

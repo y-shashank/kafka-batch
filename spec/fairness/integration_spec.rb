@@ -19,9 +19,10 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
     KafkaBatch.config.store     = :redis
     KafkaBatchSpec::RedisHelper.flush!
 
-    KafkaBatch.config.fairness_ingest_topic            = "test.ingest"
-    KafkaBatch.config.fairness_ready_topic             = "test.ready"
-    KafkaBatch.config.fairness_mode                    = :time_fairness
+    KafkaBatch.config.fair_time_ingest_topic           = "test.time.ingest"
+    KafkaBatch.config.fair_time_ready_topic            = "test.time.ready"
+    KafkaBatch.config.fair_throughput_ingest_topic     = "test.tp.ingest"
+    KafkaBatch.config.fair_throughput_ready_topic      = "test.tp.ready"
     KafkaBatch.config.fairness_global_concurrency      = 4
     KafkaBatch.config.fairness_max_inflight_per_tenant = 0    # rely on the dynamic fair share
     KafkaBatch.config.fairness_ready_window            = 100
@@ -33,16 +34,22 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
     KafkaBatchSpec::WorkerRuns.reset!
   end
 
-  # Lazily-built singleton (captures whatever config the test set first).
+  # The fairness lane under test (:time by default; the throughput example sets
+  # @fair_type = :throughput before driving the pipeline).
+  def fair_type
+    @fair_type || :time
+  end
+
+  # Lazily-built per-lane singleton (captures whatever config the test set first).
   def scheduler
-    KafkaBatch.scheduler
+    KafkaBatch.scheduler(fair_type)
   end
 
   # ── Pipeline drivers ───────────────────────────────────────────────────────
 
   def ingest_message(tenant:, job_id:, offset:)
     FakeMessage.new(
-      topic:   KafkaBatch.config.fairness_ingest_topic,
+      topic:   KafkaBatch.config.fairness_ingest_topic(fair_type),
       offset:  offset,
       payload: {
         "job_id"       => job_id,
@@ -66,7 +73,7 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
   # Forward every currently-checkoutable job (until the budget is full or the
   # ring is empty), returning how many were forwarded to the ready topic.
   def forward_all(limit = 1000)
-    fwd = KafkaBatch::Fairness::Forwarder.new
+    fwd = KafkaBatch::Fairness::Forwarder.new(fair_type)
     n = 0
     n += 1 while n < limit && fwd.forward_once
     n
@@ -75,12 +82,12 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
   # Run a single ready-topic message through the JobConsumer (perform + complete).
   def run_ready(produced)
     jc = build_consumer(KafkaBatch::Consumers::JobConsumer)
-    fm = FakeMessage.new(topic: KafkaBatch.config.fairness_ready_topic, payload: produced.payload, offset: 0)
+    fm = FakeMessage.new(topic: KafkaBatch.config.fairness_ready_topic(fair_type), payload: produced.payload, offset: 0)
     jc.send(:process_message, fm)
   end
 
   def ready_messages
-    FakeProducer.for_topic(KafkaBatch.config.fairness_ready_topic)
+    FakeProducer.for_topic(KafkaBatch.config.fairness_ready_topic(fair_type))
   end
 
   def tenant_of(produced)
@@ -167,8 +174,8 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
     expect(scheduler.stats[:inflight_total]).to eq(0)  # every slot released
   end
 
-  it "gives a higher-weight tenant proportionally more throughput end-to-end (:job_count_fairness)" do
-    KafkaBatch.config.fairness_mode               = :job_count_fairness
+  it "gives a higher-weight tenant proportionally more throughput end-to-end (throughput lane)" do
+    @fair_type = :throughput  # drive the whole pipeline on the throughput lane
     KafkaBatch.config.fairness_global_concurrency = 1   # near-sequential → weight drives selection order
     scheduler.set_weight("A", 1.0)
     scheduler.set_weight("B", 2.0)

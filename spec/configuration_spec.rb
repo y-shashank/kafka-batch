@@ -83,8 +83,10 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.fairness_global_concurrency).to eq(50)
       expect(config.fairness_ready_window).to eq(500)
       expect(config.fairness_default_weight).to eq(1.0)
-      expect(config.fairness_ingest_topic).to eq("kafka_batch.ingest")
-      expect(config.fairness_ready_topic).to eq("kafka_batch.ready")
+      expect(config.fairness_ingest_topic(:time)).to eq("kafka_batch.fair_time_ingest")
+      expect(config.fairness_ready_topic(:time)).to eq("kafka_batch.fair_time_ready")
+      expect(config.fairness_ingest_topic(:throughput)).to eq("kafka_batch.fair_throughput_ingest")
+      expect(config.fairness_ready_topic(:throughput)).to eq("kafka_batch.fair_throughput_ready")
       expect(config.fairness_min_ingest_partitions).to eq(2)
     end
 
@@ -100,8 +102,8 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.dead_letter_topic).to eq("myapp.kafka_batch.dead_letter")
       expect(config.retry_topic).to eq("myapp.kafka_batch.jobs.retry")
       expect(config.consumer_group).to eq("myapp.kafka-batch")
-      expect(config.fairness_ingest_topic).to eq("myapp.kafka_batch.ingest")
-      expect(config.fairness_ready_topic).to eq("myapp.kafka_batch.ready")
+      expect(config.fairness_ingest_topic(:time)).to eq("myapp.kafka_batch.fair_time_ingest")
+      expect(config.fairness_ready_topic(:throughput)).to eq("myapp.kafka_batch.fair_throughput_ready")
       expect(config.fast_p0_topic).to eq("myapp.kafka_batch.jobs.fast_p0")
     end
 
@@ -118,8 +120,10 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.consumer_group).to eq("kafka-batch")
     end
 
-    it "defaults fairness_mode to :time_fairness" do
-      expect(config.fairness_mode).to eq(:time_fairness)
+    it "no longer exposes the removed global fairness_mode reader" do
+      expect(config).not_to respond_to(:fairness_mode)
+      # the setter is a deprecation no-op (does not raise)
+      expect { config.fairness_mode = :time_fairness }.not_to raise_error
     end
 
     it "defaults retry_max_pause_seconds to 30 (caps partition pause to ~1 poll cycle)" do

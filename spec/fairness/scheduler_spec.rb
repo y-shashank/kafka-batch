@@ -1,5 +1,7 @@
 RSpec.describe KafkaBatch::Fairness::Scheduler do
-  let(:scheduler) { described_class.new }
+  # Default to the :throughput lane (vtime advances at dispatch — the old
+  # job-count behaviour). The time-lane block below overrides with type: :time.
+  let(:scheduler) { described_class.new(type: :throughput) }
 
   before(:each) do
     skip "Redis unavailable at #{KafkaBatchSpec::RedisHelper::TEST_URL}" unless KafkaBatchSpec::RedisHelper.available?
@@ -7,7 +9,6 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
     KafkaBatch.config.store     = :redis  # weight backend; keeps set_weight on the Redis path
     KafkaBatchSpec::RedisHelper.flush!
     # Generous defaults; individual tests tighten budget/window as needed.
-    KafkaBatch.config.fairness_mode                    = :job_count_fairness  # vtime advances at dispatch
     KafkaBatch.config.fairness_global_concurrency      = 1000
     KafkaBatch.config.fairness_ready_window            = 0     # unbounded unless a test sets it
     KafkaBatch.config.fairness_max_inflight_per_tenant = 0
@@ -177,8 +178,8 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       KafkaBatch.config.fairness_active_count_source = :ingest_lag
       allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
       allow(KafkaBatch::Lag).to receive(:read_group).and_return(
-        KafkaBatch.dispatch_consumer_group => {
-          KafkaBatch.config.fairness_ingest_topic => {
+        KafkaBatch.dispatch_consumer_group(:throughput) => {
+          KafkaBatch.config.fairness_ingest_topic(:throughput) => {
             0 => { lag: 5 }, 1 => { lag: 0 }, 2 => { lag: 3 }
           }
         }
@@ -263,11 +264,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
   # vtime advances at completion rather than dispatch. This exercises both
   # CHECKOUT_LUA_TIME and COMPLETE_LUA_TIME — the default production paths.
   describe ":time_fairness mode" do
-    let(:scheduler) { described_class.new }
-
-    before do
-      KafkaBatch.config.fairness_mode = :time_fairness
-    end
+    let(:scheduler) { described_class.new(type: :time) }
 
     it "does not advance vtime at checkout — both tenants stay at 0 until complete" do
       scheduler.enqueue("A", "a0")
@@ -345,7 +342,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
 
       # Check vtime via Redis directly
       redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
-      vt = redis.hget(KafkaBatch::Fairness::Scheduler::VTIME, "A").to_f
+      vt = redis.hget(scheduler.vtime, "A").to_f
       expect(vt).to be_within(0.01).of(9.0)
     end
 
@@ -361,9 +358,9 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       expect { scheduler.complete("A", duration: nil) }.not_to raise_error
     end
 
-    it "stats reports fairness_mode as :time_fairness" do
+    it "stats reports the lane type as :time" do
       s = scheduler.stats
-      expect(s[:fairness_mode]).to eq(:time_fairness)
+      expect(s[:type]).to eq(:time)
     end
   end
 
@@ -464,7 +461,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(1.0)
 
       # Write via the scheduler's Redis pool (simulates another process)
-      scheduler.send(:with) { |r| r.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 9.0) }
+      scheduler.send(:with) { |r| r.hset(scheduler.weight, "t1", 9.0) }
 
       # Still within TTL — should see old value from cache
       expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(1.0)
@@ -477,7 +474,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       scheduler.set_weight("t1", 1.0)
       scheduler.send(:weight_for, "t1")  # prime cache at t=0
 
-      scheduler.send(:with) { |r| r.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 7.0) }
+      scheduler.send(:with) { |r| r.hset(scheduler.weight, "t1", 7.0) }
 
       t = 61.0  # advance past TTL
       expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(7.0)
@@ -487,7 +484,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       scheduler.set_weight("t1", 1.0)
       scheduler.send(:weight_for, "t1")  # prime cache
 
-      scheduler.send(:with) { |r| r.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 5.0) }
+      scheduler.send(:with) { |r| r.hset(scheduler.weight, "t1", 5.0) }
 
       # Still cached without bust
       expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(1.0)
@@ -505,7 +502,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       scheduler.set_weight("t1", 1.0)
       scheduler.send(:weight_for, "t1")
 
-      scheduler.send(:with) { |r| r.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 8.0) }
+      scheduler.send(:with) { |r| r.hset(scheduler.weight, "t1", 8.0) }
       scheduler.send(:bust_weight_cache!)
 
       expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(8.0)

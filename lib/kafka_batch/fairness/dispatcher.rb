@@ -33,11 +33,15 @@ module KafkaBatch
       BACKPRESSURE_PAUSE_MS = 250
 
       def consume
-        # Ensure this process runs exactly one forwarder thread. Lazy-started here
-        # so only processes actually assigned ingest partitions forward.
-        KafkaBatch::Fairness::Forwarder.ensure_running!
+        # Which lane is this? Both ingest topics route to this consumer class; the
+        # topic name tells us whether we're the :time or :throughput dispatcher.
+        type = fairness_type
 
-        sched = KafkaBatch.scheduler
+        # Ensure this process runs exactly one forwarder thread for THIS lane.
+        # Lazy-started here so only processes assigned ingest partitions forward.
+        KafkaBatch::Fairness::Forwarder.ensure_running!(type)
+
+        sched = KafkaBatch.scheduler(type)
         unless sched
           # Redis is a hard dependency; if the scheduler is genuinely unavailable
           # we cannot enqueue. Leave offsets uncommitted so Karafka redelivers
@@ -72,6 +76,16 @@ module KafkaBatch
       end
 
       private
+
+      # Which fairness lane this consumer instance is draining, derived from the
+      # ingest topic of the messages it received (works both under real Karafka and
+      # in unit tests where the consumer's own #topic isn't set). Defaults to :time.
+      def fairness_type
+        tname = messages.first&.topic
+        tname == KafkaBatch.config.fair_throughput_ingest_topic ? :throughput : :time
+      rescue StandardError
+        :time
+      end
 
       # The fairness unit. Prefer tenant_id; fall back to batch_id then job_id so
       # jobs without an explicit tenant still flow (grouped per batch/job) — but

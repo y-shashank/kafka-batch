@@ -24,8 +24,8 @@ module KafkaBatch
       retry:       3,   # per tier
       scheduled:   6,   # durable payload store for perform_in/perform_at
       dead_letter: 1,
-      ingest:      12,  # fairness: ≈ max concurrent tenants
-      ready:       6    # fairness: swarm parallelism
+      ingest:      12,  # fairness ingest (per lane): ≈ max concurrent tenants
+      ready:       6    # fairness ready (per lane): swarm parallelism
     }.freeze
 
     # The full set of topics implied by the current config.
@@ -55,10 +55,12 @@ module KafkaBatch
       fair_workers  = workers.select { |w| w.respond_to?(:fairness?) && w.fairness? }
       plain_workers = workers - fair_workers
 
-      # Fair workers share the ingest -> dispatcher -> ready lane.
-      if fair_workers.any?
-        add.call(cfg.fairness_ingest_topic, :ingest)
-        add.call(cfg.fairness_ready_topic, :ready)
+      # Fair workers share, per lane, an ingest -> dispatcher -> ready path.
+      # Provision the ingest/ready pair for each fairness lane actually in use.
+      lane_types = fair_workers.map { |w| w.respond_to?(:fairness_type) ? w.fairness_type : :time }.uniq
+      lane_types.each do |ft|
+        add.call(cfg.fairness_ingest_topic(ft), :ingest)
+        add.call(cfg.fairness_ready_topic(ft), :ready)
       end
 
       # Plain workers are produced to their own topic (see Batch#produce_job).

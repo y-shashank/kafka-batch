@@ -65,6 +65,7 @@ module KafkaBatch
         # marker stripped (see schedule_retry), so they never double-release.
         fair_slot     = data["_fair_slot"] ? true : false
         fair_tenant   = data["tenant_id"]
+        fair_type     = (data["_fair_type"] || "time").to_sym  # which lane's slot to release
         fair_started  = nil  # set right before perform so duration reflects run time
 
         # Everything below runs inside begin/ensure so the fair-lane in-flight
@@ -200,7 +201,7 @@ module KafkaBatch
           # checkout and duration is ignored.
           if fair_slot
             dur = fair_started ? (Time.now - fair_started) : 0.0
-            release_fair_slot(fair_tenant, dur)
+            release_fair_slot(fair_tenant, dur, fair_type)
           end
         end
       end
@@ -209,14 +210,14 @@ module KafkaBatch
       # Best-effort: a Redis hiccup here must never break job processing (the
       # slot self-heals — a stuck slot is only a soft concurrency undercount and
       # can be reset via Scheduler#reset!).
-      def release_fair_slot(tenant_id, duration)
+      def release_fair_slot(tenant_id, duration, type = :time)
         return unless tenant_id && !tenant_id.to_s.empty?
-        sched = KafkaBatch.scheduler
+        sched = KafkaBatch.scheduler(type)
         return unless sched
         sched.complete(tenant_id, duration: duration)
       rescue StandardError => e
         KafkaBatch.logger.warn(
-          "[KafkaBatch][JobConsumer] fair slot release failed for tenant=#{tenant_id}: #{e.message}"
+          "[KafkaBatch][JobConsumer] fair slot release failed for tenant=#{tenant_id} lane=#{type}: #{e.message}"
         )
       end
 
