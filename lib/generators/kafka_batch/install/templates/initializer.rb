@@ -30,6 +30,17 @@ KafkaBatch.configure do |config|
   # don't all query MySQL — set KB_SCHEDULE_POLLER=false on non-scheduler pods:
   # config.schedule_poller_enabled = ENV.fetch("KB_SCHEDULE_POLLER", "true") == "true"
   #
+  # If you deploy one Deployment per role (see the README "Preferred deployment"
+  # section), drive the poller from the same comma-separated KB_ROLE so it runs
+  # only on the scheduler/all roles, with KB_SCHEDULE_POLLER as an optional override:
+  # roles = ENV.fetch("KB_ROLE", "all").split(",").map(&:strip)
+  # config.schedule_poller_enabled =
+  #   case ENV["KB_SCHEDULE_POLLER"]
+  #   when "true"  then true
+  #   when "false" then false
+  #   else (roles & %w[all scheduler]).any?
+  #   end
+  #
   # Idle pods back off automatically (schedule_poll_interval → schedule_poll_max_interval)
   # so they don't hammer the store when nothing is due; jitter de-syncs them.
   # config.schedule_poll_interval     = 5.0    # base poll cadence when work is flowing

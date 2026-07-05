@@ -392,6 +392,15 @@ Every option on `KafkaBatch.config`:
 | `consumer_config` | Hash | `{}` | Raw rdkafka consumer overrides (merged into every consumer) |
 | `validate_topics_on_boot` | Boolean | `false` | Raise at boot if required topics are missing |
 | `extra_job_topics` | Array&lt;String&gt; | `[]` | Custom plain-worker topics a **UI-only** dashboard should list on the `/lag` page. Used verbatim (not prefix-aware). Only affects the config-based `/lag` fallback — worker processes that call `draw_routes` resolve custom topics from the routes automatically |
+| `schedule_store` | Symbol | `:redis` | Delayed-job (`perform_in`/`perform_at`) pointer index: `:redis` (ZSET, RAM-resident, lowest latency) or `:mysql` (`kafka_batch_scheduled_jobs` table — run its migration). Independent of `store` |
+| `schedule_poller_enabled` | Boolean | `true` | Whether **this process** runs the delayed-job poller thread. Every consumer pod polls by default; set `false` on non-scheduler pods and dedicate a small set (see [Preferred deployment](#preferred-deployment-one-deployment-per-role-same-image)). Commonly wired to an env, e.g. `ENV.fetch("KB_SCHEDULE_POLLER","true") == "true"` or a `KB_ROLE` check |
+| `schedule_poll_interval` | Float (s) | `5.0` | Base poll cadence when delayed jobs are flowing |
+| `schedule_poll_max_interval` | Float (s) | `60.0` | Idle-backoff ceiling — an idle poller backs off from `schedule_poll_interval` up to this, snapping back the instant work appears |
+| `schedule_poll_jitter` | Float | `0.1` | ± randomization on the poll sleep so pods don't poll in lockstep |
+| `schedule_batch_size` | Integer | `100` | Max due jobs a poller claims per tick |
+| `schedule_lease_seconds` | Integer (s) | `60` | Lease TTL on a claimed delayed job; a crashed poller's claims are reclaimed after this (at-least-once) |
+| `schedule_reclaim_interval` | Integer (s) | `30` | How often a poller sweeps for expired delayed-job leases to reclaim |
+| `max_schedule_horizon` | Integer (s) | `604800` (7d) | Clamp for `perform_at`/`perform_in` — a run-at beyond `now + this` is clamped. Keep `≤` the `scheduled_topic` retention so a pointer can't reference a log-cleaned offset |
 
 **Per-Worker overrides** (on the worker class, not `config`): `kafka_topic` (optional — defaults to `config.jobs_topic`; set to one of the four priority topic names to enroll in a priority group), `max_retries`, `complete_after_retries`, `retry_tier`, `fairness` (opt into the shared multi-tenant fair lane — takes precedence over `kafka_topic`).
 
