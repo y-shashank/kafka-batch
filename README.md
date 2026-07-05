@@ -662,6 +662,88 @@ Replace `kafka-batch` with your `config.consumer_group` value. Use `--exclude-co
 
 > **Tip:** keep `config.concurrency > 1` on processes that include `-control` or job groups so partitions are worked in parallel. For production, a common split is: one (or more) `-control` processes, and independently sized per-lane swarms (`-dispatch-<lane>` + `-jobs-fair-<lane>`) plus `-jobs` / priority swarms. With `concurrency = 1`, a long-running job can delay (not starve) event/callback processing on the same process.
 
+#### Preferred deployment: one Deployment per role (same image)
+
+The recommended production topology is **one Deployment per role, all running the same image**, each selecting its consumer group(s) from an env var. `draw_routes` still registers every group (producing/admin need the full picture) — Karafka only *runs* the groups you include, so you subset at the server, not in `karafka.rb`.
+
+A tiny wrapper maps a `KB_ROLE` env (a comma-separated list) to `--include-consumer-groups`, de-duped. Commit it as `bin/kb-server`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+CG="${KAFKA_PREFIX:+${KAFKA_PREFIX}.}kafka-batch"   # e.g. mothership.kafka-batch
+
+groups_for() {
+  case "$1" in
+    control)          echo "$CG-control" ;;
+    scheduler)        echo "$CG-control" ;;   # the poller rides the (light) control group
+    fair-time)        echo "$CG-dispatch-time $CG-jobs-fair-time" ;;
+    fair-throughput)  echo "$CG-dispatch-throughput $CG-jobs-fair-throughput" ;;
+    jobs)             echo "$CG-jobs" ;;
+    fast)             echo "$CG-jobs-fast" ;;
+    slow)             echo "$CG-jobs-slow" ;;
+    *) echo "unknown KB_ROLE component: $1" >&2; exit 1 ;;
+  esac
+}
+
+ROLE="${KB_ROLE:-all}"
+[ "$ROLE" = "all" ] && exec bundle exec karafka server   # run everything (dev / single node)
+
+GROUPS=""
+IFS=',' read -ra PARTS <<< "$ROLE"
+for r in "${PARTS[@]}"; do
+  r="$(echo "$r" | xargs)"; [ -z "$r" ] && continue
+  for g in $(groups_for "$r"); do
+    case ",$GROUPS," in *",$g,"*) : ;; *) GROUPS="${GROUPS:+$GROUPS,}$g" ;; esac  # dedupe
+  done
+done
+
+exec bundle exec karafka server --include-consumer-groups "$GROUPS"
+```
+
+The schedule poller isn't a consumer group — it's a per-process thread gated by `config.schedule_poller_enabled`. Drive it from the same role list (with an optional hard override) in your initializer:
+
+```ruby
+# config/initializers/kafka_batch.rb
+roles = ENV.fetch("KB_ROLE", "all").split(",").map(&:strip)
+config.schedule_poller_enabled =
+  case ENV["KB_SCHEDULE_POLLER"]          # optional explicit override
+  when "true"  then true
+  when "false" then false
+  else (roles & %w[all scheduler]).any?   # default: poller only where scheduler/all is present
+  end
+```
+
+| `KB_ROLE` | Runs | Poller | Autoscale on |
+|---|---|---|---|
+| `control` | events · callbacks · retries | off | events-topic lag |
+| `scheduler` | control group **+ schedule poller** | on | fixed 1–3 pods |
+| `fair-time` | `dispatch-time` + `jobs-fair-time` | off | `fair_time_ready` lag |
+| `fair-throughput` | `dispatch-throughput` + `jobs-fair-throughput` | off | `fair_throughput_ready` lag |
+| `jobs` | plain worker topics | off | `-jobs` lag |
+| `fast` / `slow` | priority topics | off | those topics' lag |
+| `all` | everything (dev / single node) | on | — |
+
+```yaml
+# k8s — same image everywhere; only the envs change per Deployment
+containers:
+- image: my-app:latest
+  command: ["bin/kb-server"]
+  env:
+    - { name: KB_ROLE,        value: "fair-throughput" }
+    - { name: KAFKA_PREFIX,   value: "mothership" }
+    - { name: KB_CONCURRENCY, value: "10" }
+```
+
+**Clubbing roles into one pod.** `KB_ROLE` is a list, so you can co-locate roles: `KB_ROLE=control,scheduler` runs the control group **and** the poller in a single pod (the two `control` group names de-dupe to one `--include-consumer-groups`). Handy when your control-plane volume is small and you'd rather not run a separate scheduler Deployment. Arbitrary combinations work too (e.g. `KB_ROLE=control,jobs`).
+
+> ⚠️ **Don't over-scale `control` / `scheduler`.** These are *control-plane* roles, not throughput roles, and they converge on shared hot state:
+> - **`control`** — every `EventConsumer` increments the **same** per-batch counter hash (`kafka_batch:b:{batch_id}`) and the single `kafka_batch:counts` summary, plus the reconciler lock. For a hot batch, all completion events funnel onto that one key; adding control pods past a handful buys no throughput and just piles concurrent writers onto the hot key.
+> - **`scheduler`** — every poller claims due jobs from the **same** schedule store: a hot Redis key/ZSET (Redis backend) or `SELECT … FOR UPDATE SKIP LOCKED` on `kafka_batch_scheduled_jobs` (MySQL backend). Claims are atomic so nothing double-fires, but more pollers = more contention on that hot key / row / table (and more store query volume), not more work done.
+>
+> Keep `control` to a few pods and `scheduler` to a small fixed 1–3 (that's why they're split from the job roles). Do your **horizontal scaling on the execution roles** — `jobs`, `fair-*`, `fast`/`slow` — where partitions, not a shared key, are the unit of parallelism. If you clubbed `control,scheduler`, remember that scaling that Deployment scales the poller too; at that point split `scheduler` back out (`KB_ROLE=scheduler`) and set `KB_ROLE=control` (poller off) on the wider control Deployment.
+
 #### Running both fairness lanes on one process
 
 If a process includes **both** lanes' groups (the default single-process setup), the lanes stay **independently fair among their own tenants** but **share that process's execution resources**:
