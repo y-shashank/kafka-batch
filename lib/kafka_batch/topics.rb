@@ -15,17 +15,22 @@ module KafkaBatch
     module_function
 
     # Per-topic default partition counts (used when the caller doesn't force a
-    # single count). These are starting points — size them for your throughput.
+    # single count). Sized for a mid-size enterprise swarm (~150 Karafka pods ×
+    # concurrency 10). Rule of thumb: execution topics (jobs, priority, fair
+    # ready) ≈ peak_pods × concurrency; events ≈ execution / 16; fair ingest ≈
+    # max concurrent tenants. Override via create_all!(partitions: N) or the
+    # PARTITIONS env in bin/create_kafka_topics.sh before first deploy — Kafka
+    # cannot shrink partitions later.
     DEFAULT_PARTITIONS = {
-      jobs:        6,
-      priority:    6,   # fast/slow p0+p1 topics (override per topic if needed)
-      events:      3,
-      callbacks:   1,
-      retry:       3,   # per tier
-      scheduled:   6,   # durable payload store for perform_in/perform_at
-      dead_letter: 1,
-      ingest:      12,  # fairness ingest (per lane): ≈ max concurrent tenants
-      ready:       6    # fairness ready (per lane): swarm parallelism
+      jobs:        768,  # plain worker topics: pods × concurrency
+      priority:    768, # fast/slow p0+p1 (override per topic if needed)
+      events:      48,  # completion events; keep control pods small (3–6)
+      callbacks:   6,
+      retry:       12,  # per tier
+      scheduled:   48,  # perform_in/at payload store; poller reads by partition
+      dead_letter: 3,
+      ingest:      64,  # fairness ingest (per lane): ≈ max concurrent tenants
+      ready:       768  # fairness ready (per lane): pods × concurrency
     }.freeze
 
     # The full set of topics implied by the current config.

@@ -94,8 +94,9 @@ module KafkaBatch
         say "   # With a topic prefix (must match KAFKA_PREFIX in your env):"
         say "     KAFKA_BROKERS=kafka:9092 KAFKA_PREFIX=myapp ./bin/create_kafka_topics.sh\n"
         say ""
-        say "   # Force a specific partition count and replication factor:"
-        say "     PARTITIONS=12 REPLICATION_FACTOR=3 ./bin/create_kafka_topics.sh\n"
+        say "   # Override partition count (defaults target ~150 pods × concurrency 10):"
+        say "     PARTITIONS=1500 REPLICATION_FACTOR=3 ./bin/create_kafka_topics.sh\n"
+        say "   # Per-topic defaults live in bin/create_kafka_topics.sh — edit before first deploy.\n"
 
         say "\n4. Mount the web dashboard in config/routes.rb:\n"
         say <<~ROUTES

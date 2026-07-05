@@ -55,7 +55,9 @@ KafkaBatch.configure do |config|
   config.redis_url       = ENV.fetch("REDIS_URL", "redis://localhost:6379/0")
   # Or a Rails-style hash (mutually exclusive with redis_url):
   # config.redis = { host: "localhost", port: 6379, db: 0 }
-  config.redis_pool_size = 5
+  # Size for ~150 consumer pods (each doing concurrent Redis work). Raise if you
+  # see pool checkout timeouts under load.
+  config.redis_pool_size = 10
 
   # ── Topic namespace ─────────────────────────────────────────────────────────
   # All topic names AND the consumer group derive from this prefix, so a single
@@ -88,12 +90,18 @@ KafkaBatch.configure do |config|
   #
   # One active tenant uses 100% of the in-flight window; N split it evenly
   # (work-conserving). The knobs below apply to EACH lane independently.
-  config.fairness_global_concurrency = 50   # in-flight window per lane (ready depth + concurrency)
+  #
+  # Rule of thumb: set this ≥ (fair-lane execution pods × karafka concurrency),
+  # or ≥ (target fair throughput jobs/sec × p99 job duration seconds). The library
+  # default is 50 (dev-sized); 1000 fits ~150 pods at concurrency ~7 with headroom.
+  config.fairness_global_concurrency = 1000  # in-flight window per lane
   # config.fairness_max_inflight_per_tenant = 0   # optional hard per-tenant ceiling (0 = dynamic share)
   # In-flight slots are leases: if a consumer is hard-killed mid-job the slot is
   # reclaimed when this TTL expires, so a lane never stays wedged. MUST exceed your
   # longest job runtime (a longer job's slot is reclaimed early — soft overshoot).
-  # config.fairness_lease_ttl = 1800   # seconds (default 30 min)
+  config.fairness_lease_ttl = 7200   # 2 hours — raise for longer jobs
+  # Boot check: warn/raise if fair ingest has fewer partitions than this.
+  # config.fairness_min_ingest_partitions = 64
 
   # ⚠ Make per-tenant weights actually control THROUGHPUT (edit them live on
   # /kafka_batch/weights). The library default is FALSE, which means weights only
@@ -112,6 +120,13 @@ KafkaBatch.configure do |config|
   # Raise a clear ProducerError instead of an opaque rdkafka error on oversized
   # payloads. 0/nil disables. Matches Kafka's typical 1 MiB broker default.
   config.max_message_bytes = 1_048_576
+
+  # ── Kafka topic sizing ────────────────────────────────────────────────────────
+  # Partition counts are fixed at topic creation. bin/create_kafka_topics.sh (and
+  # rake kafka_batch:create_topics) default to ~150 pods × concurrency 10:
+  #   jobs / priority / fair ready → 768   events → 48   fair ingest → 64
+  # Override before first deploy, e.g. PARTITIONS=1500 ./bin/create_kafka_topics.sh
+  # (forces one count for every topic — prefer per-topic tuning in the shell script).
 
   # ── Topic validation ──────────────────────────────────────────────────────────
   # Verify all topics exist in Kafka at boot (needs a broker connection). Off by

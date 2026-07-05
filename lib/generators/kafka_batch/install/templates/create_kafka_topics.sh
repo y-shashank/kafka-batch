@@ -51,27 +51,29 @@ fi
 
 # ── Topic definitions ────────────────────────────────────────────────────────
 # Format: "topic_name:partitions"  — mirrors KafkaBatch::Topics::DEFAULT_PARTITIONS
+# Sized for ~150 pods × concurrency 10. Tune execution topics to (pods × concurrency)
+# before first deploy; Kafka cannot shrink partitions later.
 
 TOPICS=(
   # ── Core control-plane ────────────────────────────────────────────────────
-  "${PREFIX}kafka_batch.jobs:6"
-  "${PREFIX}kafka_batch.events:3"
-  "${PREFIX}kafka_batch.callbacks:1"
-  "${PREFIX}kafka_batch.dead_letter:1"
+  "${PREFIX}kafka_batch.jobs:768"
+  "${PREFIX}kafka_batch.events:48"
+  "${PREFIX}kafka_batch.callbacks:6"
+  "${PREFIX}kafka_batch.dead_letter:3"
 
   # ── Tiered retry topics ───────────────────────────────────────────────────
-  "${PREFIX}kafka_batch.jobs.retry.short:3"
-  "${PREFIX}kafka_batch.jobs.retry.medium:3"
-  "${PREFIX}kafka_batch.jobs.retry.large:3"
+  "${PREFIX}kafka_batch.jobs.retry.short:12"
+  "${PREFIX}kafka_batch.jobs.retry.medium:12"
+  "${PREFIX}kafka_batch.jobs.retry.large:12"
 
   # ── Priority queue topics (fast/slow × p0/p1) ─────────────────────────────
-  "${PREFIX}kafka_batch.jobs.fast_p0:6"
-  "${PREFIX}kafka_batch.jobs.fast_p1:6"
-  "${PREFIX}kafka_batch.jobs.slow_p0:6"
-  "${PREFIX}kafka_batch.jobs.slow_p1:6"
+  "${PREFIX}kafka_batch.jobs.fast_p0:768"
+  "${PREFIX}kafka_batch.jobs.fast_p1:768"
+  "${PREFIX}kafka_batch.jobs.slow_p0:768"
+  "${PREFIX}kafka_batch.jobs.slow_p1:768"
 
   # ── Delayed jobs (perform_in / perform_at) durable payload store ───────────
-  "${PREFIX}kafka_batch.scheduled:6"
+  "${PREFIX}kafka_batch.scheduled:48"
 )
 
 # Fairness lanes (time + throughput). A worker picks one via `fairness_type`;
@@ -79,10 +81,10 @@ TOPICS=(
 # need many partitions (≈ max concurrent tenants).
 if [ "${INCLUDE_FAIRNESS}" = "true" ]; then
   TOPICS+=(
-    "${PREFIX}kafka_batch.fair_time_ingest:12"
-    "${PREFIX}kafka_batch.fair_time_ready:6"
-    "${PREFIX}kafka_batch.fair_throughput_ingest:12"
-    "${PREFIX}kafka_batch.fair_throughput_ready:6"
+    "${PREFIX}kafka_batch.fair_time_ingest:64"
+    "${PREFIX}kafka_batch.fair_time_ready:768"
+    "${PREFIX}kafka_batch.fair_throughput_ingest:64"
+    "${PREFIX}kafka_batch.fair_throughput_ready:768"
   )
 fi
 
