@@ -56,14 +56,6 @@ module KafkaBatchSpec
         add_index :kafka_batch_scheduled_jobs, :job_id, unique: true
         add_index :kafka_batch_scheduled_jobs, %i[run_at lease_until]
         add_index :kafka_batch_scheduled_jobs, :batch_id
-
-        create_table :kafka_batch_tenant_weights, force: true do |t|
-          t.string   :tenant_id,     null: false
-          t.string   :fairness_type, null: false, default: "time"
-          t.decimal  :weight, precision: 10, scale: 4, null: false, default: "1.0"
-          t.datetime :updated_at, null: false
-        end
-        add_index :kafka_batch_tenant_weights, %i[tenant_id fairness_type], unique: true
       end
     end
 
@@ -73,7 +65,6 @@ module KafkaBatchSpec
       conn.execute("DELETE FROM kafka_batch_failures")
       conn.execute("DELETE FROM kafka_batch_consumption_pauses")
       conn.execute("DELETE FROM kafka_batch_scheduled_jobs")
-      conn.execute("DELETE FROM kafka_batch_tenant_weights")
     end
   end
 end

@@ -81,6 +81,21 @@ class FanoutWorker
   end
 end
 
+class ContextProbeWorker
+  include KafkaBatch::Worker
+  kafka_topic "test.context_probe"
+
+  def perform(_payload)
+    KafkaBatchSpec::WorkerRuns.record(
+      :context_probe,
+      batch_open: !batch.nil?,
+      job_id:     job_id,
+      batch_id:   batch_id,
+      retry_count: retry_count
+    )
+  end
+end
+
 class UniqWorker
   include KafkaBatch::Worker
   kafka_topic "test.uniq"

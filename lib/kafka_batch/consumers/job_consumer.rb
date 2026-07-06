@@ -158,7 +158,7 @@ module KafkaBatch
           # that subsequently fails at event emission is handled separately.
           begin
             worker = worker_class.new
-            worker.kafka_batch_id = batch_id if worker.respond_to?(:kafka_batch_id=)
+            worker.bind_job_context!(data, worker_class: worker_class)
             worker.perform(payload)
           rescue StandardError => e
             handle_failure(

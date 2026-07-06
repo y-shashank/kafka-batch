@@ -13,7 +13,7 @@ KafkaBatch.configure do |config|
   # ── State store ─────────────────────────────────────────────────────────────
   # :redis – (default) all batch ledger state in Redis; no migrations.
   # :mysql – batch ledger still in Redis; run `rails g kafka_batch:install --store mysql`
-  #          then `rails db:migrate` for failures / pause / weight tables.
+  #          then `rails db:migrate` for failures / pause tables.
   config.store = :<%= @store %>
 
   # ── Delayed-job (perform_in / perform_at) index store ─────────────────────────
@@ -98,13 +98,10 @@ KafkaBatch.configure do |config|
   # Boot check: warn/raise if fair ingest has fewer partitions than this.
   # config.fairness_min_ingest_partitions = 64
 
-  # ⚠ Make per-tenant weights actually control THROUGHPUT (edit them live on
-  # /kafka_batch/weights). The library default is FALSE, which means weights only
-  # bias selection order — under load every active tenant gets an EQUAL in-flight
-  # cap, so throughput stays ~equal no matter the weight (the #1 "my weights do
-  # nothing" gotcha). With this ON, a weight-N tenant gets ~N× the concurrency of a
-  # weight-1 tenant. It's a no-op when all weights are equal, so it's safe to leave on.
-  config.fairness_weighted_concurrency = true
+  # Per-tenant weights control throughput share (edit live on /kafka_batch/weights).
+  # Default is true — a weight-N tenant gets ~N× the in-flight concurrency of a
+  # weight-1 tenant under saturation. Set false for equal cap per active tenant.
+  # config.fairness_weighted_concurrency = false
   # config.fairness_weight_cache_ttl = 60   # secs before a weight change propagates across pods
 
   # Pin specific tenants to ingest partitions (common to both lanes; others use

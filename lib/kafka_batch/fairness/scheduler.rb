@@ -5,7 +5,7 @@ require "securerandom"
 module KafkaBatch
   module Fairness
     # Redis-backed Weighted Fair Queuing (WFQ) scheduler for one FAIRNESS LANE.
-    # Two lanes run simultaneously, one instance each, selected per-worker via
+    # Two independent fairness lanes run simultaneously, one instance each, selected per-worker via
     # `fairness_type` (:time | :throughput):
     #
     #   * the durable backlog stays in Kafka (the lane's ingest topic);
@@ -25,8 +25,7 @@ module KafkaBatch
     #
     # Each lane keeps its state under its own Redis namespace
     # (kafka_batch:fair_time:* / kafka_batch:fair_throughput:*) and its own tenant
-    # weights (Redis hash, or the kafka_batch_tenant_weights table filtered by
-    # fairness_type), so the two lanes never interfere.
+    # weights (per-lane Redis WEIGHT hash), so the two lanes never interfere.
     #
     # ── Virtual-time WFQ invariant ────────────────────────────────────────────
     #
@@ -38,9 +37,7 @@ module KafkaBatch
     # ── Process-local weight cache ────────────────────────────────────────────
     #
     # Weights are cached in each dispatcher process for
-    # config.fairness_weight_cache_ttl seconds. Redis backend populates it from
-    # the lane's WEIGHT hash; MySQL backend from kafka_batch_tenant_weights
-    # (WHERE fairness_type = this lane).
+    # config.fairness_weight_cache_ttl seconds, populated from the lane's WEIGHT hash.
     #
     class Scheduler
       # Minimum in-flight lease TTL (seconds). A lease shorter than a job's runtime
@@ -431,10 +428,6 @@ module KafkaBatch
         @active_count_source = cfg.fairness_active_count_source.to_sym
         @weight_cache_ttl = cfg.fairness_weight_cache_ttl.to_f
 
-        # Weight backend mirrors config.store (:mysql uses kafka_batch_tenant_weights
-        # filtered by fairness_type; :redis uses the lane's WEIGHT hash).
-        @weight_backend   = cfg.store  # :mysql | :redis
-
         @fetch_n          = [(@budget * 3), 60].max
 
         @weights_mutex    = Mutex.new
@@ -650,8 +643,7 @@ module KafkaBatch
           active_tenants: active.to_i,
           inflight_total: live.to_i,
           budget:         @budget,
-          window:         @window,
-          weight_backend: @weight_backend
+          window:         @window
         }
       end
 
@@ -748,80 +740,27 @@ module KafkaBatch
         Process.clock_gettime(Process::CLOCK_MONOTONIC)
       end
 
-      # ── Weight backend helpers (per fairness_type) ─────────────────────────
+      # ── Weight helpers (per-lane Redis WEIGHT hash) ────────────────────────
 
-      def mysql_weight_backend?
-        @weight_backend == :mysql
-      end
-
-      # Read all custom weight overrides for THIS lane.
-      # MySQL: SELECT ... WHERE fairness_type = <lane>. Redis: HGETALL lane hash.
       def fetch_all_weights_from_backend
-        if mysql_weight_backend?
-          weight_record_class.where(fairness_type: @fairness_type).each_with_object({}) do |r, h|
-            h[r.tenant_id.to_s] = r.weight.to_f
-          end
-        else
-          with { |r| r.hgetall(@weight) }.transform_values(&:to_f)
-        end
+        with { |r| r.hgetall(@weight) }.transform_values(&:to_f)
       rescue => e
         KafkaBatch.logger.warn("[KafkaBatch][Scheduler] fetch_all_weights failed: #{e.message}")
         {}
       end
 
-      # Persist a single weight override for THIS lane.
       def write_weight_to_backend(tenant_id, weight)
-        if mysql_weight_backend?
-          conn = weight_record_class.connection
-          qt   = conn.quote(tenant_id.to_s)
-          qty  = conn.quote(@fairness_type)
-          qw   = conn.quote(weight.to_f)
-          qnow = conn.quote(Time.now.utc.strftime("%Y-%m-%d %H:%M:%S"))
-          conn.execute(<<~SQL)
-            INSERT INTO kafka_batch_tenant_weights (tenant_id, fairness_type, weight, updated_at)
-            VALUES (#{qt}, #{qty}, #{qw}, #{qnow})
-            ON DUPLICATE KEY UPDATE weight = VALUES(weight), updated_at = VALUES(updated_at)
-          SQL
-          mirror_weight_to_redis(tenant_id, weight)
-        else
-          with { |r| r.hset(@weight, tenant_id, weight) }
-        end
+        with { |r| r.hset(@weight, tenant_id, weight) }
       rescue => e
         KafkaBatch.logger.error("[KafkaBatch][Scheduler] write_weight failed for #{tenant_id}: #{e.message}")
         raise
       end
 
-      # Remove a weight override for THIS lane.
       def remove_weight_from_backend(tenant_id)
-        if mysql_weight_backend?
-          weight_record_class.where(tenant_id: tenant_id, fairness_type: @fairness_type).delete_all
-          mirror_weight_delete_to_redis(tenant_id)
-        else
-          with { |r| r.hdel(@weight, tenant_id) }
-        end
+        with { |r| r.hdel(@weight, tenant_id) }
       rescue => e
         KafkaBatch.logger.error("[KafkaBatch][Scheduler] remove_weight failed for #{tenant_id}: #{e.message}")
         raise
-      end
-
-      def mirror_weight_to_redis(tenant_id, weight)
-        with { |r| r.hset(@weight, tenant_id, weight) }
-      rescue => e
-        KafkaBatch.logger.warn("[KafkaBatch][Scheduler] weight Redis mirror failed for #{tenant_id}: #{e.message}")
-      end
-
-      def mirror_weight_delete_to_redis(tenant_id)
-        with { |r| r.hdel(@weight, tenant_id) }
-      rescue => e
-        KafkaBatch.logger.warn("[KafkaBatch][Scheduler] weight Redis unmirror failed for #{tenant_id}: #{e.message}")
-      end
-
-      # Anonymous ActiveRecord model for kafka_batch_tenant_weights.
-      def weight_record_class
-        @weight_record_class ||= Class.new(ActiveRecord::Base) do
-          self.table_name         = "kafka_batch_tenant_weights"
-          self.inheritance_column = nil
-        end
       end
 
       def with(&block)

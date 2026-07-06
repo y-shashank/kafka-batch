@@ -11,7 +11,6 @@ module KafkaBatch
     # MySQL holds:
     #   - kafka_batch_failures          (dashboard failure log)
     #   - kafka_batch_consumption_pauses (/lag pause state when Redis is down)
-    #   - kafka_batch_tenant_weights    (fairness weight overrides)
     class MysqlStore < Base
       attr_reader :ledger
 

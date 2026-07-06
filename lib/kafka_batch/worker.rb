@@ -11,7 +11,11 @@ module KafkaBatch
   #
   #     def perform(payload)
   #       Order.find(payload["order_id"]).process!
+  #       ChildWorker.perform_async("parent_job_id" => job_id) if batch
   #     end
+  #
+  # While #perform runs, JobConsumer binds job metadata on the worker instance:
+  #   job_id, batch_id, batch, retry_count, uniq_hex (when `uniq true`).
   #   end
   #
   # The worker is registered automatically on include and will be picked up
@@ -174,21 +178,50 @@ module KafkaBatch
       end
     end
 
-    # Set by JobConsumer before #perform so a running job knows its batch.
-    attr_accessor :kafka_batch_id
+    # Job metadata set by JobConsumer (and tests) immediately before #perform.
+    attr_reader :job_id, :batch_id, :retry_count, :uniq_hex
 
-    # The batch this job belongs to, as a pushable Batch handle – or nil for a
-    # standalone job. Lets a running job add more jobs to its own (open) batch
-    # without threading the batch id around:
+    # @deprecated Prefer +batch_id+ — kept for backward compatibility.
+    def kafka_batch_id
+      batch_id
+    end
+
+    def kafka_batch_id=(id)
+      @batch_id = id
+      @kafka_batch = nil
+    end
+
+    # Bind metadata from a decoded Kafka job message. Called by JobConsumer; safe
+    # to call manually in tests.
+    def bind_job_context!(data, worker_class: self.class)
+      @job_id      = data["job_id"]
+      @batch_id    = data["batch_id"]
+      @retry_count = data["attempt"].to_i
+      @kafka_batch = nil
+
+      wc = worker_class.is_a?(Class) ? worker_class : self.class
+      @uniq_hex =
+        if wc.uniq? && KafkaBatch.config.uniq_enabled
+          KafkaBatch::Uniqueness.digest_hex(wc, data["payload"] || {})
+        end
+
+      self
+    end
+
+    # The batch this job belongs to — a pushable Batch handle, or nil for a
+    # standalone job. Uses Batch.open so tenant_id and callbacks are restored
+    # from the store (no Batch.open call needed in application code):
     #
     #   def perform(payload)
-    #     batch&.push(ChildWorker, "parent_id" => payload["id"])
+    #     batch.push(ChildWorker, "parent_id" => payload["id"])
     #   end
     #
     # @return [KafkaBatch::Batch, nil]
     def batch
-      return nil if kafka_batch_id.nil? || kafka_batch_id.to_s.empty?
-      @kafka_batch ||= KafkaBatch::Batch.new(id: kafka_batch_id)
+      bid = batch_id
+      return nil if bid.nil? || bid.to_s.empty?
+
+      @kafka_batch ||= KafkaBatch::Batch.open(bid)
     end
 
     # Override this in your worker class.

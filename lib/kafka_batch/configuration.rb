@@ -4,7 +4,7 @@ module KafkaBatch
   class Configuration
     # ── Store ────────────────────────────────────────────────────────────────
     # :redis  – (default) all batch ledger state in Redis
-    # :mysql  – batch ledger in Redis + failures/pauses/weights in MySQL
+    # :mysql  – batch ledger in Redis + failures/pauses in MySQL
     attr_accessor :store
 
     # ── Kafka connection ─────────────────────────────────────────────────────
@@ -283,19 +283,19 @@ module KafkaBatch
     attr_accessor :fairness_active_count_ttl     # Integer – seconds; default 5
     attr_accessor :fairness_active_count_source  # Symbol – default :inflight_plus_ready
 
-    # Weighted concurrency. When false (default), every active tenant gets an
-    # EQUAL slice of the in-flight window (ceil(global/active)); per-tenant weight
-    # then only affects selection ORDER, so it is masked under full saturation.
-    # When true, each active tenant's in-flight cap is proportional to its weight:
+    # Weighted concurrency. When true (default), each active tenant's in-flight cap
+    # is proportional to its weight:
     #   cap_t = floor(fairness_global_concurrency * weight_t / Σ active weights)
     # (min 1), so a weight-50 tenant runs ~50× the concurrency of a weight-1
     # tenant even when all tenants are saturated — enforcing the intended
     # job/time distribution, not just competing for slack. Still work-conserving:
     # a lone active tenant's slice equals the whole window. Costs one O(active)
     # weight sum per checkout (negligible at tens/low-hundreds of active tenants).
-    # NOTE: custom weights must be visible to the Redis WFQ Lua — set_weight
-    # mirrors them to Redis for both :redis and :mysql weight backends.
-    attr_accessor :fairness_weighted_concurrency    # Boolean – default false
+    # When false, every active tenant gets an EQUAL slice (ceil(global/active));
+    # per-tenant weight then only affects selection ORDER under full saturation.
+    # NOTE: tenant weights always live in Redis (per-lane WEIGHT hash); set_weight
+    # writes there regardless of config.store.
+    attr_accessor :fairness_weighted_concurrency    # Boolean – default true
 
     # Bounded per-tenant staging window in Redis. When full the Dispatcher pauses
     # the ingest partition (backpressure) so the durable backlog stays in Kafka.
@@ -417,7 +417,7 @@ module KafkaBatch
       @max_failures_per_batch   = 1000           # cap tracked failing jobs per batch (0 = unlimited)
       @fairness_global_concurrency      = 50
       @fairness_max_inflight_per_tenant = 0      # 0 = dynamic fair share only (ceil(window/active))
-      @fairness_weighted_concurrency    = false  # true = per-tenant cap proportional to weight
+      @fairness_weighted_concurrency    = true   # false = equal in-flight cap per active tenant
       @fairness_active_count_ttl        = 5      # seconds to cache the smoothed active-tenant count
       @fairness_active_count_source     = :inflight_plus_ready  # or :ingest_lag
       @fairness_ready_window            = 500    # bounded ready jobs per tenant in Redis

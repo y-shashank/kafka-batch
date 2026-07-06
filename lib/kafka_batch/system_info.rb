@@ -146,7 +146,7 @@ module KafkaBatch
         return nil unless config.store == :mysql
 
         rows = [
-          row("Role", "failures, consumption pauses, tenant weights"),
+          row("Role", "failures, consumption pauses"),
           row("Batch ledger", "Redis (shared with :redis store)")
         ]
 

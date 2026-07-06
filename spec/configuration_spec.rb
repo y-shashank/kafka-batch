@@ -87,6 +87,7 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.fairness_global_concurrency).to eq(50)
       expect(config.fairness_ready_window).to eq(500)
       expect(config.fairness_default_weight).to eq(1.0)
+      expect(config.fairness_weighted_concurrency).to eq(true)
       expect(config.fairness_ingest_topic(:time)).to eq("kafka_batch.fair_time_ingest")
       expect(config.fairness_ready_topic(:time)).to eq("kafka_batch.fair_time_ready")
       expect(config.fairness_ingest_topic(:throughput)).to eq("kafka_batch.fair_throughput_ingest")

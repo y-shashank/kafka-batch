@@ -19,7 +19,7 @@ module KafkaBatch
            "--schedule-store (mysql)."
 
       class_option :store, type: :string, default: "redis",
-                           desc: "Batch-ledger store: redis (default) or mysql (failures/pauses/weights in MySQL)"
+                           desc: "Batch-ledger store: redis (default) or mysql (failures/pauses in MySQL)"
 
       class_option :schedule_store, type: :string, default: "redis",
                                     desc: "Delayed-job (perform_in/at) index store: redis (default) or mysql. " \
@@ -57,7 +57,7 @@ module KafkaBatch
 
       def copy_migrations
         # Copy only what each chosen store needs:
-        #   --store mysql          → failures / pauses / tenant-weights tables
+        #   --store mysql          → failures / pauses tables
         #   --schedule-store mysql → kafka_batch_scheduled_jobs table
         copy_file LEDGER_MIGRATION,    "db/migrate/#{LEDGER_MIGRATION}"    if @store == "mysql"
         copy_file SCHEDULED_MIGRATION, "db/migrate/#{SCHEDULED_MIGRATION}" if @schedule_store == "mysql"
@@ -81,7 +81,7 @@ module KafkaBatch
 
         if @store == "mysql" || @schedule_store == "mysql"
           copied = []
-          copied << "failures / pauses / tenant-weights" if @store == "mysql"
+          copied << "failures / pauses" if @store == "mysql"
           copied << "scheduled-jobs index"               if @schedule_store == "mysql"
           say "\n2. Run the migrations (#{copied.join(' + ')}):\n"
           say "     rails db:migrate\n"

@@ -253,6 +253,28 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       # total grew from 1 (parent) to 2 (parent + child)
       expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(2)
     end
+
+    it "binds job_id, batch_id, retry_count on the worker instance" do
+      batch = KafkaBatch::Batch.create
+      batch.push(ContextProbeWorker, {})
+
+      msg = FakeMessage.new(
+        topic: ContextProbeWorker.kafka_topic, partition: 0, offset: 1,
+        payload: {
+          "job_id" => "probe-j", "batch_id" => batch.id,
+          "worker_class" => "ContextProbeWorker",
+          "payload" => {}, "attempt" => 1
+        }
+      )
+      consumer.send(:process_message, msg)
+
+      probe = KafkaBatchSpec::WorkerRuns.runs.last
+      expect(probe[:name]).to eq(:context_probe)
+      expect(probe[:payload][:job_id]).to eq("probe-j")
+      expect(probe[:payload][:batch_id]).to eq(batch.id)
+      expect(probe[:payload][:retry_count]).to eq(1)
+      expect(probe[:payload][:batch_open]).to be(true)
+    end
   end
 
   describe "completion event shape" do

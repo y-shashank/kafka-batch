@@ -65,6 +65,15 @@ module KafkaBatch
         @pool = nil
       end
 
+      # @return [String] 16-char hex digest (for tests / debugging / worker #uniq_hex)
+      def digest_hex(worker_class, payload)
+        digest(worker_class, payload).unpack1("H*")
+      end
+
+      def digest_hex_for_name(worker_class_name, payload)
+        fingerprint(worker_class_name.to_s, payload).unpack1("H*")
+      end
+
       private
 
       def applies_to?(worker_class)

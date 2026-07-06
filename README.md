@@ -60,9 +60,9 @@ Kafka cannot shrink partitions. Size execution topics for **peak pods × concurr
 
 Completion dedup is a bitmap (~1 bit/job), but counter updates go to `kafka_batch:b:{batch_id}`. A single 10M-job batch is a deliberate burst — shard into smaller batches in app policy if needed.
 
-### 7. Fairness weights need `fairness_weighted_concurrency = true`
+### 7. `fairness_weighted_concurrency = false` ignores weight ratios under load
 
-With the default `false`, weights only affect **selection order** under saturation — every active tenant gets an equal in-flight cap. Turn weighted concurrency on for weight → throughput share.
+Default is `true` (weights → in-flight throughput share). Set `false` only if you want every active tenant to get an **equal** in-flight cap regardless of weight.
 
 ### 8. `fairness_lease_ttl` must exceed your longest job
 
@@ -109,7 +109,7 @@ gem "kafka-batch", require: "kafka_batch/ui"
 
 ```bash
 bundle exec rails generate kafka_batch:install
-# optional: --store mysql  (failure log / weights in MySQL; ledger still Redis)
+# optional: --store mysql  (failure log / pauses in MySQL; ledger still Redis)
 ```
 
 Edit `config/initializers/kafka_batch.rb` — at minimum:
@@ -285,7 +285,7 @@ All options live on `KafkaBatch.config`. The install generator ships enterprise-
 | `brokers` | `["localhost:9092"]` | Kafka bootstrap servers |
 | `redis_url` | `redis://localhost:6379/0` | **Required** |
 | `topic_prefix` | `""` | Namespaces all topics + consumer group (`myapp` → `myapp.kafka_batch.jobs`, `myapp.kafka-batch`) |
-| `store` | `:redis` | `:mysql` moves failure log / pauses / weights to MySQL; **ledger stays Redis** |
+| `store` | `:redis` | `:mysql` moves failure log / pauses to MySQL; **ledger stays Redis** |
 | `schedule_store` | `:redis` | Delayed-job index (`:mysql` for disk-backed scale) |
 | `schedule_poller_enabled` | `false` | Enable on scheduler pods only |
 | `max_retries` | `3` | Override per worker |
@@ -293,7 +293,7 @@ All options live on `KafkaBatch.config`. The install generator ships enterprise-
 | `skip_cancelled_jobs` | `true` | |
 | `cancellation_cache_ttl` | `120` | seconds |
 | `priority_config_paths` | `[]` | Paths to priority YAML files |
-| `fairness_weighted_concurrency` | `false` | **Set `true` in prod** if weights should control throughput |
+| `fairness_weighted_concurrency` | `true` | Set `false` for equal in-flight cap per tenant (weights → order only) |
 | `fairness_global_concurrency` | `50` | Per-lane in-flight window (install template: `1000`) |
 | `fairness_lease_ttl` | `1800` | Seconds; install template: `7200` |
 | `track_running_jobs` | `true` | Set `false` at very high throughput (keeps heartbeats) |
@@ -463,12 +463,12 @@ Fair jobs re-enter **ready** on retry (skip scheduler). Everything downstream (e
 
 ```ruby
 config.fairness_global_concurrency      = 1000   # in-flight window per lane
-config.fairness_weighted_concurrency    = true   # weights → throughput share
+config.fairness_weighted_concurrency    = true   # default; false = equal cap per tenant
 config.fairness_lease_ttl               = 7200   # must exceed longest job
 config.fairness_min_ingest_partitions   = 64     # boot check
 ```
 
-Tune live weights at `/kafka_batch/weights`.
+Tune live weights at `/kafka_batch/weights` (stored in Redis per fairness lane, regardless of `config.store`).
 
 ### Enqueue
 
@@ -557,7 +557,7 @@ Autoscale execution Deployments on **consumer lag** (KEDA / HPA). Partitions are
 ### High-volume checklist
 
 1. Size execution topics for peak pods × concurrency
-2. `fairness_weighted_concurrency = true` if using weights
+2. Tune tenant weights at `/kafka_batch/weights` (weighted concurrency is on by default)
 3. `fairness_lease_ttl` > longest job runtime
 4. `schedule_poller_enabled` only on 2–3 scheduler pods
 5. `track_running_jobs = false` at 50M+ jobs/day if `/live` per-job detail isn't needed

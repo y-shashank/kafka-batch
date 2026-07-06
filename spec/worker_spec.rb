@@ -61,29 +61,60 @@ RSpec.describe KafkaBatch::Worker do
     expect { klass.new.perform({}) }.to raise_error(NotImplementedError)
   end
 
-  # ── Instance helpers (kafka_batch_id / batch) ─────────────────────────────
+  # ── Instance helpers (job context / batch) ────────────────────────────────
+  describe "job context" do
+    it "exposes job_id, batch_id, retry_count, and uniq_hex after bind_job_context!" do
+      worker = UniqWorker.new
+      worker.bind_job_context!(
+        {
+          "job_id"  => "jid-1",
+          "batch_id"=> "bid-1",
+          "attempt" => 2,
+          "payload" => { "k" => "v" }
+        },
+        worker_class: UniqWorker
+      )
+
+      expect(worker.job_id).to eq("jid-1")
+      expect(worker.batch_id).to eq("bid-1")
+      expect(worker.kafka_batch_id).to eq("bid-1")
+      expect(worker.retry_count).to eq(2)
+      expect(worker.uniq_hex).to eq(KafkaBatch::Uniqueness.digest_hex(UniqWorker, { "k" => "v" }))
+    end
+
+    it "sets uniq_hex to nil for workers without uniq true" do
+      worker = SuccessfulWorker.new
+      worker.bind_job_context!(
+        { "job_id" => "j", "batch_id" => "b", "attempt" => 0, "payload" => {} },
+        worker_class: SuccessfulWorker
+      )
+      expect(worker.uniq_hex).to be_nil
+    end
+  end
+
   describe "#batch instance helper" do
-    it "returns nil when kafka_batch_id is nil" do
+    it "returns nil when batch_id is nil" do
       worker = SuccessfulWorker.new
-      worker.kafka_batch_id = nil
+      worker.bind_job_context!({ "job_id" => "j", "batch_id" => nil, "attempt" => 0, "payload" => {} })
       expect(worker.batch).to be_nil
     end
 
-    it "returns nil when kafka_batch_id is an empty string" do
+    it "returns nil when batch_id is an empty string" do
       worker = SuccessfulWorker.new
-      worker.kafka_batch_id = ""
+      worker.bind_job_context!({ "job_id" => "j", "batch_id" => "", "attempt" => 0, "payload" => {} })
       expect(worker.batch).to be_nil
     end
 
-    it "returns a Batch with the correct id when kafka_batch_id is set" do
+    it "returns an opened Batch with the correct id when batch_id is set" do
       id = SecureRandom.uuid
-      KafkaBatch.store.create_batch(id: id, total_jobs: 1)
+      KafkaBatch.store.create_batch(id: id, total_jobs: 1, tenant_id: "acme")
 
       worker = SuccessfulWorker.new
-      worker.kafka_batch_id = id
+      worker.bind_job_context!({ "job_id" => "j", "batch_id" => id, "attempt" => 0, "payload" => {} })
       b = worker.batch
       expect(b).to be_a(KafkaBatch::Batch)
       expect(b.id).to eq(id)
+      expect(b.instance_variable_get(:@tenant_id)).to eq("acme")
     end
 
     it "memoizes the Batch on repeated calls (no extra store round-trips)" do
@@ -91,7 +122,7 @@ RSpec.describe KafkaBatch::Worker do
       KafkaBatch.store.create_batch(id: id, total_jobs: 1)
 
       worker = SuccessfulWorker.new
-      worker.kafka_batch_id = id
+      worker.bind_job_context!({ "job_id" => "j", "batch_id" => id, "attempt" => 0, "payload" => {} })
       expect(worker.batch).to equal(worker.batch)  # same object identity
     end
   end
