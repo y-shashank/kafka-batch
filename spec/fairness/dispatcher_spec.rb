@@ -71,4 +71,19 @@ RSpec.describe KafkaBatch::Fairness::Dispatcher do
     expect(consumer).to have_received(:pause).with(5, kind_of(Integer))
     expect(consumer).not_to have_received(:mark_as_consumed!)
   end
+
+  it "routes malformed ingest JSON to the DLT and does not enqueue garbage" do
+    bad = FakeMessage.new(topic: KafkaBatch.config.fair_time_ingest_topic, offset: 4, payload: "{bad")
+    good = msg(offset: 5, tenant: "acme")
+    allow(consumer).to receive(:messages).and_return([bad, good])
+    allow(scheduler).to receive(:enqueue).and_return(:ok)
+
+    consumer.consume
+
+    dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
+    expect(dlt.size).to eq(1)
+    expect(dlt.first.payload["dlt_type"]).to eq("malformed_ingest")
+    expect(scheduler).to have_received(:enqueue).once.with("acme", stamped_raw(good))
+    expect(consumer).to have_received(:mark_as_consumed!).with(good)
+  end
 end

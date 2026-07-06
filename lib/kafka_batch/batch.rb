@@ -84,8 +84,17 @@ module KafkaBatch
       )
 
       if block_given?
-        yield batch
-        batch.send(:seal!)  # population done – open the completion gate
+        block_error = nil
+        begin
+          yield batch
+        rescue StandardError => e
+          block_error = e
+        ensure
+          # Always seal after block form — even when the block raises — so jobs
+          # already pushed can still finalize and fire callbacks.
+          batch.send(:seal!)
+        end
+        raise block_error if block_error
       end
 
       batch
@@ -273,7 +282,7 @@ module KafkaBatch
         end
         self.class.schedule_messages(messages, run_at: run_at, batch_id: @id)
       rescue StandardError
-        messages.each do |message|
+        entries.each do |message|
           self.class.release_uniq!(
             worker_class, message["payload"] || {}, job_id: message["job_id"]
           )

@@ -39,6 +39,10 @@ module KafkaBatch
       return false if till.nil? || till.to_s.empty?
 
       Batch.to_time(till) <= now
+    rescue ArgumentError, TypeError
+      # Unparseable valid_till is a poison pill — treat as expired so consumers
+      # route to DLT instead of redelivering forever.
+      true
     end
 
     # Stamp immutable source coordinates on a fair-lane job the first time it is
@@ -133,8 +137,7 @@ module KafkaBatch
     end
 
     def publish_dlt(data:, error:, topic:)
-      KafkaBatch::Producer.produce_sync(
-        topic:   KafkaBatch.config.dead_letter_topic,
+      KafkaBatch::Dlt.publish(
         payload: data.merge(
           "dlt_type"          => "expired",
           "dlt_source_topic"  => topic,
@@ -142,7 +145,11 @@ module KafkaBatch
           "dlt_error_message" => error.message,
           "dlt_at"            => Time.now.iso8601
         ),
-        key: data["job_id"]
+        key:          data["job_id"],
+        dlt_type:     "expired",
+        source_topic: topic,
+        batch_id:     data["batch_id"],
+        job_id:       data["job_id"]
       )
     end
   end

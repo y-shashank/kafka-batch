@@ -51,6 +51,20 @@ RSpec.describe KafkaBatch::Batch do
       expect(cb.first.payload["batch_id"]).to eq(batch.id)
       expect(cb.first.payload["outcome"]).to eq("success")
     end
+
+    it "seals the batch even when the block raises so pushed jobs can still finalize" do
+      batch = nil
+      expect {
+        described_class.create(on_complete: "RecordingCallback") do |b|
+          batch = b
+          b.push(SuccessfulWorker, { "id" => 1 })
+          raise "population failed"
+        end
+      }.to raise_error(RuntimeError, "population failed")
+
+      expect(KafkaBatch.store.find_batch(batch.id)[:locked_at]).not_to be_nil
+      expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(1)
+    end
   end
 
   describe "open / streaming (no lock step)" do

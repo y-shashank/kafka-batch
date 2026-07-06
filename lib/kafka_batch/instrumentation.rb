@@ -17,21 +17,24 @@ module KafkaBatch
   # Event name format: "<event>.<component>.kafka_batch"
   #
   # Events emitted:
-  #   job.processed.kafka_batch        – job completed successfully
-  #   job.retried.kafka_batch          – job scheduled for retry
-  #   job.failed.kafka_batch           – job exhausted all retries
-  #   job.cancelled.kafka_batch        – job skipped (batch was cancelled)
-  #   job.uniq_skipped.kafka_batch     – duplicate rejected (worker has uniq true)
-  #   job.expired.kafka_batch          – job dropped (valid_till passed)
-  #   job.emit_retried.kafka_batch     – completion-event produce retried inline
-  #   batch.created.kafka_batch        – a new batch was persisted
-  #   batch.sealed.kafka_batch         – block-form population finished; batch sealed
-  #   batch.completed.kafka_batch      – batch reached terminal state
-  #   callback.invoked.kafka_batch     – on_success / on_complete callback ran
-  #   callback.failed.kafka_batch      – callback raised or was unresolvable
-  #   dlt.published.kafka_batch        – a message was forwarded to the dead-letter topic
-  #   consumer.priority_yielded.kafka_batch – p1 consumer paused for p0 lag
-  #   reconciler.ran.kafka_batch       – reconciler sweep completed
+  #   job.processed.kafka_batch           – job completed successfully
+  #   job.retried.kafka_batch             – job scheduled for retry
+  #   job.failed.kafka_batch              – job exhausted all retries
+  #   job.cancelled.kafka_batch           – job skipped (batch was cancelled)
+  #   job.uniq_skipped.kafka_batch        – duplicate rejected (worker has uniq true)
+  #   job.expired.kafka_batch             – job dropped (valid_till passed)
+  #   job.emit_retried.kafka_batch        – completion-event produce retried inline
+  #   scheduled.enqueued.kafka_batch      – delayed job indexed (perform_in/at)
+  #   scheduled.enqueued_bulk.kafka_batch – bulk delayed jobs indexed
+  #   scheduled.dispatched.kafka_batch    – SchedulePoller re-produced a due job
+  #   batch.created.kafka_batch             – a new batch was persisted
+  #   batch.sealed.kafka_batch              – block-form population finished
+  #   batch.completed.kafka_batch           – batch reached terminal state
+  #   callback.invoked.kafka_batch          – on_success / on_complete callback ran
+  #   callback.failed.kafka_batch           – callback raised or was unresolvable
+  #   dlt.published.kafka_batch             – message forwarded to dead-letter topic
+  #   consumer.priority_yielded.kafka_batch   – priority consumer paused for higher lag
+  #   reconciler.ran.kafka_batch              – reconciler sweep completed
   #
   module Instrumentation
     NAMESPACE = "kafka_batch"
@@ -200,11 +203,15 @@ module KafkaBatch
 
       # ── DLT events ─────────────────────────────────────────────────────
 
-      # Fired whenever any consumer publishes a message to the dead-letter topic.
-      # dlt_type is a short label identifying the publish path, e.g.:
-      #   "retry_routing"   – RetryConsumer could not route the retry
-      #   "callback_failed" – CallbackConsumer failed to invoke the callback
-      #   "job_failed"      – JobConsumer exhausted retries (forwarded by store)
+      # Fired whenever a message is published to the dead-letter topic.
+      # All DLT paths go through KafkaBatch::Dlt.publish so this always fires
+      # on successful produce. dlt_type labels the publish path, e.g.:
+      #   job              – JobConsumer (malformed, unknown worker, exhausted)
+      #   expired          – valid_till passed
+      #   retry_routing    – RetryConsumer could not route the retry
+      #   callback         – unresolvable callback class/method
+      #   callback_error   – callback raised during invocation
+      #   malformed_callback / malformed_event – unparseable JSON
       def dlt_published(batch_id: nil, job_id: nil, dlt_type:, source_topic:)
         instrument("dlt.published", {
           batch_id:     batch_id,
@@ -216,15 +223,17 @@ module KafkaBatch
 
       # ── Consumer events ────────────────────────────────────────────────
 
-      # Fired by PriorityGate#yield_to_p0 when a p1 consumer pauses because the
-      # corresponding p0 topic has lag.  Subscribe to this event to measure
-      # priority queue contention and tune lag_check_interval or worker counts.
+      # Fired when a lower-ranked priority consumer pauses because higher-ranked
+      # topics in the same group have lag.
       #
       # Payload keys:
       #   consumer_class  – e.g. "KafkaBatch::Consumers::PriorityJobConsumer"
-      #   p0_topic        – topic name the lag was detected on
-      #   consumer_group  – the consumer group owning that topic
+      #   p0_topic        – first higher-ranked topic checked (legacy key name)
+      #   consumer_group  – the consumer group owning those topics
       #   pause_ms        – how long the partition will be paused
+      #   mode            – weighted | strict
+      #   rank            – topic rank in the priority YAML (0 = highest)
+      #   higher_topics   – all higher-ranked topics with lag at check time
       def consumer_priority_yielded(consumer_class:, p0_topic:, consumer_group:, pause_ms:,
                                     mode: nil, rank: nil, higher_topics: nil)
         instrument("consumer.priority_yielded", {

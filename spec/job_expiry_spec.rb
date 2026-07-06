@@ -27,6 +27,10 @@ RSpec.describe KafkaBatch::JobExpiry do
       data = { "valid_till" => 1.hour.from_now.iso8601 }
       expect(described_class.expired?(data)).to eq(false)
     end
+
+    it "is true when valid_till is unparseable (poison pill → DLT path)" do
+      expect(described_class.expired?({ "valid_till" => "not-a-timestamp" })).to eq(true)
+    end
   end
 end
 
@@ -63,5 +67,21 @@ RSpec.describe "valid_till enqueue + consumption" do
     dlt = FakeProducer.messages.find { |m| m[:topic] == KafkaBatch.config.dead_letter_topic }
     expect(dlt[:payload]["dlt_type"]).to eq("expired")
     expect(dlt[:payload]["job_id"]).to eq(FakeProducer.messages.first[:payload]["job_id"])
+  end
+
+  it "JobConsumer DLTs jobs with unparseable valid_till instead of stalling the partition" do
+    consumer = build_consumer(KafkaBatch::Consumers::JobConsumer)
+    msg = FakeMessage.new(
+      topic: "test.success", partition: 0, offset: 9,
+      payload: {
+        "job_id" => "j-bad-till", "worker_class" => SuccessfulWorker.name,
+        "payload" => {}, "valid_till" => "not-a-timestamp"
+      }
+    )
+
+    expect { consumer.send(:process_message, msg) }.not_to raise_error
+    expect(KafkaBatchSpec::WorkerRuns.runs).to be_empty
+    dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic).first
+    expect(dlt.payload["dlt_type"]).to eq("expired")
   end
 end

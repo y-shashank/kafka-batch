@@ -242,8 +242,7 @@ module KafkaBatch
       end
 
       def publish_to_dlt(raw:, error:, topic:)
-        KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.dead_letter_topic,
+        KafkaBatch::Dlt.publish(
           payload: {
             "dlt_type"          => "malformed_event",
             "dlt_source_topic"  => topic,
@@ -252,7 +251,8 @@ module KafkaBatch
             "dlt_error_message" => error.message,
             "dlt_at"            => Time.now.iso8601
           },
-          key: SecureRandom.uuid
+          dlt_type:     "malformed_event",
+          source_topic: topic
         )
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error("[KafkaBatch][EventConsumer] DLT publish failed: #{e.message}")

@@ -56,17 +56,32 @@ RSpec.describe KafkaBatch::Consumers::RetryConsumer do
   end
 
   it "fails the batch job AND DLTs an unroutable message (missing retry_to) so the batch can finish" do
+    id = SecureRandom.uuid
     msg = FakeMessage.new(
       topic:   KafkaBatch.config.retry_topic,
-      payload: { "job_id" => "j1", "batch_id" => "b1", "worker_class" => "W" }
+      payload: {
+        "job_id"        => "j1",
+        "batch_id"      => id,
+        "batch_seq"     => 1,
+        "worker_class"  => "SuccessfulWorker",
+        "payload"       => {}
+      }
     )
+    KafkaBatch.store.create_batch(id: id, total_jobs: 1, on_complete: "RecordingCallback")
     consumer.send(:process_retry, msg)
 
-    # Emits a failed completion event so the batch still drains (no silent drop).
     evt = FakeProducer.for_topic(KafkaBatch.config.events_topic).first
     expect(evt).not_to be_nil
     expect(evt.payload["status"]).to eq("failed")
-    expect(evt.payload["batch_id"]).to eq("b1")
+    expect(evt.payload["batch_id"]).to eq(id)
+    expect(evt.payload["batch_seq"]).to eq(1)
+
+    event_consumer = build_consumer(KafkaBatch::Consumers::EventConsumer)
+    event_consumer.send(:process_event, FakeMessage.new(
+      topic: KafkaBatch.config.events_topic,
+      payload: evt.payload
+    ))
+    expect(KafkaBatch.store.find_batch(id)[:failed_count]).to eq(1)
 
     dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
     expect(dlt.first.payload["dlt_type"]).to eq("retry_routing")

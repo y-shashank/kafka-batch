@@ -283,6 +283,10 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       KafkaBatch.config.event_emit_backoff = 0 # no real sleeping in tests
 
       attempts = 0
+      emit_retries = []
+      allow(KafkaBatch::Instrumentation).to receive(:job_emit_retried) do |**kw|
+        emit_retries << kw
+      end
       allow(KafkaBatch::Producer).to receive(:produce_sync) do |topic:, **_|
         if topic == KafkaBatch.config.events_topic
           attempts += 1
@@ -299,6 +303,7 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
 
       # 1 initial attempt + 2 configured retries
       expect(attempts).to eq(3)
+      expect(emit_retries.map { |e| e[:attempt] }).to eq([1, 2])
     end
 
     it "does not attempt emission at all for a standalone (batch-less) job" do
@@ -397,6 +402,29 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
     it "does NOT call complete for a plain (non-fair) message" do
       consumer.send(:process_message, job_message(worker: SuccessfulWorker, batch_id: "b1"))
       expect(scheduler).not_to have_received(:complete)
+    end
+
+    it "releases the fair slot when an expired ready message is dropped" do
+      till = 1.minute.ago.iso8601
+      msg = FakeMessage.new(
+        topic:   KafkaBatch.config.fairness_ready_topic(:time),
+        offset:  2,
+        payload: {
+          "job_id"       => "j-exp",
+          "worker_class" => SuccessfulWorker.name,
+          "payload"      => {},
+          "tenant_id"    => "acme",
+          "_fair_slot"   => true,
+          "_fair_slot_id"=> "lease-1",
+          "valid_till"   => till
+        }
+      )
+      consumer.send(:process_message, msg)
+
+      expect(scheduler).to have_received(:complete).with(
+        "acme", hash_including(slot_id: "lease-1", duration: 0.0)
+      ).once
+      expect(KafkaBatchSpec::WorkerRuns.runs).to be_empty
     end
   end
 end

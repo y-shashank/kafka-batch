@@ -128,19 +128,24 @@ module KafkaBatch
         job = sched.checkout
         return false unless job
 
-        data = Oj.load(job[:payload])
-        if KafkaBatch::JobExpiry.expired?(data)
-          drop_expired_forwarded!(sched, job, data)
-          return true
-        end
+        begin
+          data = Oj.load(job[:payload])
+          if KafkaBatch::JobExpiry.expired?(data)
+            drop_expired_forwarded!(sched, job, data)
+            return true
+          end
 
-        payload = mark_slot(job[:payload], job[:tenant_id], job[:slot_id])
-        KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.fairness_ready_topic(@type),
-          payload: payload,
-          key:     job_key(payload)
-        )
-        true
+          payload = mark_slot!(job[:payload], job[:tenant_id], job[:slot_id])
+          KafkaBatch::Producer.produce_sync(
+            topic:   KafkaBatch.config.fairness_ready_topic(@type),
+            payload: payload,
+            key:     job_key(payload)
+          )
+          true
+        rescue StandardError => e
+          recover_checkout_failure!(sched, job, e)
+          false
+        end
       end
 
       private
@@ -167,15 +172,37 @@ module KafkaBatch
       # into the raw job JSON so the JobConsumer knows this ready message holds one
       # Scheduler in-flight slot on the CORRECT lane, and releases exactly that
       # lease (Scheduler(type)#complete(slot_id:)) once.
-      def mark_slot(raw, tenant_id, slot_id = nil)
+      def mark_slot!(raw, tenant_id, slot_id = nil)
         data = Oj.load(raw)
         data["_fair_slot"]    = true
         data["_fair_type"]    = @type.to_s
         data["_fair_slot_id"] = slot_id if slot_id
         data["tenant_id"] ||= tenant_id
         Oj.dump(data, mode: :compat)
-      rescue StandardError
-        raw
+      end
+
+      # Checkout is destructive (LPOP + lease). On any post-checkout failure,
+      # release the lease and push the raw payload back into the tenant window.
+      def recover_checkout_failure!(sched, job, error)
+        sched.complete(job[:tenant_id], slot_id: job[:slot_id], duration: 0)
+        case sched.enqueue(job[:tenant_id], job[:payload])
+        when :ok
+          KafkaBatch.logger.warn(
+            "[KafkaBatch][Fairness::Forwarder] lane=#{@type} recovered checkout failure " \
+            "for tenant=#{job[:tenant_id]}: #{error.class}: #{error.message}"
+          )
+        when :full
+          KafkaBatch.logger.error(
+            "[KafkaBatch][Fairness::Forwarder] lane=#{@type} checkout failure AND tenant " \
+            "ready window full – job may be lost for tenant=#{job[:tenant_id]}: " \
+            "#{error.class}: #{error.message}"
+          )
+        end
+      rescue StandardError => e
+        KafkaBatch.logger.error(
+          "[KafkaBatch][Fairness::Forwarder] lane=#{@type} failed to recover checkout " \
+          "for tenant=#{job[:tenant_id]}: #{e.class}: #{e.message}"
+        )
       end
 
       # Spread across ready-topic partitions by job_id.

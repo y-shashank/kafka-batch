@@ -12,6 +12,7 @@ require_relative "kafka_batch/ui"    # config, store, lag, liveness, web, …
 
 # ── Backend-only requires ────────────────────────────────────────────────────
 require_relative "kafka_batch/producer"
+require_relative "kafka_batch/dlt"
 require_relative "kafka_batch/consumers/consumption_gate"
 require_relative "kafka_batch/consumers/expired_job_handler"
 require_relative "kafka_batch/topics"

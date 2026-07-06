@@ -195,18 +195,21 @@ module KafkaBatch
 
       def publish_to_dlt(original_message:, data:, error:, callback_class:, callback_method:,
                          dlt_type: "callback")
-        KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.dead_letter_topic,
+        KafkaBatch::Dlt.publish(
           payload: data.merge(
-            "dlt_type"              => dlt_type,
-            "dlt_callback_class"    => callback_class.to_s,
-            "dlt_callback_method"   => callback_method.to_s,
-            "dlt_error_class"       => error.class.name,
-            "dlt_error_message"     => error.message,
-            "dlt_source_topic"      => original_message.topic,
-            "dlt_at"                => Time.now.iso8601
+            "dlt_type"            => dlt_type,
+            "dlt_callback_class"  => callback_class.to_s,
+            "dlt_callback_method" => callback_method.to_s,
+            "dlt_error_class"     => error.class.name,
+            "dlt_error_message"   => error.message,
+            "dlt_source_topic"    => original_message.topic,
+            "dlt_at"              => Time.now.iso8601
           ),
-          key: data["batch_id"] || SecureRandom.uuid
+          key:          data["batch_id"],
+          dlt_type:     dlt_type,
+          source_topic: original_message.topic,
+          batch_id:     data["batch_id"],
+          job_id:       data["job_id"]
         )
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error(

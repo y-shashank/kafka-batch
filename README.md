@@ -594,13 +594,17 @@ Events publish via `ActiveSupport::Notifications` when Rails/AS is loaded:
 | `job.cancelled.kafka_batch` | Batch cancelled |
 | `job.uniq_skipped.kafka_batch` | Duplicate uniq enqueue |
 | `job.expired.kafka_batch` | Past `valid_till` |
+| `job.emit_retried.kafka_batch` | Completion-event produce retry |
+| `scheduled.enqueued.kafka_batch` | Delayed job indexed |
+| `scheduled.enqueued_bulk.kafka_batch` | Bulk delayed jobs indexed |
+| `scheduled.dispatched.kafka_batch` | Delayed job fired |
 | `batch.created.kafka_batch` | Batch persisted |
+| `batch.sealed.kafka_batch` | Block-form batch sealed |
 | `batch.completed.kafka_batch` | Terminal state |
 | `callback.invoked.kafka_batch` | Callback ran |
 | `callback.failed.kafka_batch` | Callback error |
-| `dlt.published.kafka_batch` | Dead letter |
+| `dlt.published.kafka_batch` | Dead letter (all paths via `KafkaBatch::Dlt`) |
 | `consumer.priority_yielded.kafka_batch` | Priority gate paused |
-| `scheduled.dispatched.kafka_batch` | Delayed job fired |
 | `reconciler.ran.kafka_batch` | Sweep finished |
 
 ### Subscribe today (DIY metrics)

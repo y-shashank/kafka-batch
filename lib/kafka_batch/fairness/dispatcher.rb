@@ -57,7 +57,11 @@ module KafkaBatch
 
         last_committed = nil
         messages.each do |message|
-          data = decode_ingest(message.raw_payload)
+          data = decode_ingest(message)
+          if data.nil?
+            last_committed = message
+            next
+          end
 
           if expired_job?(data)
             handle_expired_job(message: message, data: data, log_tag: "Fairness::Dispatcher")
@@ -99,10 +103,36 @@ module KafkaBatch
         :time
       end
 
-      def decode_ingest(raw)
-        Oj.load(raw)
-      rescue StandardError
-        {}
+      def decode_ingest(message)
+        Oj.load(message.raw_payload)
+      rescue StandardError => e
+        KafkaBatch.logger.error(
+          "[KafkaBatch][Fairness::Dispatcher] Malformed JSON in ingest message – " \
+          "forwarding to DLT: #{e.message}"
+        )
+        publish_malformed_to_dlt(message: message, error: e)
+        nil
+      end
+
+      def publish_malformed_to_dlt(message:, error:)
+        KafkaBatch::Dlt.publish(
+          payload: {
+            "dlt_type"          => "malformed_ingest",
+            "dlt_source_topic"  => message.topic,
+            "dlt_raw_payload"   => message.raw_payload.to_s,
+            "dlt_parse_error"   => error.message,
+            "dlt_error_class"   => error.class.name,
+            "dlt_at"            => Time.now.iso8601
+          },
+          key:          nil,
+          dlt_type:     "malformed_ingest",
+          source_topic: message.topic
+        )
+      rescue KafkaBatch::ProducerError => e
+        KafkaBatch.logger.error(
+          "[KafkaBatch][Fairness::Dispatcher] DLT publish failed: #{e.message}"
+        )
+        raise
       end
 
       def tenant_key_from_data(data)
@@ -116,7 +146,9 @@ module KafkaBatch
 
       # @deprecated use tenant_key_from_data — kept for tests referencing tenant_key
       def tenant_key(raw)
-        tenant_key_from_data(decode_ingest(raw))
+        tenant_key_from_data(Oj.load(raw))
+      rescue StandardError
+        "_unparsable"
       end
     end
   end

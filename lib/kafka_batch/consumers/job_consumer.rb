@@ -56,24 +56,32 @@ module KafkaBatch
         batch_id      = data["batch_id"]
         payload       = data["payload"] || {}
 
-        if expired_job?(data)
-          handle_expired_job(message: message, data: data)
-          return
-        end
-
-        # Fair-lane bookkeeping: a message forwarded by Fairness::Forwarder carries
-        # "_fair_slot" => true and a tenant_id. It holds exactly one Scheduler
-        # in-flight slot (fairness_global_concurrency / per-tenant cap) that MUST
-        # be released via Scheduler#complete exactly once when we finish with the
-        # message — whether it succeeds, is scheduled for retry, is DLT'd, or is
-        # skipped (cancelled). In :time_fairness mode complete also advances the
-        # tenant's virtual time by (duration / weight). Retried messages have the
-        # marker stripped (see schedule_retry), so they never double-release.
+        # Fair-lane bookkeeping: parse before the expiry gate so an expired ready
+        # message still releases its Scheduler in-flight slot.
         fair_slot     = data["_fair_slot"] ? true : false
         fair_tenant   = data["tenant_id"]
         fair_type     = (data["_fair_type"] || "time").to_sym  # which lane's slot to release
         fair_slot_id  = data["_fair_slot_id"]                  # lease id (nil for pre-upgrade messages)
         fair_started  = nil  # set right before perform so duration reflects run time
+
+        if expired_job?(data)
+          begin
+            handle_expired_job(message: message, data: data)
+          ensure
+            if fair_slot
+              release_fair_slot(fair_tenant, 0.0, fair_type, fair_slot_id)
+            end
+          end
+          return
+        end
+
+        # A message forwarded by Fairness::Forwarder carries "_fair_slot" => true
+        # and a tenant_id. It holds exactly one Scheduler in-flight slot that MUST
+        # be released via Scheduler#complete exactly once when we finish with the
+        # message — whether it succeeds, is scheduled for retry, is DLT'd, expired,
+        # or is skipped (cancelled). In :time_fairness mode complete also advances
+        # the tenant's virtual time by (duration / weight). Retried messages have
+        # the marker stripped (see schedule_retry), so they never double-release.
 
         # Everything below runs inside begin/ensure so the fair-lane in-flight
         # slot is released exactly once on every exit path (success, retry, DLT,
@@ -396,6 +404,12 @@ module KafkaBatch
         rescue KafkaBatch::ProducerError => e
           attempts += 1
           if attempts <= max_attempts
+            KafkaBatch::Instrumentation.job_emit_retried(
+              job_id:   job_id,
+              batch_id: batch_id,
+              attempt:  attempts,
+              error:    e
+            )
             KafkaBatch.logger.warn(
               "[KafkaBatch][JobConsumer] Event emit failed (attempt #{attempts}) – retrying: #{e.message}"
             )
@@ -450,8 +464,7 @@ module KafkaBatch
       end
 
       def publish_to_dlt(data:, error:, topic:)
-        KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.dead_letter_topic,
+        KafkaBatch::Dlt.publish(
           payload: data.merge(
             "dlt_type"          => "job",
             "dlt_source_topic"  => topic,
@@ -459,7 +472,11 @@ module KafkaBatch
             "dlt_error_message" => error.message,
             "dlt_at"            => Time.now.iso8601
           ),
-          key: data["job_id"]
+          key:          data["job_id"],
+          dlt_type:     "job",
+          source_topic: topic,
+          batch_id:     data["batch_id"],
+          job_id:       data["job_id"]
         )
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error("[KafkaBatch][JobConsumer] DLT publish failed: #{e.message}")

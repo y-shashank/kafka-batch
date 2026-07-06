@@ -148,13 +148,22 @@ module KafkaBatch
       end
 
       # Emit a 'failed' completion event so a dropped/unroutable retry still
-      # advances its batch toward completion. Dedup is keyed by this retry
-      # message's own coordinates (unique per retry-topic partition/offset).
+      # advances its batch toward completion. Dedup is by batch_seq (bitmap in
+      # the store), same as JobConsumer / JobExpiry.
       # Best-effort: a standalone job (no batch_id) needs no event, and an emit
       # failure must not block DLT routing of the poison message.
       def emit_failed_event(data, message)
         batch_id = data["batch_id"]
         return unless batch_id
+
+        batch_seq = data["batch_seq"]
+        if batch_seq.nil? || batch_seq.to_i <= 0
+          KafkaBatch.logger.warn(
+            "[KafkaBatch][RetryConsumer] Unroutable batch job missing batch_seq – " \
+            "cannot advance batch_id=#{batch_id} job_id=#{data['job_id']}"
+          )
+          return
+        end
 
         KafkaBatch::Producer.produce_sync(
           topic:   KafkaBatch.config.events_topic,
@@ -166,7 +175,8 @@ module KafkaBatch
             "occurred_at"   => Time.now.iso8601,
             "src_topic"     => message.topic,
             "src_partition" => message.partition,
-            "src_offset"    => message.offset
+            "src_offset"    => message.offset,
+            "batch_seq"     => batch_seq.to_i
           },
           key: "#{message.topic}/#{message.partition}"
         )
@@ -178,21 +188,17 @@ module KafkaBatch
       end
 
       def publish_to_dlt(data:, topic:)
-        KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.dead_letter_topic,
+        KafkaBatch::Dlt.publish(
           payload: data.merge(
             "dlt_type"         => "retry_routing",
             "dlt_source_topic" => topic,
             "dlt_at"           => Time.now.iso8601
           ),
-          key: data["job_id"]
-        )
-        # #22: emit dlt_published instrumentation so operators can track DLT rates.
-        KafkaBatch::Instrumentation.dlt_published(
-          batch_id:     data["batch_id"],
-          job_id:       data["job_id"],
+          key:          data["job_id"],
           dlt_type:     "retry_routing",
-          source_topic: topic
+          source_topic: topic,
+          batch_id:     data["batch_id"],
+          job_id:       data["job_id"]
         )
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error("[KafkaBatch][RetryConsumer] DLT publish failed: #{e.message}")
