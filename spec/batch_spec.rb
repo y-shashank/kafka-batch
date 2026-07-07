@@ -115,6 +115,7 @@ RSpec.describe KafkaBatch::Batch do
         expect(produced.size).to eq(3)
         expect(produced.map { |m| m.payload["batch_id"] }.uniq).to eq([batch.id])
         expect(produced.map { |m| m.payload["batch_seq"] }).to eq([1, 2, 3])
+        expect(KafkaBatch::Producer).to have_received(:produce_many_sync).once
       end
 
       it "is a no-op for an empty array" do
@@ -125,26 +126,46 @@ RSpec.describe KafkaBatch::Batch do
 
       it "rolls back only the unproduced remainder on partial produce failure" do
         batch = described_class.create
-        calls = 0
-        allow(KafkaBatch::Producer).to receive(:produce_sync) do |**args|
-          calls += 1
-          raise KafkaBatch::ProducerError, "boom" if calls >= 2
+        allow(KafkaBatch::Producer).to receive(:produce_many_sync) do |messages|
+          msg = messages.first
           FakeProducer.record(
-            topic: args[:topic], payload: args[:payload],
-            key: args[:key], partition: args[:partition]
+            topic: msg[:topic], payload: msg[:payload],
+            key: msg[:key], partition: msg[:partition]
+          )
+          report = double("report", partition: 0, offset: 1, error: nil)
+          handle = double("handle", create_result: report)
+          raise KafkaBatch::PartialProduceError.new(
+            "boom", dispatched: [handle], produced_count: nil
           )
         end
-        expect { batch.push_many(SuccessfulWorker, [{}, {}, {}]) }.to raise_error(KafkaBatch::ProducerError)
+
+        expect { batch.push_many(SuccessfulWorker, [{}, {}, {}]) }
+          .to raise_error(KafkaBatch::PartialProduceError)
         expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(1)
         expect(FakeProducer.for_topic("test.success").size).to eq(1)
       end
 
       it "rolls back the unproduced remainder on produce failure" do
         batch = described_class.create
-        FakeProducer.raise_for { |topic| topic == "test.success" }
-        expect { batch.push_many(SuccessfulWorker, [{}, {}]) }.to raise_error(KafkaBatch::ProducerError)
-        # nothing was produced, so the full count is rolled back
+        allow(KafkaBatch::Producer).to receive(:produce_many_sync)
+          .and_raise(KafkaBatch::PartialProduceError.new("boom", dispatched: [], produced_count: 0))
+        expect { batch.push_many(SuccessfulWorker, [{}, {}]) }
+          .to raise_error(KafkaBatch::PartialProduceError)
         expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(0)
+      end
+
+      it "produces large batches in sequential chunks" do
+        previous = KafkaBatch.config.push_many_chunk_size
+        KafkaBatch.config.push_many_chunk_size = 2
+        batch = described_class.create
+        payloads = [{ "n" => 1 }, { "n" => 2 }, { "n" => 3 }, { "n" => 4 }, { "n" => 5 }]
+
+        batch.push_many(SuccessfulWorker, payloads)
+
+        expect(KafkaBatch::Producer).to have_received(:produce_many_sync).exactly(3).times
+        expect(FakeProducer.for_topic("test.success").size).to eq(5)
+      ensure
+        KafkaBatch.config.push_many_chunk_size = previous
       end
     end
 

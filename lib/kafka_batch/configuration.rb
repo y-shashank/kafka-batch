@@ -383,6 +383,10 @@ module KafkaBatch
     # Default 1 MiB (Kafka's typical message.max.bytes). 0/nil disables the guard.
     attr_accessor :max_message_bytes  # Integer – default 1_048_576
 
+    # Chunk size for #push_many / bulk scheduled produce. Sequential chunks preserve
+    # gap-free batch_seq semantics while pipelining via produce_many_sync.
+    attr_accessor :push_many_chunk_size  # Integer – default 500
+
     # ── Passthrough rdkafka config ───────────────────────────────────────────
     attr_accessor :producer_config  # Hash – merged on top of producer defaults
     attr_accessor :consumer_config  # Hash – merged on top of consumer defaults
@@ -459,6 +463,7 @@ module KafkaBatch
       @max_reconcile_per_run    = 100
       @all_index_max_size       = 200_000
       @max_message_bytes        = 1_048_576  # 1 MiB; set to 0 to disable
+      @push_many_chunk_size     = 500
       @producer_config          = {}
       @consumer_config          = {}
       @validate_topics_on_boot  = false

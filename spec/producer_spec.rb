@@ -25,6 +25,51 @@ RSpec.describe KafkaBatch::Producer do
     end
   end
 
+  describe ".produce_many_sync partial failure" do
+    it "raises PartialProduceError preserving dispatched handles" do
+      described_class.reset!
+      allow(described_class).to receive(:produce_many_sync).and_call_original
+      handle = double("handle")
+      fake   = double("producer")
+      allow(fake).to receive(:produce_many_sync).and_raise(
+        WaterDrop::Errors::ProduceManyError.new([handle], "partial")
+      )
+      allow(described_class).to receive(:instance).and_return(fake)
+
+      expect {
+        described_class.produce_many_sync([{ topic: "t", payload: { x: 1 }, key: "k" }])
+      }.to raise_error(KafkaBatch::PartialProduceError) { |err|
+        expect(err.dispatched).to eq([handle])
+      }
+    ensure
+      described_class.reset!
+    end
+  end
+
+  describe ".prefix_delivered_count" do
+    def ok_report
+      double("report", partition: 0, offset: 1, error: nil)
+    end
+
+    def fail_report
+      err = double("err", null?: false)
+      double("report", partition: 0, offset: 1, error: err)
+    end
+
+    it "counts a consecutive successful prefix" do
+      handles = [
+        double("h1", create_result: ok_report),
+        double("h2", create_result: fail_report),
+        double("h3", create_result: ok_report)
+      ]
+      expect(described_class.prefix_delivered_count(handles)).to eq(1)
+    end
+
+    it "returns zero for an empty handle list" do
+      expect(described_class.prefix_delivered_count([])).to eq(0)
+    end
+  end
+
   # ── max_message_bytes size guard ─────────────────────────────────────────
   describe ".encode max_message_bytes guard" do
     after { KafkaBatch.config.max_message_bytes = 1_048_576 }  # restore default

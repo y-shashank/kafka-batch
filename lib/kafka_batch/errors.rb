@@ -15,6 +15,19 @@ module KafkaBatch
   # Raised when Kafka message production fails
   class ProducerError < Error; end
 
+  # Raised when a bulk produce call fails after delivering a prefix of messages.
+  # +produced_count+ is the number of messages confirmed on Kafka (gap-free
+  # prefix). +dispatched+ holds WaterDrop delivery handles for the failing chunk.
+  class PartialProduceError < ProducerError
+    attr_reader :dispatched, :produced_count
+
+    def initialize(message, dispatched: [], produced_count: nil)
+      super(message)
+      @dispatched     = dispatched || []
+      @produced_count = produced_count
+    end
+  end
+
   # Raised when enqueueing a job that opts into `uniq true` while an identical
   # job (same worker + payload) is already queued or in progress. Only raised
   # when config.uniq_on_duplicate is :raise.

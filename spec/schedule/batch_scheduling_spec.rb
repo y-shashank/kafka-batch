@@ -129,13 +129,30 @@ RSpec.describe "KafkaBatch::Batch delayed scheduling (perform_in / perform_at)" 
         end
       end
 
-      it "rolls back the full reservation if bulk scheduling fails" do
+      it "rolls back the full reservation if bulk scheduling fails before any produce" do
         allow(sched).to receive(:schedule_many).and_raise(KafkaBatch::ProducerError, "boom")
         batch = KafkaBatch::Batch.create
 
         expect { batch.push_many_at(Time.now + 300, SuccessfulWorker, [{}, {}, {}]) }
           .to raise_error(KafkaBatch::ProducerError)
         expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(0)
+      end
+
+      it "rolls back only the unscheduled remainder on partial bulk produce failure" do
+        batch = KafkaBatch::Batch.create
+        allow(KafkaBatch::Producer).to receive(:produce_many_sync) do |messages|
+          msg = messages.first
+          FakeProducer.record(topic: msg[:topic], payload: msg[:payload], key: msg[:key])
+          report = double("report", partition: 0, offset: 100, error: nil)
+          handle = double("handle", create_result: report)
+          raise KafkaBatch::PartialProduceError.new("boom", dispatched: [handle])
+        end
+        allow(sched).to receive(:schedule_many)
+
+        expect { batch.push_many_at(Time.now + 300, SuccessfulWorker, [{}, {}, {}]) }
+          .to raise_error(KafkaBatch::PartialProduceError)
+        expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(1)
+        expect(sched).to have_received(:schedule_many).once
       end
     end
 

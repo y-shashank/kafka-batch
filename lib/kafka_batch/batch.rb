@@ -143,9 +143,10 @@ module KafkaBatch
 
     # Push many jobs (same worker class) into this open batch in one call.
     # total_jobs is grown by payloads.size with a single atomic store write, then
-    # ALL jobs are produced in one produce_many_sync call so librdkafka can
-    # pipeline them into one (or a few) Kafka MessageSets. This is the equivalent
-    # of Sidekiq's push_bulk: one broker round-trip instead of N.
+    # jobs are produced in sequential produce_many_sync chunks so librdkafka can
+    # pipeline each chunk into one (or a few) Kafka MessageSets. This is the
+    # equivalent of Sidekiq's push_bulk: one broker round-trip per chunk instead
+    # of N per-message round-trips.
     #
     #   batch.push_many(ProcessUserWorker, users.map { |u| { "user_id" => u.id } })
     #
@@ -189,29 +190,10 @@ module KafkaBatch
         msg
       end
 
-      produced = 0
       begin
-        messages.each do |msg|
-          KafkaBatch::Producer.produce_sync(**msg)
-          produced += 1
-        end
-      rescue StandardError
-        # produce_sync is per-message; only roll back slots that never reached Kafka.
-        entries.drop(produced).each do |payload, job_id|
-          self.class.release_uniq!(worker_class, payload, job_id: job_id)
-        end
-        unproduced = entries.size - produced
-        if unproduced.positive?
-          begin
-            KafkaBatch.store.add_jobs(@id, -unproduced)
-          rescue StandardError => rollback_err
-            KafkaBatch.logger.error(
-              "[KafkaBatch][Batch] push_many rollback failed for batch_id=#{@id}: " \
-              "#{rollback_err.message}. Leaving total_jobs unchanged — jobs already " \
-              "on Kafka will still complete."
-            )
-          end
-        end
+        self.class.produce_in_chunks!(messages)
+      rescue KafkaBatch::PartialProduceError => e
+        rollback_unproduced_jobs!(entries, e.produced_count || 0, worker_class)
         raise
       end
 
@@ -289,13 +271,11 @@ module KafkaBatch
           message.merge("batch_seq" => next_batch_seq!)
         end
         self.class.schedule_messages(messages, run_at: run_at, batch_id: @id)
+      rescue KafkaBatch::PartialProduceError => e
+        rollback_unproduced_batch_messages!(entries, e.produced_count || 0, worker_class)
+        raise
       rescue StandardError
-        entries.each do |message|
-          self.class.release_uniq!(
-            worker_class, message["payload"] || {}, job_id: message["job_id"]
-          )
-        end
-        KafkaBatch.store.add_jobs(@id, -entries.size) rescue nil
+        rollback_unproduced_batch_messages!(entries, 0, worker_class)
         raise
       end
 
@@ -396,10 +376,11 @@ module KafkaBatch
 
       begin
         schedule_messages(messages, run_at: run_at, batch_id: nil)
+      rescue KafkaBatch::PartialProduceError => e
+        release_unproduced_message_locks!(messages, e.produced_count || 0, worker_class)
+        raise
       rescue StandardError
-        messages.each do |message|
-          release_uniq!(worker_class, message["payload"] || {}, job_id: message["job_id"])
-        end
+        release_unproduced_message_locks!(messages, 0, worker_class)
         raise
       end
       job_ids
@@ -478,11 +459,14 @@ module KafkaBatch
       message["job_id"]
     end
 
-    # Bulk variant of #schedule_message: produce ALL payloads to the scheduled
-    # topic in ONE produce_many_sync call (one broker round-trip, like push_bulk),
-    # then bulk-write all pointers in one store call. All jobs share +run_at+.
+    # Bulk variant of #schedule_message: produce payloads to the scheduled topic
+    # in sequential produce_many_sync chunks, then bulk-write pointers per chunk.
+    # All jobs share +run_at+. On partial failure the delivered prefix is indexed
+    # before raising so scheduled jobs are not orphaned on the topic.
     # @param messages [Array<Hash>] built job messages (each has "job_id")
     # @return [Array<String>] job ids, in order
+    # @raise [KafkaBatch::PartialProduceError] when produce fails mid-batch;
+    #   +produced_count+ reflects the gap-free prefix that was indexed
     def self.schedule_messages(messages, run_at:, batch_id:)
       store = KafkaBatch.schedule_store
       raise ConfigurationError, "schedule_store is not available" unless store
@@ -491,24 +475,103 @@ module KafkaBatch
       produce_msgs = messages.map do |m|
         { topic: KafkaBatch.config.scheduled_topic, payload: m, key: m["job_id"] }
       end
-      reports = KafkaBatch::Producer.produce_many_sync(produce_msgs)
 
-      unless reports.is_a?(Array) && reports.size == messages.size
-        raise KafkaBatch::ProducerError,
-          "scheduled bulk produce returned #{reports.inspect} (expected #{messages.size} delivery results)"
-      end
+      produced_total = 0
+      chunk_size     = push_many_chunk_size
 
-      entries = messages.each_with_index.map do |m, i|
-        partition, offset = delivery_coords(reports[i])
-        { job_id: m["job_id"], run_at: run_at, partition: partition, offset: offset, batch_id: batch_id }
+      produce_msgs.each_slice(chunk_size) do |chunk|
+        reports = KafkaBatch::Producer.produce_many_sync(chunk)
+        unless reports.is_a?(Array) && reports.size == chunk.size
+          raise KafkaBatch::ProducerError,
+            "scheduled bulk produce returned #{reports.inspect} (expected #{chunk.size} delivery results)"
+        end
+
+        entries = build_schedule_entries(chunk, reports, run_at: run_at, batch_id: batch_id)
+        begin
+          store.schedule_many(entries)
+        rescue StandardError => e
+          raise KafkaBatch::PartialProduceError.new(
+            "schedule index write failed: #{e.message}",
+            dispatched:     [],
+            produced_count: produced_total
+          )
+        end
+        produced_total += chunk.size
+      rescue KafkaBatch::PartialProduceError => e
+        delivered = KafkaBatch::Producer.prefix_delivered_count(e.dispatched)
+        if delivered.positive?
+          prefix_chunk   = chunk.first(delivered)
+          prefix_reports = e.dispatched.first(delivered)
+          store.schedule_many(
+            build_schedule_entries(prefix_chunk, prefix_reports, run_at: run_at, batch_id: batch_id)
+          )
+          produced_total += delivered
+        end
+        raise KafkaBatch::PartialProduceError.new(
+          e.message,
+          dispatched:     e.dispatched,
+          produced_count: produced_total
+        )
       end
-      store.schedule_many(entries)
 
       KafkaBatch::Instrumentation.scheduled_enqueued_bulk(
-        count: messages.size, batch_id: batch_id,
+        count: produced_total, batch_id: batch_id,
         worker_class: messages.first["worker_class"], run_at: run_at
       )
       messages.map { |m| m["job_id"] }
+    end
+
+    # Produce Kafka messages in sequential chunks via produce_many_sync.
+    # Preserves gap-free prefix semantics: on failure, indices 0..(n-1) are on
+    # Kafka and indices n.. are not.
+    #
+    # @return [Integer] number of messages successfully delivered
+    # @raise [KafkaBatch::PartialProduceError] +produced_count+ is the delivered prefix
+    def self.produce_in_chunks!(messages)
+      return 0 if messages.nil? || messages.empty?
+
+      produced_total = 0
+      chunk_size     = push_many_chunk_size
+
+      messages.each_slice(chunk_size) do |chunk|
+        KafkaBatch::Producer.produce_many_sync(chunk)
+        produced_total += chunk.size
+      rescue KafkaBatch::PartialProduceError => e
+        delivered = KafkaBatch::Producer.prefix_delivered_count(e.dispatched)
+        produced_total += delivered
+        raise KafkaBatch::PartialProduceError.new(
+          e.message,
+          dispatched:     e.dispatched,
+          produced_count: produced_total
+        )
+      end
+
+      produced_total
+    end
+
+    def self.push_many_chunk_size
+      size = KafkaBatch.config.push_many_chunk_size.to_i
+      size < 1 ? 500 : size
+    end
+
+    def self.build_schedule_entries(chunk, reports, run_at:, batch_id:)
+      chunk.each_with_index.map do |msg_hash, i|
+        payload = msg_hash[:payload]
+        partition, offset = delivery_coords(reports[i])
+        {
+          job_id:    payload["job_id"],
+          run_at:    run_at,
+          partition: partition,
+          offset:    offset,
+          batch_id:  batch_id
+        }
+      end
+    end
+
+    def self.release_unproduced_message_locks!(messages, produced_count, worker_class)
+      messages.drop(produced_count.to_i).each do |message|
+        release_uniq!(worker_class, message["payload"] || {}, job_id: message["job_id"])
+      end
     end
 
     # Extract (partition, offset) from a WaterDrop/rdkafka delivery result.
@@ -636,6 +699,46 @@ module KafkaBatch
       @seq_cursor += 1
       seq
     end
+
+    def rollback_unproduced_jobs!(entries, produced_count, worker_class)
+      produced   = produced_count.to_i
+      unproduced = entries.size - produced
+      return if unproduced <= 0
+
+      entries.drop(produced).each do |payload, job_id|
+        self.class.release_uniq!(worker_class, payload, job_id: job_id)
+      end
+
+      begin
+        KafkaBatch.store.add_jobs(@id, -unproduced)
+      rescue StandardError => rollback_err
+        KafkaBatch.logger.error(
+          "[KafkaBatch][Batch] push_many rollback failed for batch_id=#{@id}: " \
+          "#{rollback_err.message}. Leaving total_jobs unchanged — jobs already " \
+          "on Kafka will still complete."
+        )
+      end
+    end
+
+    def rollback_unproduced_batch_messages!(entries, produced_count, worker_class)
+      produced   = produced_count.to_i
+      unproduced = entries.size - produced
+
+      self.class.release_unproduced_message_locks!(entries, produced, worker_class)
+      return if unproduced <= 0
+
+      begin
+        KafkaBatch.store.add_jobs(@id, -unproduced)
+      rescue StandardError => rollback_err
+        KafkaBatch.logger.error(
+          "[KafkaBatch][Batch] push_many_at rollback failed for batch_id=#{@id}: " \
+          "#{rollback_err.message}. Leaving total_jobs unchanged — scheduled jobs " \
+          "already indexed will still complete."
+        )
+      end
+    end
+
+    private :rollback_unproduced_jobs!, :rollback_unproduced_batch_messages!
 
     def parse_add_jobs_result(result)
       case result

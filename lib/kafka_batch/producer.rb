@@ -21,17 +21,9 @@ module KafkaBatch
       # @param partition [Integer, nil]  explicit partition number; skips key-hash when set
       # @param headers   [Hash]          optional Kafka headers
       def produce_sync(topic:, payload:, key: nil, partition: nil, headers: {})
-        msg = {
-          topic:   topic,
-          payload: encode(payload),
-          headers: headers
-        }
-        # Explicit partition takes precedence; when set, no key is needed.
-        if partition
-          msg[:partition] = partition
-        else
-          msg[:key] = key&.to_s
-        end
+        msg = encode_message(
+          topic: topic, payload: payload, key: key, partition: partition, headers: headers
+        )
         instance.produce_sync(**msg)
       rescue WaterDrop::Errors::BaseError, Rdkafka::RdkafkaError => e
         raise KafkaBatch::ProducerError, "Kafka produce failed: #{e.message}"
@@ -48,23 +40,36 @@ module KafkaBatch
       # @param messages [Array<Hash>] each with keys: :topic, :payload,
       #                              :key (opt), :partition (opt), :headers (opt)
       #   When :partition is set, :key is ignored for that message.
+      # @return [Array<Rdkafka::Producer::DeliveryHandle>]
+      # @raise [KafkaBatch::PartialProduceError] on partial bulk failure
       def produce_many_sync(messages)
-        encoded = messages.map do |m|
-          msg = {
-            topic:   m[:topic],
-            payload: encode(m[:payload]),
-            headers: m[:headers] || {}
-          }
-          if m.key?(:partition) && !m[:partition].nil?
-            msg[:partition] = m[:partition]
-          else
-            msg[:key] = m[:key]&.to_s
-          end
-          msg
-        end
+        encoded = encode_messages(messages)
         instance.produce_many_sync(encoded)
+      rescue WaterDrop::Errors::ProduceManyError => e
+        raise KafkaBatch::PartialProduceError.new(
+          "Kafka bulk produce failed: #{e.message}",
+          dispatched: e.dispatched
+        )
       rescue WaterDrop::Errors::BaseError, Rdkafka::RdkafkaError => e
         raise KafkaBatch::ProducerError, "Kafka produce failed: #{e.message}"
+      end
+
+      # Count consecutive successfully delivered messages from the start of
+      # +handles+ (WaterDrop delivery handles in enqueue order). Stops at the
+      # first handle whose delivery report indicates failure.
+      def prefix_delivered_count(handles)
+        return 0 if handles.nil? || handles.empty?
+
+        count = 0
+        handles.each do |handle|
+          report = handle.respond_to?(:create_result) ? handle.create_result : handle
+          break unless delivery_report_ok?(report)
+
+          count += 1
+        rescue StandardError
+          break
+        end
+        count
       end
 
       # Close and reset the producer (e.g. in tests or after fork).
@@ -76,6 +81,36 @@ module KafkaBatch
       end
 
       private
+
+      def encode_messages(messages)
+        messages.map { |m| encode_message(**m) }
+      end
+
+      def encode_message(topic:, payload:, key: nil, partition: nil, headers: {})
+        msg = {
+          topic:   topic,
+          payload: encode(payload),
+          headers: headers || {}
+        }
+        if !partition.nil?
+          msg[:partition] = partition
+        else
+          msg[:key] = key&.to_s
+        end
+        msg
+      end
+
+      def delivery_report_ok?(report)
+        return false unless report
+
+        if report.respond_to?(:error)
+          err = report.error
+          return false if err && err.respond_to?(:null?) && !err.null?
+          return false if err && !err.respond_to?(:null?)
+        end
+
+        report.respond_to?(:partition) && report.respond_to?(:offset)
+      end
 
       def build
         cfg = KafkaBatch.config
