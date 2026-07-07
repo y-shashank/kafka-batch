@@ -50,10 +50,30 @@ module KafkaBatch
       # Pass +fp+ (_uniq_fp from the job message) when available.
       def release_by_name(worker_class_name, payload, job_id:, fp: nil)
         return unless KafkaBatch.config.uniq_enabled
-        return if worker_class_name.nil? || worker_class_name.to_s.empty?
 
-        key = redis_key_from_fp(fp) || redis_key_for_name(worker_class_name.to_s, payload)
-        safe_release(key, job_id)
+        name = worker_class_name.to_s
+        return if name.empty?
+
+        # Fast path: new messages carry the fingerprint on the wire. Reconstruct
+        # the exact key and release in a single round-trip — no class resolution,
+        # no hashing. This is the steady-state path for every uniq job.
+        if (key = redis_key_from_fp(fp))
+          safe_release(key, job_id)
+          return
+        end
+
+        # No fp on the message → either a non-uniq worker (nothing was ever
+        # locked, so skip Redis entirely — an efficiency win over the old
+        # unconditional release) or a job enqueued before _uniq_fp existed. Only
+        # touch Redis when the worker actually opts into uniqueness.
+        return unless uniq_worker?(name)
+
+        safe_release(redis_key_for_name(name, payload), job_id)
+        # Rolling-upgrade safety: also clear the legacy 64-bit (8-byte) key so a
+        # lock claimed by a pre-128-bit version is never orphaned until its TTL.
+        if (legacy = legacy_redis_key_for_name(name, payload))
+          safe_release(legacy, job_id)
+        end
       end
 
       # @return [String] 16 raw bytes (128-bit digest, not hex)
@@ -64,6 +84,7 @@ module KafkaBatch
       def reset!
         @pool&.shutdown(&:close) rescue nil
         @pool = nil
+        @uniq_worker_cache = nil
       end
 
       # @return [String] 32-char hex digest (for _uniq_fp on job messages)
@@ -94,6 +115,44 @@ module KafkaBatch
 
       def redis_key_for_name(name, payload)
         "#{KEY_PREFIX}#{fingerprint(name, payload)}"
+      end
+
+      # Legacy pre-v0.2.2 lock key: single 64-bit XXHash64 packed as 8 raw bytes.
+      # Only used on the fp-less release path to reclaim locks written by an older
+      # version during a rolling upgrade. Returns nil on any hashing error.
+      def legacy_redis_key_for_name(name, payload)
+        material = "#{name}\0#{canonical_payload(payload)}"
+        bin = [XXhash.xxh64(material) & 0xFFFF_FFFF_FFFF_FFFF].pack("Q")
+        "#{KEY_PREFIX}#{bin}"
+      rescue StandardError
+        nil
+      end
+
+      # Whether a worker class opts into uniqueness, memoized per class name so the
+      # fp-less release path never repeats a const lookup. Lock-free on hit (a
+      # bounded set of worker classes); only synchronizes to fill a cold entry.
+      def uniq_worker?(name)
+        cache  = uniq_worker_cache
+        cached = cache[name]
+        return cached unless cached.nil? # false is a valid cached value
+
+        klass = begin
+          Object.const_get(name)
+        rescue NameError
+          nil
+        end
+        result = !!(klass.is_a?(Class) && klass.include?(Worker) &&
+                    klass.respond_to?(:uniq?) && klass.uniq?)
+        uniq_worker_cache_mutex.synchronize { cache[name] = result }
+        result
+      end
+
+      def uniq_worker_cache
+        @uniq_worker_cache ||= {}
+      end
+
+      def uniq_worker_cache_mutex
+        @uniq_worker_cache_mutex ||= Mutex.new
       end
 
       def redis_key_from_fp(fp_hex)

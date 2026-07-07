@@ -353,9 +353,15 @@ module KafkaBatch
       # per-event Lua (atomic dedup + increment + finalize) but pipelines all the
       # events in one network round-trip. Each event is still exactly-once via
       # batch_seq bitmap (O(1) per event), so nothing is double-counted.
-      # @return [Array<Hash>] { batch:, outcome: } for batches that just finished
+      #
+      # @return [Hash]
+      #   :finished [Array<Hash>] { batch:, outcome: } for batches that just finished
+      #   :replays  [Array<String>] batch_ids whose events were DEDUPED (Lua
+      #     returned 'duplicate') — the only batches that can be already-finalized
+      #     with an undispatched callback on a redelivery. In steady state (first
+      #     delivery) this is empty, so the EventConsumer does zero extra reads.
       def record_completions_batch(events)
-        return [] if events.empty?
+        return { finished: [], replays: [] } if events.empty?
         now = Time.now.iso8601
 
         now_float = Time.now.to_f.to_s
@@ -373,26 +379,36 @@ module KafkaBatch
           end
         end
 
-        # #29 fix: collect (result, index) pairs for batches that just finalized,
-        # then pipeline all their HGETALL calls in ONE round-trip instead of
-        # calling find_batch (one HGETALL each) sequentially inside the loop.
-        finalized_indices = results.each_with_index.select { |(res, _)| res[0] == 1 }
-
-        if finalized_indices.empty?
-          return []
+        # One pass over the results: code 1 = just finalized (needs a callback),
+        # code 0 + 'duplicate' = replayed event (candidate for inline callback
+        # re-fire). code 2 = still counting → nothing to do.
+        finalized_indices = []
+        replays           = []
+        results.each_with_index do |res, i|
+          case res[0]
+          when 1 then finalized_indices << i
+          when 0 then replays << events[i][:batch_id] if res[1] == "duplicate"
+          end
         end
+        replays.uniq!
 
+        return { finished: [], replays: replays } if finalized_indices.empty?
+
+        # #29 fix: pipeline all finalized-batch HGETALLs in ONE round-trip instead
+        # of calling find_batch (one HGETALL each) sequentially inside the loop.
         batch_hashes = with_redis do |r|
           r.pipelined do |pipe|
-            finalized_indices.each { |(_, i)| pipe.hgetall(batch_key(events[i][:batch_id])) }
+            finalized_indices.each { |i| pipe.hgetall(batch_key(events[i][:batch_id])) }
           end
         end
 
-        finalized_indices.each_with_index.map do |(res, _i), j|
-          _code, payload = res
+        finished = finalized_indices.each_with_index.map do |idx, j|
+          _code, payload = results[idx]
           h = batch_hashes[j]
           { batch: (h && !h.empty? ? hash_to_batch(h) : nil), outcome: payload }
         end.compact
+
+        { finished: finished, replays: replays }
       end
 
       def add_jobs(id, count)

@@ -142,17 +142,18 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
         { batch_id: id, job_id: "j1", batch_seq: 1, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success" }, # dup
         { batch_id: id, job_id: "j2", batch_seq: 2, source_topic: "wt", source_partition: 0, source_offset: 2, status: "failed" }
       ]
-      finalized = store.record_completions_batch(events)
+      result = store.record_completions_batch(events)
 
       b = store.find_batch(id)
       expect(b[:completed_count]).to eq(1)  # dup batch_seq counted once
       expect(b[:failed_count]).to eq(1)
-      expect(finalized.size).to eq(1)
-      expect(finalized.first[:outcome]).to eq("complete")
+      expect(result[:finished].size).to eq(1)
+      expect(result[:finished].first[:outcome]).to eq("complete")
+      expect(result[:replays]).to include(id)  # the duplicate event surfaced as a replay
     end
 
     it "is a no-op for an empty list" do
-      expect(store.record_completions_batch([])).to eq([])
+      expect(store.record_completions_batch([])).to eq(finished: [], replays: [])
     end
   end
 

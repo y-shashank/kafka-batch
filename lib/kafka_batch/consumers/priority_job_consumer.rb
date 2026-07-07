@@ -19,7 +19,14 @@ module KafkaBatch
         end
       end
 
-      def consume
+      # NOTE: we override #process_messages, NOT #consume. #consume is wrapped by
+      # the prepended ConsumptionGate (liveness heartbeat + /lag pause), and
+      # JobConsumer#consume calls #process_messages. Overriding here keeps priority
+      # consumers flowing through the gate, so:
+      #   - pausing a priority topic (e.g. p0) via /lag actually stops it, and
+      #   - a lower rank (p1) whose higher topic is /lag-paused is NOT blocked by
+      #     it (active_higher_topics excludes paused topics) and keeps processing.
+      def process_messages
         spec = self.class.priority_spec
         rank = spec[:rank].to_i
 
@@ -27,7 +34,10 @@ module KafkaBatch
         # poll batch (Karafka may deliver many messages per consume call).
         messages.each do |message|
           if rank.positive? && should_yield_to_higher?(spec)
-            yield_for_priority(spec)
+            # Seek back to THIS (unprocessed) message — never messages.first,
+            # which would redeliver and re-run messages already committed earlier
+            # in this same batch.
+            yield_for_priority(spec, message)
             return
           end
           process_message(message)
@@ -56,7 +66,7 @@ module KafkaBatch
         end
       end
 
-      def yield_for_priority(spec)
+      def yield_for_priority(spec, message = nil)
         pause_ms = (KafkaBatch.config.priority_lag_check_interval * 1_000).to_i
         higher   = spec[:higher_topics]
 
@@ -75,7 +85,16 @@ module KafkaBatch
           higher_topics:  higher
         )
         # Karafka::BaseConsumer#pause(offset, timeout_ms) — NOT pause(timeout_ms).
-        seek = messages.empty? ? :consecutive : messages.first.offset
+        # Seek to the message we're yielding on (still uncommitted); fall back to
+        # the batch head only when no message was supplied.
+        seek =
+          if message
+            message.offset
+          elsif messages.empty?
+            :consecutive
+          else
+            messages.first.offset
+          end
         pause(seek, pause_ms)
       end
     end

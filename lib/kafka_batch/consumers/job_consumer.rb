@@ -31,6 +31,14 @@ module KafkaBatch
       WORKER_CACHE_MUTEX = Mutex.new
 
       def consume
+        process_messages
+      end
+
+      # Overridable batch-processing hook. Kept separate from #consume so the
+      # prepended ConsumptionGate (heartbeat + /lag pause) always wraps the work:
+      # subclasses (e.g. PriorityJobConsumer) override THIS, not #consume, so they
+      # can never bypass the gate by forgetting to call `super`.
+      def process_messages
         messages.each { |msg| process_message(msg) }
       end
 

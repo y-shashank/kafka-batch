@@ -43,7 +43,10 @@ module KafkaBatch
       #
       # @param events [Array<Hash>] each: { batch_id:, job_id:, batch_seq:,
       #   source_topic:, source_partition:, source_offset:, status: }
-      # @return [Array<Hash>] batches that JUST finalized: { batch:, outcome: }
+      # @return [Hash] { finished: [{ batch:, outcome: }], replays: [batch_id, …] }
+      #   :finished — batches that JUST finalized (fire their callback now)
+      #   :replays  — batch_ids whose events were deduped on redelivery (candidates
+      #               for an inline callback re-fire; empty on first delivery)
       def record_completions_batch(events)
         raise NotImplementedError, "#{self.class}#record_completions_batch"
       end

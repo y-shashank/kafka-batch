@@ -95,5 +95,47 @@ RSpec.describe KafkaBatch::Consumers::PriorityJobConsumer do
       expect(inst).to receive(:process_message).with(msg)
       inst.consume
     end
+
+    # R1: a priority consumer must flow through the prepended ConsumptionGate, so
+    # pausing ITS OWN topic via /lag actually stops it (regression guard: the
+    # per-message loop must live in #process_messages, not override #consume).
+    it "honors its own /lag pause (does not bypass the ConsumptionGate)" do
+      inst  = build_consumer(klass)
+      msg   = instance_double("Karafka::Messages::Message", offset: 7)
+      group = instance_double("Karafka::Routing::ConsumerGroup", id: spec[:consumer_group])
+      topic = instance_double("Karafka::Routing::Topic", name: spec[:topic], consumer_group: group)
+      allow(inst).to receive(:messages).and_return([msg])
+      allow(inst).to receive(:topic).and_return(topic)
+      allow(inst).to receive(:partition).and_return(0)
+      allow(KafkaBatch::Liveness).to receive(:heartbeat)
+      allow(KafkaBatch::ConsumptionControl).to receive(:available?).and_return(true)
+      allow(KafkaBatch::ConsumptionControl).to receive(:paused?)
+        .with(group: spec[:consumer_group], topic: spec[:topic], partition: 0).and_return(true)
+
+      expect(inst).to receive(:pause)          # gate pauses this consumer
+      expect(inst).not_to receive(:process_message)  # …and nothing is processed
+      inst.consume
+    end
+  end
+
+  # R2: yielding mid-batch must seek to the message being yielded on, never to
+  # messages.first — otherwise already-committed messages get redelivered/re-run.
+  describe "mid-batch yield offset (weighted)" do
+    let(:mode) { :weighted }
+
+    it "seeks to the current message, not the batch head" do
+      inst = build_consumer(klass)
+      m0   = instance_double("Karafka::Messages::Message", offset: 100)
+      m1   = instance_double("Karafka::Messages::Message", offset: 101)
+      allow(inst).to receive(:messages).and_return([m0, m1])
+      # Process m0, then yield on m1.
+      allow(inst).to receive(:should_yield_to_higher?).and_return(false, true)
+      allow(KafkaBatch::Instrumentation).to receive(:consumer_priority_yielded)
+
+      expect(inst).to receive(:process_message).with(m0).ordered
+      expect(inst).not_to receive(:process_message).with(m1)
+      expect(inst).to receive(:pause).with(101, anything)  # m1.offset, NOT m0.offset
+      inst.send(:process_messages)
+    end
   end
 end

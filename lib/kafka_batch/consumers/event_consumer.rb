@@ -136,10 +136,10 @@ module KafkaBatch
       def apply(events)
         return if events.empty?
 
-        freshly_finished = KafkaBatch.store.record_completions_batch(events)
-        finished_ids     = Set.new
+        result       = KafkaBatch.store.record_completions_batch(events)
+        finished_ids = Set.new
 
-        freshly_finished.each do |f|
+        Array(result[:finished]).each do |f|
           batch = f[:batch]
           next unless batch
 
@@ -147,7 +147,10 @@ module KafkaBatch
           produce_callback_for_batch!(batch, f[:outcome])
         end
 
-        events.map { |e| e[:batch_id] }.uniq.each do |batch_id|
+        # Only DEDUPED (replayed) events can belong to a batch that was already
+        # finalized in a prior poll whose callback never dispatched. On first
+        # delivery :replays is empty, so this loop does zero extra Redis reads.
+        Array(result[:replays]).each do |batch_id|
           next if finished_ids.include?(batch_id)
 
           retry_undispatched_callback(batch_id)

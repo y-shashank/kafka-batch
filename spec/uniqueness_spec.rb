@@ -71,4 +71,31 @@ RSpec.describe KafkaBatch::Uniqueness do
       expect(described_class.claim(UniqWorker, { "id" => 42 }, job_id: "next")).to eq(true)
     end
   end
+
+  describe "release_by_name efficiency + migration (R4)" do
+    it "releases via the wire fingerprint without resolving the worker class" do
+      fp = described_class.digest_hex(UniqWorker, { "id" => 7 })
+      described_class.claim(UniqWorker, { "id" => 7 }, job_id: "owner")
+      # An unresolvable class name must still release when the fp is present.
+      described_class.release_by_name("No::Such::Worker", { "id" => 7 }, job_id: "owner", fp: fp)
+      expect(described_class.claim(UniqWorker, { "id" => 7 }, job_id: "next")).to eq(true)
+    end
+
+    it "does not touch Redis for a non-uniq worker when no fingerprint is present" do
+      expect(described_class).not_to receive(:safe_release)
+      described_class.release_by_name(SuccessfulWorker.name, { "id" => 1 }, job_id: "j1", fp: nil)
+    end
+
+    it "clears a legacy 8-byte lock on the fp-less release path (rolling upgrade)" do
+      payload    = { "id" => 55 }
+      legacy_key = described_class.send(:legacy_redis_key_for_name, UniqWorker.name, payload)
+      expect(legacy_key.bytesize).to eq(described_class::KEY_PREFIX.bytesize + 8)
+
+      r = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      r.set(legacy_key, "owner")
+
+      described_class.release_by_name(UniqWorker.name, payload, job_id: "owner", fp: nil)
+      expect(r.get(legacy_key)).to be_nil
+    end
+  end
 end
