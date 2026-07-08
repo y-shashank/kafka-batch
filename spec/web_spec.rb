@@ -473,6 +473,77 @@ RSpec.describe KafkaBatch::Web do
       expect(html).not_to match(/onsubmit="return confirm\('[^']*"><img/)
       expect(html).to include("&quot;&gt;&lt;img")
     end
+
+    it "accepts the CSRF token from the POST body (not just the query string)" do
+      id = seed
+      token = SecureRandom.hex(16)
+      env = {
+        "REQUEST_METHOD" => "POST", "PATH_INFO" => "/batches/#{id}/delete",
+        "SCRIPT_NAME" => "/kafka_batch", "QUERY_STRING" => "",
+        "HTTP_COOKIE" => "#{KafkaBatch::Web::CSRF_COOKIE}=#{token}",
+        "rack.input" => StringIO.new("_csrf=#{token}"),
+        "CONTENT_TYPE" => "application/x-www-form-urlencoded"
+      }
+      status, = KafkaBatch::Web.call(env)
+      expect(status).to eq(302)
+      expect(KafkaBatch.store.find_batch(id)).to be_nil
+    end
+
+    it "does not embed the CSRF token in form action URLs (no Referer/log leak)" do
+      id = seed
+      html = get("/batches/#{id}").last.join
+      expect(html).to include(%(name="#{KafkaBatch::Web::CSRF_FIELD}"))
+      expect(html).not_to match(/action=['"][^'"]*#{KafkaBatch::Web::CSRF_FIELD}=/)
+    end
+  end
+
+  describe "CSRF cookie hardening" do
+    it "sets SameSite=Strict and HttpOnly on the CSRF cookie" do
+      _s, headers, = get("/")
+      cookie = Array(headers["set-cookie"]).join("\n")
+      expect(cookie).to include("SameSite=Strict")
+      expect(cookie).to include("HttpOnly")
+    end
+
+    it "adds Secure only on HTTPS requests" do
+      _s, headers, = KafkaBatch::Web.call(
+        "REQUEST_METHOD" => "GET", "PATH_INFO" => "/",
+        "SCRIPT_NAME" => "/kafka_batch", "QUERY_STRING" => "",
+        "rack.url_scheme" => "https"
+      )
+      expect(Array(headers["set-cookie"]).join).to include("Secure")
+
+      _s2, h2, = get("/")
+      expect(Array(h2["set-cookie"]).join).not_to include("Secure")
+    end
+  end
+
+  describe "optional web_authenticator" do
+    it "returns 401 when the authenticator rejects the request" do
+      KafkaBatch.config.web_authenticator = ->(_env) { false }
+      status, = get("/")
+      expect(status).to eq(401)
+    end
+
+    it "serves normally when the authenticator allows the request" do
+      KafkaBatch.config.web_authenticator = ->(_env) { true }
+      status, = get("/")
+      expect(status).to eq(200)
+    end
+
+    it "denies (401) when the authenticator raises" do
+      KafkaBatch.config.web_authenticator = ->(_env) { raise "boom" }
+      status, = get("/")
+      expect(status).to eq(401)
+    end
+  end
+
+  describe "status filter validation" do
+    it "ignores an unknown status value instead of forwarding it to the store" do
+      expect(KafkaBatch.store).to receive(:list_batches)
+        .with(hash_including(status: nil)).and_return([])
+      get("/", query: "status=%27%20OR%201=1")
+    end
   end
 
   describe "POST /batches/bulk" do
@@ -534,6 +605,20 @@ RSpec.describe KafkaBatch::Web do
       expect(headers["location"]).to eq("/kafka_batch/")
       expect(KafkaBatch.store.find_batch(id)[:status]).to eq("cancelled")
     end
+
+    it "does not flip a non-running (e.g. succeeded) batch to cancelled" do
+      id = seed
+      KafkaBatch.store.update_batch_status(id, "success")
+      status, = post("/batches/#{id}/cancel")
+
+      expect(status).to eq(302)
+      expect(KafkaBatch.store.find_batch(id)[:status]).to eq("success")
+    end
+
+    it "404s when the batch does not exist" do
+      status, = post("/batches/does-not-exist/cancel")
+      expect(status).to eq(404)
+    end
   end
 
   describe "POST /batches/:id/delete" do
@@ -543,6 +628,11 @@ RSpec.describe KafkaBatch::Web do
 
       expect(status).to eq(302)
       expect(KafkaBatch.store.find_batch(id)).to be_nil
+    end
+
+    it "404s when the batch does not exist" do
+      status, = post("/batches/does-not-exist/delete")
+      expect(status).to eq(404)
     end
   end
 

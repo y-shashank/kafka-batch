@@ -615,6 +615,30 @@ Mount `KafkaBatch::Web` at `/kafka_batch`:
 
 **Reconciler** (inside `EventConsumer`, periodic): recovers stuck `running` batches and re-dispatches lost callbacks. Summary is persisted in Redis for `/reconciler`. Manual: `rake kafka_batch:reconcile`.
 
+### Securing the dashboard
+
+The dashboard exposes destructive actions (cancel/delete, pause/resume, weight edits) and config/dead-letter payloads, so it **must** sit behind authentication. Always wrap the mount in your app's auth:
+
+```ruby
+authenticate :admin do
+  mount KafkaBatch::Web => "/kafka_batch"
+end
+```
+
+Built-in defences:
+
+- **CSRF** — double-submit cookie (`SameSite=Strict`, `HttpOnly`, `Secure` on HTTPS); the token rides a hidden form field (never the URL), and comparison is constant-time.
+- **Credential masking** — the Redis URL (and other secrets) are masked wherever displayed (`/system`, `/lag`).
+- **DoS caps** — POST bodies are capped (1 MiB), bulk cancel/delete enumeration is bounded, and the weights page caps rendered tenants.
+- **Optional authenticator** (defence-in-depth, not a replacement for host auth):
+
+  ```ruby
+  config.web_authenticator = ->(env) {
+    # return truthy to allow, falsey to reject with 401
+    ActionController::HttpAuthentication::Basic.with_credentials(env) { |u, p| Rack::Utils.secure_compare(p, ENV["KB_WEB_PASS"]) && u == "admin" }
+  }
+  ```
+
 ### Pause / resume (`/lag`)
 
 Pause state is written to Redis (or MySQL when `store = :mysql`) **immediately** when you click Pause. Karafka consumers **cache** that state and re-read it at most every `consumption_control_refresh_interval` seconds (default **30**). Until the cache refreshes, jobs may still run and lag can keep falling — wait up to one interval after pausing.

@@ -14,8 +14,8 @@ module KafkaBatch
       STATS_SAMPLE_LIMIT = 500
 
       DLT_TYPES = %w[
-        job expired callback callback_error malformed_event malformed_callback
-        malformed_ingest retry_routing
+        job expired callback callback_error malformed_event incomplete_event
+        malformed_callback malformed_ingest retry_routing
       ].freeze
 
       def initialize(topic: nil, consumer: nil)

@@ -23,6 +23,13 @@ module KafkaBatch
     BULK_MAX = 100  # safety cap on batch_ids per bulk request
     BULK_ALL_MAX = 1000  # max batches per cancel_all / delete_all request
     MAX_BODY_BYTES = 1_048_576  # 1 MiB cap on POST body reads
+    WEIGHTS_MAX = 500  # max tenant rows rendered on the /weights page
+    # Bound the id-enumeration scan behind cancel_all / delete_all so a store with
+    # millions of matching batches can't be fully loaded into memory. We only need
+    # enough ids to fill one BULK_ALL_MAX page (+1 to detect that more remain).
+    FILTER_SCAN_MAX = BULK_ALL_MAX + 1
+    # Statuses the index/bulk filters accept; anything else is treated as "no filter".
+    VALID_STATUSES = %w[running success complete cancelled pending].freeze
 
     # ── CSRF (double-submit cookie pattern) ───────────────────────────────────
     # A per-session token is set as a SameSite=Strict cookie on every response and
@@ -71,24 +78,37 @@ module KafkaBatch
       path         = env["PATH_INFO"].to_s
       path         = "/" if path.empty?
       @path        = path   # remembered so layout can tailor per-page live/reload behaviour
+      @secure      = request_secure?(env)
       params       = parse_query(env["QUERY_STRING"])
+
+      # ── Optional built-in authentication ──────────────────────────────────
+      # The dashboard exposes destructive actions and configuration/dead-letter
+      # payloads, so it MUST sit behind authentication. Best practice is still to
+      # wrap the mount in the host app (`authenticate :admin do … end`). As a
+      # defence-in-depth backstop the host may also set config.web_authenticator
+      # to a callable(env) -> truthy/false; a falsey result is rejected here.
+      unless web_authenticated?(env)
+        return inject_csrf_cookie(unauthorized)
+      end
 
       # ── CSRF: resolve token from cookie (or generate a fresh one) ──────────
       request_cookies = parse_cookies(env)
       @csrf_token     = request_cookies[CSRF_COOKIE] || SecureRandom.hex(16)
 
       # Validate CSRF on every mutating POST: cookie and submitted token must
-      # both be present and equal. Absent cookie rejects cross-site forgeries.
+      # both be present and equal. Absent cookie rejects cross-site forgeries
+      # (the cookie is SameSite=Strict, so a cross-origin POST never carries it).
       #
-      # IMPORTANT: ALL destructive forms embed _csrf in the action URL's query
-      # string (not the POST body). This avoids reading rack.input, which may be
-      # already consumed and non-rewindable by upstream middleware (e.g.
-      # ActionDispatch::Request in Rails). params is always parsed from
-      # QUERY_STRING, which middleware never consumes.
+      # The submitted token is read from the POST body's hidden _csrf field
+      # first (so the secret never rides the URL and leaks via Referer/logs), and
+      # falls back to the QUERY_STRING for API clients / older forms. Body reads
+      # are rewind-safe (Rails wraps rack.input in RewindableInput) and rescue to
+      # nil, so a non-rewindable environment simply relies on the query token.
+      # The comparison is constant-time to avoid leaking the token via timing.
       if method == "POST"
         cookie_token = request_cookies[CSRF_COOKIE]
-        submitted    = params[CSRF_FIELD]
-        unless cookie_token && submitted && submitted == cookie_token
+        submitted    = body_csrf_token(env) || params[CSRF_FIELD]
+        unless cookie_token && submitted && secure_compare(submitted, cookie_token)
           return inject_csrf_cookie(csrf_forbidden)
         end
         @csrf_token = cookie_token
@@ -138,13 +158,26 @@ module KafkaBatch
           bulk_batches(env, params)
         elsif method == "POST" && (m = path.match(%r{\A/batches/([^/]+)/cancel\z}))
           # Inline cancel so web.rb works in UI-only mode (no Batch class loaded).
-          # Mirrors KafkaBatch::Batch.cancel exactly.
-          KafkaBatch.store.update_batch_status(m[1], "cancelled")
-          KafkaBatch::CancellationCache.add(m[1]) if defined?(KafkaBatch::CancellationCache)
-          redirect_to_index
+          # Mirrors KafkaBatch::Batch.cancel — but only for a batch that exists and
+          # is still running, so a stray POST can't flip a completed/succeeded
+          # batch to "cancelled" (matches the bulk cancel_all guard).
+          batch = KafkaBatch.store.find_batch(m[1])
+          if batch.nil?
+            not_found
+          else
+            if batch[:status] == "running"
+              KafkaBatch.store.update_batch_status(m[1], "cancelled")
+              KafkaBatch::CancellationCache.add(m[1]) if defined?(KafkaBatch::CancellationCache)
+            end
+            redirect_to_index(params)
+          end
         elsif method == "POST" && (m = path.match(%r{\A/batches/([^/]+)/delete\z}))
-          KafkaBatch.store.delete_batch(m[1])
-          redirect_to_index
+          if KafkaBatch.store.find_batch(m[1])
+            KafkaBatch.store.delete_batch(m[1])
+            redirect_to_index(params)
+          else
+            not_found
+          end
         else
           not_found
         end
@@ -168,17 +201,106 @@ module KafkaBatch
       @csrf_token
     end
 
+    # Hidden form field carrying the CSRF token in the POST body (preferred over
+    # the URL query string, which leaks the token via Referer headers and logs).
+    def csrf_field
+      %(<input type="hidden" name="#{CSRF_FIELD}" value="#{h(csrf_token)}">)
+    end
+
     # Stamp the CSRF cookie onto any Rack response triple.
+    #
+    # Flags:
+    #   SameSite=Strict — the browser never sends this cookie on a cross-origin
+    #     request; this is the core protection of the double-submit pattern.
+    #   HttpOnly — the token is server-rendered into forms, never read by JS, so
+    #     the cookie can be HttpOnly to keep it out of reach of injected scripts.
+    #   Secure — set on HTTPS requests so the token is never sent in clear text.
     def inject_csrf_cookie(response)
       status, headers, body = response
       headers = headers.dup
-      # SameSite=Strict: browser will not send this cookie on cross-origin requests,
-      # which is the key security property of the double-submit pattern.
       path_scope = @script_name.empty? ? "/" : "#{@script_name}/"
-      cookie = "#{CSRF_COOKIE}=#{csrf_token}; Path=#{path_scope}; SameSite=Strict"
-      existing = headers["set-cookie"].to_s
-      headers["set-cookie"] = existing.empty? ? cookie : "#{existing}\n#{cookie}"
+      attrs = ["#{CSRF_COOKIE}=#{csrf_token}", "Path=#{path_scope}", "SameSite=Strict", "HttpOnly"]
+      attrs << "Secure" if @secure
+      cookie = attrs.join("; ")
+      # Rack ≥ 2 accepts an Array of cookie strings; joining with "\n" is the
+      # widely-supported fallback for a single header value.
+      existing = headers["set-cookie"]
+      headers["set-cookie"] =
+        case existing
+        when nil, "" then cookie
+        when Array   then existing + [cookie]
+        else "#{existing}\n#{cookie}"
+        end
       [status, headers, body]
+    end
+
+    # True when the request arrived over TLS (directly or via a terminating
+    # proxy that set X-Forwarded-Proto / X-Forwarded-Ssl).
+    def request_secure?(env)
+      return true if env["HTTPS"].to_s.casecmp?("on")
+      return true if env["rack.url_scheme"].to_s.casecmp?("https")
+      return true if env["HTTP_X_FORWARDED_PROTO"].to_s.split(",").first.to_s.strip.casecmp?("https")
+      return true if env["HTTP_X_FORWARDED_SSL"].to_s.casecmp?("on")
+
+      false
+    end
+
+    # Constant-time string comparison (Rack's if available, else a manual XOR
+    # fold) so a mismatched CSRF token can't be recovered via response timing.
+    def secure_compare(a, b)
+      a = a.to_s
+      b = b.to_s
+      if defined?(Rack::Utils) && Rack::Utils.respond_to?(:secure_compare)
+        return Rack::Utils.secure_compare(a, b)
+      end
+
+      return false unless a.bytesize == b.bytesize
+
+      l = a.unpack("C*")
+      r = 0
+      b.each_byte.with_index { |byte, i| r |= byte ^ l[i] }
+      r.zero?
+    end
+
+    # Read the CSRF token from the POST body's hidden _csrf field. Rewind-safe
+    # and capped; any error (non-rewindable input, oversized body) yields nil so
+    # the caller falls back to the query-string token.
+    def body_csrf_token(env)
+      input = env["rack.input"]
+      return nil unless input
+
+      input.rewind
+      raw = input.read(MAX_BODY_BYTES + 1).to_s
+      input.rewind
+      return nil if raw.bytesize > MAX_BODY_BYTES
+
+      parsed = CGI.parse(raw)[CSRF_FIELD]
+      parsed.is_a?(Array) ? parsed.first : parsed
+    rescue StandardError
+      nil
+    end
+
+    # ── Optional authentication hook ──────────────────────────────────────────
+
+    # Evaluate config.web_authenticator (if any). A nil authenticator means the
+    # host is responsible for protecting the mount (documented behaviour). A
+    # configured callable gates every request; a truthy return authorizes it.
+    def web_authenticated?(env)
+      auth = KafkaBatch.config.respond_to?(:web_authenticator) ? KafkaBatch.config.web_authenticator : nil
+      return true if auth.nil?
+
+      !!auth.call(env)
+    rescue StandardError => e
+      KafkaBatch.logger.error("[KafkaBatch][Web] web_authenticator raised #{e.class}: #{e.message} — denying request")
+      false
+    end
+
+    def unauthorized
+      [401,
+       html_headers.merge("www-authenticate" => 'Basic realm="kafka-batch"'),
+       [layout("Unauthorized",
+         "<div class='card'><h2>401 Unauthorized</h2>" \
+         "<p>Access to this dashboard is denied.</p></div>")]]
     end
 
     def csrf_forbidden
@@ -277,13 +399,13 @@ module KafkaBatch
         ids.each { |id| KafkaBatch.store.delete_batch(id) }
       when "cancel_all"
         note = bulk_cancel_all(
-          status: form_param(body, "scope_status"),
+          status: valid_status(form_param(body, "scope_status")),
           search: form_param(body, "scope_search")
         )
         body["bulk_note"] = note if note
       when "delete_all"
         note = bulk_delete_all(
-          status: form_param(body, "scope_status"),
+          status: valid_status(form_param(body, "scope_status")),
           search: form_param(body, "scope_search")
         )
         body["bulk_note"] = note if note
@@ -545,7 +667,7 @@ module KafkaBatch
     end
 
     def render_index(params)
-      status   = non_empty(params["status"])
+      status   = valid_status(params["status"])
       search   = non_empty(params["q"])
       page     = [params["page"].to_i, 1].max
       offset   = (page - 1) * PER_PAGE
@@ -762,7 +884,7 @@ module KafkaBatch
           #{ingest_partition_lookup_widget(tenant_q)}
           <div class="card">
             <h2>Topic lag</h2>
-            <p class="muted">Could not read lag from Kafka: <code>#{h(e.message)}</code></p>
+            <p class="muted">Could not read lag from Kafka (see server logs for details).</p>
           </div>
         HTML
       end
@@ -799,7 +921,7 @@ module KafkaBatch
           tip = lag_pause_tooltip(refresh)
           case KafkaBatch::ConsumptionControl.backend
           when :redis
-            "<p class='muted'>Pause/resume uses Redis (<code>#{h(KafkaBatch.config.redis_url)}</code>). " \
+            "<p class='muted'>Pause/resume uses Redis (<code>#{h(KafkaBatch::SystemInfo.mask_redis_url(KafkaBatch.config.redis_url))}</code>). " \
             "<span title='#{h(tip)}' style='cursor:help;border-bottom:1px dotted #9ca3af'>Consumers pick up changes within ~#{refresh}s</span> " \
             "(<code>consumption_control_refresh_interval</code>).</p>"
           when :mysql
@@ -906,7 +1028,7 @@ module KafkaBatch
            lag_partitions(KafkaBatch.jobs_fair_consumer_group(type), ready_topic)]
         rescue StandardError => e
           KafkaBatch.logger.warn("[KafkaBatch::Web] fairness lag read failed: #{e.message}")
-          return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path(type), type: type)}<div class='card'><h2>#{lane_label}</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>"
+          return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path(type), type: type)}<div class='card'><h2>#{lane_label}</h2><p class='muted'>Could not read lag from Kafka (see server logs for details).</p></div>"
         end
 
       # Augment ingest rows with :group and :topic so ingest_partition_lookup_result
@@ -1016,6 +1138,12 @@ module KafkaBatch
       shares    = KafkaBatch::WeightShares.compute(tenants)
       share_by  = shares.to_h { |s| [s.tenant_id, s] }
 
+      # Cap the number of tenant rows rendered so a lane with tens of thousands
+      # of tenants can't produce an unbounded page (each row emits two forms).
+      total_tenants = tenants.size
+      truncated     = total_tenants > WEIGHTS_MAX
+      tenants       = tenants.first(WEIGHTS_MAX) if truncated
+
       tenant_rows = tenants.map do |t|
         tid    = t[:tenant_id]
         w      = t[:weight]
@@ -1037,10 +1165,9 @@ module KafkaBatch
           : "<span class='muted'>idle</span>"
         vtime_cell = vtime > 0 ? ("%.1f" % vtime) + "s" : "<span class='muted'>—</span>"
 
-        csrf_qs = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
-
         set_form = <<~FORM.gsub(/\n\s*/, "")
-          <form class="inline-form" method="POST" action="#{weights_path(type)}?#{csrf_qs}">
+          <form class="inline-form" method="POST" action="#{weights_path(type)}">
+            #{csrf_field}
             <input type="hidden" name="tenant_id" value="#{h(tid)}">
             <input type="number" name="weight" value="#{w}" step="0.1" min="0.1" class="weight-input">
             <button type="submit" class="btn btn-sm">Set</button>
@@ -1050,7 +1177,8 @@ module KafkaBatch
         reset_form =
           if custom
             <<~FORM.gsub(/\n\s*/, "")
-              <form class="inline-form" method="POST" action="#{weights_reset_path(type)}?#{csrf_qs}">
+              <form class="inline-form" method="POST" action="#{weights_reset_path(type)}">
+                #{csrf_field}
                 <input type="hidden" name="tenant_id" value="#{h(tid)}">
                 <button type="submit" class="btn btn-sm">Reset</button>
               </form>
@@ -1084,9 +1212,9 @@ module KafkaBatch
 
       tenant_rows = "<tr><td colspan='9' class='empty'>No active tenants yet. Tenants appear automatically as soon as they enqueue their first job.</td></tr>" if tenants.empty?
 
-      csrf_qs = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
       add_form = <<~FORM
-        <form class="weight-add-form" method="POST" action="#{weights_path(type)}?#{csrf_qs}">
+        <form class="weight-add-form" method="POST" action="#{weights_path(type)}">
+          #{csrf_field}
           <input type="text" name="tenant_id" placeholder="Tenant ID" required class="weight-add-id">
           <input type="number" name="weight" value="#{default_w}" step="0.1" min="0.1" class="weight-input">
           <button type="submit" class="btn">Set weight</button>
@@ -1119,7 +1247,7 @@ module KafkaBatch
         #{back}
         #{weighted_warning}
         <div class="metrics">
-          <div class="metric"><div class="metric-value">#{tenants.size}</div><div class="metric-label">Known tenants</div></div>
+          <div class="metric"><div class="metric-value">#{total_tenants}</div><div class="metric-label">Known tenants</div></div>
           <div class="metric"><div class="metric-value">#{tenants.count { |t| t[:has_custom_weight] }}</div><div class="metric-label">Custom weights</div></div>
           <div class="metric metric-info" title="Tenants with jobs currently checked out via Scheduler#checkout but not yet completed. Tracks active WFQ concurrency. Always 0 with the Kafka-native Dispatcher — only non-zero when driving the Scheduler directly with checkout/complete."><div class="metric-value">#{tenants.count { |t| t[:inflight].positive? }}</div><div class="metric-label">In-flight now ⓘ</div></div>
           <div class="metric metric-info" title="Tenants currently in the WFQ ring — they have jobs in their Scheduler ready queue awaiting checkout. Always 0 with the Kafka-native Dispatcher — only non-zero when using the Scheduler-based WFQ dispatch path."><div class="metric-value">#{tenants.count { |t| t[:queued] }}</div><div class="metric-label">Queued ⓘ</div></div>
@@ -1134,6 +1262,7 @@ module KafkaBatch
         </div>
         <div class="card">
           <h3>Tenant weights</h3>
+          #{truncated ? "<p class='muted' style='color:#b45309'>Showing the first #{WEIGHTS_MAX} of #{total_tenants} tenants. Use the search on the fairness page to look up a specific tenant.</p>" : ""}
           <p class="muted">
             Higher weight = proportionally more throughput.
             <strong>Capacity share</strong> normalizes all tenant weights to 100% — raising one tenant's weight
@@ -1252,10 +1381,10 @@ module KafkaBatch
       path = action == :pause ? "#{lag_path}/pause" : "#{lag_path}/resume"
       cls  = action == :pause ? "btn btn-sm danger-btn" : "btn btn-sm"
       tip  = h(lag_pause_tooltip(KafkaBatch.config.consumption_control_refresh_interval))
-      # #23: lag forms POST all params via query string (no body); embed the CSRF
-      # token there too so it arrives in env["QUERY_STRING"] and passes validation.
-      csrf_qs = "&#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
-      %(<form class="inline-form" method="post" action="#{path}?#{qs}#{csrf_qs}"><button type="submit" class="#{cls}" title="#{tip}">#{verb}</button></form>)
+      # #23: lag forms POST operational params (group/topic/partition) via the
+      # query string; the CSRF token rides a hidden body field so the secret never
+      # appears in the URL (Referer/log leak). body_csrf_token reads it back.
+      %(<form class="inline-form" method="post" action="#{path}?#{qs}">#{csrf_field}<button type="submit" class="#{cls}" title="#{tip}">#{verb}</button></form>)
     end
 
     def lag_pause_tooltip(refresh_seconds)
@@ -1586,14 +1715,14 @@ module KafkaBatch
     BULK_FORM_ID = "kb-bulk-form"
 
     def bulk_batch_toolbar(status:, search:, page:)
-      csrf_qs = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
       hidden  = +""
       hidden << %(<input type="hidden" form="#{BULK_FORM_ID}" name="return_status" value="#{h(status)}">) if status
       hidden << %(<input type="hidden" form="#{BULK_FORM_ID}" name="return_q" value="#{h(search)}">) if search
       hidden << %(<input type="hidden" form="#{BULK_FORM_ID}" name="return_page" value="#{page}">) if page > 1
       <<~HTML
         #{hidden}
-        <form id="#{BULK_FORM_ID}" class="bulk-toolbar" method="post" action="#{bulk_batches_path}?#{csrf_qs}">
+        <form id="#{BULK_FORM_ID}" class="bulk-toolbar" method="post" action="#{bulk_batches_path}">
+          #{csrf_field}
           <button type="submit" name="bulk_action" value="cancel" class="btn warn">Cancel selected</button>
           <button type="submit" name="bulk_action" value="delete" class="btn danger-btn">Delete selected</button>
         </form>
@@ -1601,20 +1730,21 @@ module KafkaBatch
     end
 
     def bulk_all_toolbar(status:, search:, page:)
-      csrf_qs   = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
       scope     = bulk_scope_fields(status: status, search: search, page: page)
       label     = bulk_scope_label(status: status, search: search)
       cancel_q  = js_string("Cancel all#{label}? Remaining jobs will not run.")
       delete_q  = js_string("Delete all#{label} permanently? This cannot be undone.")
       <<~HTML
         <div class="bulk-all-actions">
-          <form class="inline-form" method="post" action="#{bulk_batches_path}?#{csrf_qs}"
+          <form class="inline-form" method="post" action="#{bulk_batches_path}"
                 onsubmit="return confirm('#{cancel_q}')">
+            #{csrf_field}
             #{scope}
             <button type="submit" name="bulk_action" value="cancel_all" class="btn warn">Cancel all</button>
           </form>
-          <form class="inline-form" method="post" action="#{bulk_batches_path}?#{csrf_qs}"
+          <form class="inline-form" method="post" action="#{bulk_batches_path}"
                 onsubmit="return confirm('#{delete_q}')">
+            #{csrf_field}
             #{scope}
             <button type="submit" name="bulk_action" value="delete_all" class="btn danger-btn">Delete all</button>
           </form>
@@ -1661,14 +1791,20 @@ module KafkaBatch
     def limited_batch_ids(status:, search:)
       all = filtered_batch_ids(status: status, search: search)
       if all.size > BULK_ALL_MAX
-        note = "Processed first #{BULK_ALL_MAX} of #{all.size} matching batches; run again for the rest."
+        # We stopped scanning at FILTER_SCAN_MAX, so the true total is unknown —
+        # report it as "N+" rather than a wrong exact count.
+        total = "#{BULK_ALL_MAX}+"
+        note  = "Processed first #{BULK_ALL_MAX} of #{total} matching batches; run again for the rest."
         [all.first(BULK_ALL_MAX), note]
       else
         [all, nil]
       end
     end
 
-    # All batch ids matching the index filters (every page, not just the current one).
+    # Batch ids matching the index filters, bounded to FILTER_SCAN_MAX so a huge
+    # store can never load an unbounded id list into memory. The caller
+    # (limited_batch_ids) trims to BULK_ALL_MAX and tells the user to run again
+    # for the rest, so scanning past that cap would be wasted work anyway.
     def filtered_batch_ids(status: nil, search: nil)
       ids    = []
       offset = 0
@@ -1678,11 +1814,11 @@ module KafkaBatch
         break if page.empty?
 
         ids.concat(page.map { |b| b[:id] })
-        break if page.size < chunk
+        break if page.size < chunk || ids.size >= FILTER_SCAN_MAX
 
         offset += chunk
       end
-      ids
+      ids.first(FILTER_SCAN_MAX)
     end
 
     def js_string(text)
@@ -1762,16 +1898,13 @@ module KafkaBatch
     end
 
     def form_button(action, label, css, confirm)
-      # #23: embed CSRF token in the action URL's query string, NOT in the POST
-      # body. When this app is mounted inside Rails, middleware (e.g.
-      # ActionDispatch::Request) reads and exhausts rack.input before our handler
-      # runs, so body_params would always be empty. QUERY_STRING is never consumed
-      # by middleware, so params[CSRF_FIELD] is always readable. This matches the
-      # pattern used by lag_control_form (pause/resume), which has always worked.
-      sep = action.include?("?") ? "&" : "?"
-      action_with_csrf = "#{action}#{sep}#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
-      "<form method='post' action='#{action_with_csrf}' onsubmit=\"return confirm('#{h(confirm)}')\" style='display:inline'>" \
-      "<button type='submit' class='btn #{css}'>#{label}</button></form>"
+      # The CSRF token rides a hidden body field (csrf_field), not the URL, so it
+      # never leaks via Referer/logs. The main CSRF check reads it back with
+      # body_csrf_token (rewind-safe) and falls back to the query token for API
+      # clients. Rails wraps rack.input in RewindableInput, so the body read is
+      # reliable when mounted in Rails.
+      "<form method='post' action='#{action}' onsubmit=\"return confirm('#{h(confirm)}')\" style='display:inline'>" \
+      "#{csrf_field}<button type='submit' class='btn #{css}'>#{label}</button></form>"
     end
 
     def progress_bar(b)
@@ -2036,6 +2169,13 @@ module KafkaBatch
       v.nil? || v.empty? ? nil : v
     end
 
+    # A status filter is honoured only if it is one of the known batch statuses;
+    # anything else (typos, injection probes) is treated as "no filter".
+    def valid_status(v)
+      s = non_empty(v)
+      s if s && VALID_STATUSES.include?(s)
+    end
+
     def parse_query(qs)
       CGI.parse(qs.to_s).transform_values(&:first)
     end
@@ -2068,7 +2208,10 @@ module KafkaBatch
       return {} unless input
 
       input.rewind
-      raw = input.read
+      raw = input.read(MAX_BODY_BYTES + 1).to_s
+      input.rewind
+      return {} if raw.bytesize > MAX_BODY_BYTES
+
       parse_query(raw)
     rescue StandardError
       {}

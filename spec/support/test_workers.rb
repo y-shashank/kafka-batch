@@ -137,6 +137,31 @@ class UniqWorker
   end
 end
 
+# Raised by PoisonWorker: deliberately NOT a StandardError, so it escapes the
+# inner `rescue StandardError` and exercises the JobConsumer Exception backstop.
+class PoisonError < Exception; end
+
+class PoisonWorker
+  include KafkaBatch::Worker
+  kafka_topic "test.poison"
+
+  def perform(_payload)
+    raise PoisonError, "non-standard explosion"
+  end
+end
+
+# Dedicated worker for the real-Kafka full-pipeline integration test. Uses its
+# own topic ("test.e2e") so the end-to-end spec never shares a worker topic with
+# any other test/producer on a live broker.
+class E2EWorker
+  include KafkaBatch::Worker
+  kafka_topic "test.e2e"
+
+  def perform(payload)
+    KafkaBatchSpec::WorkerRuns.record(:e2e, payload)
+  end
+end
+
 # A plain class that is NOT a KafkaBatch::Worker (for negative validation).
 class NotAWorker
 end

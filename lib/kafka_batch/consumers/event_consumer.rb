@@ -196,11 +196,21 @@ module KafkaBatch
           return nil
         end
 
+        # An incomplete-but-parseable event (missing batch_id/job_id/status,
+        # source coordinates, or a positive batch_seq) can't be counted or
+        # deduped safely, so it is NOT applied to the batch. Previously such an
+        # event was silently skipped AND its offset committed, which meant the
+        # job's completion was never counted → the batch could hang forever with
+        # no trail. Route it to the DLT instead so the drop is visible on
+        # /dead_letter and the reconciler can recover the stuck batch.
         batch_id = data["batch_id"]
         job_id   = data["job_id"]
         status   = data["status"]
         unless batch_id && job_id && status
-          KafkaBatch.logger.warn("[KafkaBatch][EventConsumer] Malformed event – skipping: #{data.inspect}")
+          KafkaBatch.logger.error(
+            "[KafkaBatch][EventConsumer] Event missing batch_id/job_id/status – forwarding to DLT: #{data.inspect}"
+          )
+          publish_incomplete_to_dlt(data: data, reason: "missing batch_id/job_id/status", topic: message.topic)
           return nil
         end
 
@@ -208,17 +218,19 @@ module KafkaBatch
         src_partition = data["src_partition"]
         src_offset    = data["src_offset"]
         if src_topic.nil? || src_partition.nil? || src_offset.nil?
-          KafkaBatch.logger.warn(
-            "[KafkaBatch][EventConsumer] Event missing source coords – skipping: #{data.inspect}"
+          KafkaBatch.logger.error(
+            "[KafkaBatch][EventConsumer] Event missing source coordinates – forwarding to DLT: #{data.inspect}"
           )
+          publish_incomplete_to_dlt(data: data, reason: "missing source coordinates", topic: message.topic)
           return nil
         end
 
         batch_seq = data["batch_seq"]
         if batch_seq.nil? || batch_seq.to_i <= 0
-          KafkaBatch.logger.warn(
-            "[KafkaBatch][EventConsumer] Event missing batch_seq – skipping: #{data.inspect}"
+          KafkaBatch.logger.error(
+            "[KafkaBatch][EventConsumer] Event missing/invalid batch_seq – forwarding to DLT: #{data.inspect}"
           )
+          publish_incomplete_to_dlt(data: data, reason: "missing or non-positive batch_seq", topic: message.topic)
           return nil
         end
 
@@ -288,6 +300,30 @@ module KafkaBatch
         )
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error("[KafkaBatch][EventConsumer] DLT publish failed: #{e.message}")
+        raise  # leave offset uncommitted → redelivery
+      end
+
+      # DLT an event that parsed as JSON but is missing the fields required to
+      # count/dedup it. Keeps the decoded body plus a reason so the operator can
+      # see exactly why the completion couldn't be applied (and which batch is
+      # therefore at risk of hanging). Keyed by batch_id so a batch's failures
+      # co-locate on the DLT partition.
+      def publish_incomplete_to_dlt(data:, reason:, topic:)
+        KafkaBatch::Dlt.publish(
+          payload: data.merge(
+            "dlt_type"         => "incomplete_event",
+            "dlt_source_topic" => topic,
+            "dlt_reason"       => reason,
+            "dlt_at"           => Time.now.iso8601
+          ),
+          key:          data["batch_id"] || data["job_id"],
+          dlt_type:     "incomplete_event",
+          source_topic: topic,
+          batch_id:     data["batch_id"],
+          job_id:       data["job_id"]
+        )
+      rescue KafkaBatch::ProducerError => e
+        KafkaBatch.logger.error("[KafkaBatch][EventConsumer] incomplete-event DLT publish failed: #{e.message}")
         raise  # leave offset uncommitted → redelivery
       end
 

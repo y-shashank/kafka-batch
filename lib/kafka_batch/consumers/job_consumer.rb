@@ -44,7 +44,31 @@ module KafkaBatch
 
       private
 
+      # Wraps the per-message pipeline in a last-resort backstop for the ONE gap
+      # the inner pipeline can't cover: a worker (or other code) that raises a
+      # non-StandardError — SystemStackError, a custom `< Exception`, Timeout::Error
+      # on rubies where it isn't a StandardError. Without this, such an error is
+      # never rescued, the offset never commits, and Karafka redelivers the same
+      # message forever → the partition wedges. Here it is routed to the DLT and
+      # committed so the poison message can't stall the partition.
+      #
+      # Everything else is deliberately RE-RAISED so behaviour is unchanged:
+      #   * StandardError — already handled by the inner pipeline (worker errors →
+      #     retry/DLT, ProducerError → left uncommitted for redelivery, and any
+      #     unexpected bug keeps its prior redelivery behaviour). Re-raising also
+      #     avoids emitting a spurious "failed" event for a job that had already
+      #     succeeded or been scheduled for retry when a late StandardError (e.g.
+      #     a raising AS::Notifications subscriber) escaped.
+      #   * shutdown signals (SignalException/SystemExit) — Karafka is stopping.
       def process_message(message)
+        process_message!(message)
+      rescue Exception => e # rubocop:disable Lint/RescueException
+        raise if e.is_a?(StandardError) || e.is_a?(SignalException) || e.is_a?(SystemExit)
+
+        handle_unexpected_error(message, e)
+      end
+
+      def process_message!(message)
         data = begin
           decode(message.raw_payload)
         rescue ArgumentError => e
@@ -537,6 +561,50 @@ module KafkaBatch
         [payload, "#{message.topic}/#{message.partition}"]
       end
 
+      # Last-resort poison-pill handler (see #process_message). Routes an
+      # otherwise-unhandled message to the DLT and commits it. Best-effort decode
+      # so a message that failed *before* decode still lands in the DLT with its
+      # raw bytes. emit_event_with_retry / publish_to_dlt may raise ProducerError
+      # here; that propagates (offset uncommitted → redelivery), which is the
+      # correct behaviour for a transient Kafka outage.
+      def handle_unexpected_error(message, error)
+        data = decode_for_dlt(message)
+        job_id   = data["job_id"]
+        batch_id = data["batch_id"]
+
+        KafkaBatch.logger.error(
+          "[KafkaBatch][JobConsumer] UNEXPECTED #{error.class}: #{error.message} " \
+          "job_id=#{job_id} topic=#{message.topic} — routing to DLT and committing\n" \
+          "#{error.backtrace&.first(8)&.join("\n")}"
+        )
+
+        # Advance the batch (as failed) so a poison job never wedges completion —
+        # unless it was already counted early (batch_counted rides the message).
+        if batch_id && !data["batch_counted"]
+          emit_event_with_retry(
+            batch_id:     batch_id,
+            job_id:       job_id,
+            status:       "failed",
+            worker_class: data["worker_class"].to_s,
+            message:      message
+          )
+        end
+
+        record_failure(batch_id, job_id, data["worker_class"], error)
+        publish_to_dlt(data: data, error: error, topic: message.topic)
+        release_uniq_lock(data)
+        mark_as_consumed!(message)
+      end
+
+      # Best-effort decode for the poison-pill path: return the parsed envelope,
+      # or a synthetic one wrapping the raw bytes when it can't be parsed.
+      def decode_for_dlt(message)
+        decoded = decode(message.raw_payload)
+        decoded.is_a?(Hash) ? decoded : { "raw_payload" => message.raw_payload.to_s }
+      rescue StandardError
+        { "raw_payload" => message.raw_payload.to_s }
+      end
+
       def publish_to_dlt(data:, error:, topic:)
         KafkaBatch::Dlt.publish(
           payload: data.merge(
@@ -614,9 +682,25 @@ module KafkaBatch
       end
 
       def decode(raw)
-        Oj.load(raw)
+        parsed = Oj.load(raw)
+        # A tombstone (nil value) or a JSON literal like `null`/`123`/`"x"` is not
+        # a job envelope. Treat anything that is not a Hash as a poison pill so it
+        # is routed to the DLT instead of raising deeper (e.g. NoMethodError on
+        # data["job_id"]) and stalling the partition on redelivery.
+        unless parsed.is_a?(Hash)
+          raise ArgumentError, "payload is not a JSON object (got #{parsed.class})"
+        end
+
+        parsed
       rescue Oj::ParseError => e
         raise ArgumentError, "Invalid JSON payload: #{e.message}"
+      rescue ArgumentError
+        raise
+      rescue StandardError => e
+        # nil/tombstone raw_payload makes Oj.load raise TypeError, not
+        # Oj::ParseError — normalize every decode failure to the ArgumentError
+        # poison-pill path so the caller DLTs and commits it.
+        raise ArgumentError, "Undecodable payload (#{e.class}): #{e.message}"
       end
     end
   end

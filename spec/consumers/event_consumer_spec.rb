@@ -119,7 +119,7 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     expect(cb.first.payload["outcome"]).to eq("success")
   end
 
-  it "skips events missing batch_seq" do
+  it "does not count an event missing batch_seq, but forwards it to the DLT (no silent drop)" do
     id = SecureRandom.uuid
     KafkaBatch.store.create_batch(id: id, total_jobs: 1)
     msg = FakeMessage.new(topic: KafkaBatch.config.events_topic,
@@ -130,6 +130,12 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
 
     consumer.send(:process_event, msg)
     expect(KafkaBatch.store.find_batch(id)[:completed_count]).to eq(0)
+
+    dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
+    expect(dlt.size).to eq(1)
+    expect(dlt.first.payload["dlt_type"]).to eq("incomplete_event")
+    expect(dlt.first.payload["dlt_reason"]).to match(/batch_seq/)
+    expect(dlt.first.payload["batch_id"]).to eq(id)
   end
 
   it "routes malformed JSON to the DLT" do
@@ -138,20 +144,29 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     expect(FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic).first.payload["dlt_type"]).to eq("malformed_event")
   end
 
-  it "skips events with missing batch_id/status without producing anything" do
+  it "forwards an event with missing batch_id/job_id/status to the DLT" do
     msg = FakeMessage.new(topic: KafkaBatch.config.events_topic, payload: { "batch_id" => "x" })
     consumer.send(:process_event, msg)
-    expect(FakeProducer.messages).to be_empty
+
+    dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
+    expect(dlt.size).to eq(1)
+    expect(dlt.first.payload["dlt_type"]).to eq("incomplete_event")
+    expect(dlt.first.payload["dlt_reason"]).to match(/batch_id/)
   end
 
-  it "skips events missing source coordinates" do
+  it "does not count an event missing source coordinates, but forwards it to the DLT" do
     id = SecureRandom.uuid
     KafkaBatch.store.create_batch(id: id, total_jobs: 1)
     msg = FakeMessage.new(topic: KafkaBatch.config.events_topic,
-                          payload: { "batch_id" => id, "status" => "success" })
+                          payload: { "batch_id" => id, "job_id" => "j1", "status" => "success" })
 
     consumer.send(:process_event, msg)
     expect(KafkaBatch.store.find_batch(id)[:completed_count]).to eq(0)
+
+    dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
+    expect(dlt.size).to eq(1)
+    expect(dlt.first.payload["dlt_type"]).to eq("incomplete_event")
+    expect(dlt.first.payload["dlt_reason"]).to match(/source coordinates/)
   end
 
   # ── ProducerError re-raise leaves offset uncommitted ─────────────────────

@@ -419,6 +419,17 @@ module KafkaBatch
     # (requires a broker connection at startup). Disabled by default.
     attr_accessor :validate_topics_on_boot  # Boolean – default false
 
+    # ── Web dashboard ──────────────────────────────────────────────────────
+    # Optional authentication backstop for KafkaBatch::Web. A callable(env) that
+    # returns truthy to allow the request and falsey to reject it with 401. nil
+    # (default) means the host app is solely responsible for protecting the mount
+    # (e.g. `authenticate :admin do mount … end`). This is defence-in-depth, not
+    # a replacement for host-level auth. Example:
+    #   config.web_authenticator = ->(env) {
+    #     ActionController::HttpAuthentication::Basic.with_credentials(env) { |u, p| … }
+    #   }
+    attr_accessor :web_authenticator
+
     # ── Logging ──────────────────────────────────────────────────────────────
     attr_accessor :logger
 
@@ -503,6 +514,7 @@ module KafkaBatch
       @consumer_config          = {}
       @validate_topics_on_boot  = false
       @extra_job_topics         = []
+      @web_authenticator        = nil
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
 

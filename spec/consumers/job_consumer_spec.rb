@@ -207,6 +207,57 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       expect(KafkaBatchSpec::WorkerRuns.runs).to be_empty
       expect(FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic).size).to eq(1)
     end
+
+    it "forwards a nil/tombstone payload to the DLT instead of stalling the partition" do
+      msg = FakeMessage.new(topic: "test.success", payload: nil)
+      expect { consumer.send(:process_message, msg) }.not_to raise_error
+
+      expect(KafkaBatchSpec::WorkerRuns.runs).to be_empty
+      expect(FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic).size).to eq(1)
+      expect(consumer).to have_received(:mark_as_consumed!).with(msg)
+    end
+
+    it "forwards a non-object JSON literal to the DLT" do
+      msg = FakeMessage.new(topic: "test.success", payload: "12345")
+      expect { consumer.send(:process_message, msg) }.not_to raise_error
+      expect(FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic).size).to eq(1)
+    end
+  end
+
+  describe "Exception backstop (poison pill that is not a StandardError)" do
+    it "routes a non-StandardError raised by the worker to the DLT and commits the offset" do
+      msg = job_message(worker: PoisonWorker, batch_id: "b1", job_id: "poison1", topic: "test.poison")
+      expect { consumer.send(:process_message, msg) }.not_to raise_error
+
+      dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
+      expect(dlt.size).to eq(1)
+      expect(dlt.first.payload["job_id"]).to eq("poison1")
+      expect(dlt.first.payload["dlt_error_class"]).to eq("PoisonError")
+      expect(consumer).to have_received(:mark_as_consumed!).with(msg)
+    end
+
+    it "advances the batch (failed event) so a poison job never wedges completion" do
+      msg = job_message(worker: PoisonWorker, batch_id: "b1", job_id: "poison2", topic: "test.poison")
+      consumer.send(:process_message, msg)
+
+      evt = events_for("poison2").first
+      expect(evt).not_to be_nil
+      expect(evt.payload["status"]).to eq("failed")
+    end
+
+    it "re-raises shutdown signals instead of committing (offset left for redelivery)" do
+      msg = job_message(worker: SuccessfulWorker, batch_id: "b1", job_id: "sig1")
+      allow(consumer).to receive(:process_message!).and_raise(Interrupt.new("SIGINT"))
+      expect { consumer.send(:process_message, msg) }.to raise_error(Interrupt)
+      expect(FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)).to be_empty
+    end
+
+    it "re-raises ProducerError (transient Kafka) so the message redelivers, not DLT'd" do
+      msg = job_message(worker: SuccessfulWorker, batch_id: "b1", job_id: "prod1")
+      allow(consumer).to receive(:process_message!).and_raise(KafkaBatch::ProducerError.new("broker down"))
+      expect { consumer.send(:process_message, msg) }.to raise_error(KafkaBatch::ProducerError)
+      expect(FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)).to be_empty
+    end
   end
 
   describe "cancellation gate" do
