@@ -53,6 +53,30 @@ RSpec.describe KafkaBatch::Worker do
       expect(TierPinnedWorker.retry_tier).to eq(:large)
     end
 
+    describe "job_type" do
+      it "defaults to an underscored name derived from the class" do
+        expect(SuccessfulWorker.job_type).to eq("successful")
+        expect(FailingWorker.job_type).to eq("failing")
+        expect(ContextProbeWorker.job_type).to eq("context_probe")
+      end
+
+      it "allows an explicit override" do
+        klass = Class.new do
+          def self.name
+            "ExplicitJobTypeWorker"
+          end
+
+          include KafkaBatch::Worker
+          job_type "orders.process"
+        end
+        expect(klass.job_type).to eq("orders.process")
+      end
+    end
+
+    it "defaults executor to :ruby" do
+      expect(SuccessfulWorker.executor).to eq(:ruby)
+    end
+
     it "falls back to config.jobs_topic when no topic is set" do
       klass = Class.new { include KafkaBatch::Worker }
       expect(klass.kafka_topic).to eq(KafkaBatch.config.jobs_topic)

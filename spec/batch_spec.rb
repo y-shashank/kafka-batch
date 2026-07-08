@@ -16,6 +16,8 @@ RSpec.describe KafkaBatch::Batch do
       expect(produced.map { |m| m.payload["batch_id"] }.uniq).to eq([batch.id])
       expect(produced.first.payload["attempt"]).to eq(0)
       expect(produced.map { |m| m.payload["batch_seq"] }).to eq([1, 2])
+      expect(produced.first.payload["job_type"]).to eq("successful")
+      expect(produced.first.payload["worker_class"]).to eq("SuccessfulWorker")
     end
 
     it "holds the completion gate shut DURING the block, then fires on seal" do

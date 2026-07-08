@@ -2,10 +2,11 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
   let(:consumer) { build_consumer(described_class) }
 
   def job_message(worker:, batch_id:, attempt: 0, job_id: "j1", topic: nil, max_retries: nil,
-                  complete_after_retries: nil, batch_counted: false, offset: 0)
+                  complete_after_retries: nil, batch_counted: false, offset: 0, job_type: nil)
     payload = {
       "job_id"        => job_id,
       "batch_id"      => batch_id,
+      "job_type"      => job_type || worker.job_type,
       "worker_class"  => worker.name,
       "payload"       => { "x" => 1 },
       "attempt"       => attempt,
@@ -148,6 +149,16 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       retry_after = Time.parse(msg.payload["retry_after"])
       expect(retry_after).to be > Time.now
       expect(retry_after).to be < Time.now + 60  # ~30s, not minutes/hours
+    end
+  end
+
+  describe "handler registry (job_type on wire)" do
+    it "runs the worker after HandlerRegistry.reset! when job_type and worker_class are on the message" do
+      KafkaBatch::HandlerRegistry.reset!
+      consumer.send(:process_message, job_message(worker: SuccessfulWorker, batch_id: "b1", job_id: "reg1"))
+
+      expect(KafkaBatchSpec::WorkerRuns.runs.last).to include(name: :success)
+      expect(KafkaBatch::HandlerRegistry.registered?("successful")).to eq(true)
     end
   end
 

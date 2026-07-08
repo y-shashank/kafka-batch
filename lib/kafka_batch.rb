@@ -20,6 +20,9 @@ require_relative "kafka_batch/fairness/scheduler"
 require_relative "kafka_batch/fairness/tenant_partitions"
 require_relative "kafka_batch/fairness/forwarder"
 require_relative "kafka_batch/fairness/dispatcher"
+require_relative "kafka_batch/execution_context"
+require_relative "kafka_batch/executors/ruby"
+require_relative "kafka_batch/handler_registry"
 require_relative "kafka_batch/worker"
 require_relative "kafka_batch/uniqueness"
 require_relative "kafka_batch/job_expiry"
@@ -54,6 +57,9 @@ module KafkaBatch
         @workers ||= []
         @workers << klass unless @workers.include?(klass)
       end
+      return unless klass.name && !klass.name.to_s.empty?
+
+      HandlerRegistry.register_ruby(klass)
     end
 
     # All registered worker classes.
@@ -264,6 +270,7 @@ module KafkaBatch
       SchedulePoller.stop! if defined?(SchedulePoller)
       AuditLog.reset! if defined?(AuditLog)
       Metrics.reset!  if defined?(Metrics)
+      HandlerRegistry.reset! if defined?(HandlerRegistry)
     end
 
     private

@@ -75,7 +75,9 @@ RSpec.describe "Kafka round-trip (integration)", :integration do
   end
 
   # Poll a topic from the beginning until +count+ messages arrive or timeout.
-  def consume(topic, count: 1, timeout: 20)
+  # When +match+ is given, only messages for which match.call(decoded_hash) is
+  # truthy are counted — use this on shared/live topics to ignore stale records.
+  def consume(topic, count: 1, timeout: 20, match: nil)
     cfg = Rdkafka::Config.new(
       :"bootstrap.servers"  => brokers,
       :"group.id"           => "kb-itest-#{SecureRandom.hex(4)}",
@@ -89,11 +91,30 @@ RSpec.describe "Kafka round-trip (integration)", :integration do
     deadline = Time.now + timeout
     while out.size < count && Time.now < deadline
       msg = consumer.poll(1_000)
-      out << msg if msg
+      next unless msg
+
+      decoded = Oj.load(msg.payload)
+      next if match && !match.call(decoded)
+
+      out << msg
     end
     out
   ensure
     consumer&.close
+  end
+
+  def integration_worker(topic, job_type:, &perform_block)
+    worker_name = "IntegrationWorker#{SecureRandom.hex(4)}"
+    klass = Class.new do
+      define_singleton_method(:name) { worker_name }
+
+      include KafkaBatch::Worker
+      kafka_topic topic, apply_prefix: false
+      job_type job_type
+
+      define_method(:perform, &perform_block)
+    end
+    klass
   end
 
   # ── tests ────────────────────────────────────────────────────────────────
@@ -141,22 +162,27 @@ RSpec.describe "Kafka round-trip (integration)", :integration do
   end
 
   it "routes a standalone enqueue to a real topic with a decodable Worker envelope" do
-    topic = SuccessfulWorker.kafka_topic
+    topic  = unique_topic("kb.enqueue")
     create_topic!(topic)
+    worker = integration_worker(topic, job_type: "integration.enqueue") { |_payload| }
 
-    job_id = KafkaBatch::Batch.enqueue(SuccessfulWorker, { "order_id" => 7 })
+    job_id = KafkaBatch::Batch.enqueue(worker, { "order_id" => 7 })
     expect(job_id).to be_a(String)
 
-    got = consume(topic, count: 1)
+    got = consume(topic, count: 1, match: ->(env) { env["job_id"] == job_id })
     expect(got.size).to eq(1)
 
     envelope = Oj.load(got.first.payload)
-    expect(envelope["worker_class"]).to eq("SuccessfulWorker")
+    expect(envelope["job_type"]).to eq("integration.enqueue")
+    expect(envelope["worker_class"]).to eq(worker.name)
     expect(envelope["job_id"]).to eq(job_id)
     expect(envelope["payload"]).to eq({ "order_id" => 7 })
 
     # The JobConsumer's own decoder accepts the real on-wire envelope.
     consumer = build_consumer(KafkaBatch::Consumers::JobConsumer)
-    expect(consumer.send(:decode, got.first.payload)).to include("worker_class" => "SuccessfulWorker")
+    expect(consumer.send(:decode, got.first.payload)).to include(
+      "worker_class" => worker.name,
+      "job_type"     => "integration.enqueue"
+    )
   end
 end

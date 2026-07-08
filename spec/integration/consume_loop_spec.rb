@@ -99,7 +99,10 @@ RSpec.describe "Full consume loop (integration)", :integration do
   # consume path (gate + logic + store + downstream produce), and commit the
   # offset through rdkafka only when the consumer marked the message consumed.
   # Returns the number of messages the consumer committed.
-  def drive(consumer_class, topic, expect:, timeout: 30)
+  #
+  # When +batch_id+ is set, only messages belonging to that batch are processed
+  # (stale records on a reused broker are skipped but still committed).
+  def drive(consumer_class, topic, expect:, timeout: 30, batch_id: nil)
     rd = rd_consumer("kb-e2e-#{consumer_class.name.split('::').last}-#{suffix}")
     rd.subscribe(topic)
     processed = 0
@@ -108,6 +111,12 @@ RSpec.describe "Full consume loop (integration)", :integration do
     while processed < expect && Time.now < deadline
       raw = rd.poll(1_000)
       next unless raw
+
+      decoded = Oj.load(raw.payload)
+      if batch_id && decoded["batch_id"] != batch_id
+        commit(rd)
+        next
+      end
 
       consumer  = build_consumer(consumer_class)
       committed = false
@@ -132,6 +141,21 @@ RSpec.describe "Full consume loop (integration)", :integration do
     rd&.close
   end
 
+  def e2e_worker_for(topic)
+    worker_name = "E2EWorker#{suffix}"
+    Class.new do
+      define_singleton_method(:name) { worker_name }
+
+      include KafkaBatch::Worker
+      kafka_topic topic, apply_prefix: false
+      job_type "e2e"
+
+      def perform(payload)
+        KafkaBatchSpec::WorkerRuns.record(:e2e, payload)
+      end
+    end
+  end
+
   def commit(rd)
     rd.commit
   rescue Rdkafka::RdkafkaError
@@ -141,19 +165,20 @@ RSpec.describe "Full consume loop (integration)", :integration do
   # ── tests ────────────────────────────────────────────────────────────────
 
   it "completes a batch end-to-end through real Kafka: job → event → callback" do
-    worker_topic = E2EWorker.kafka_topic
+    worker_topic = "kb.e2e.worker.#{suffix}"
+    worker       = e2e_worker_for(worker_topic)
     [worker_topic, KafkaBatch.config.events_topic, KafkaBatch.config.callbacks_topic].each { |t| create_topic!(t) }
 
     batch = KafkaBatch::Batch.create(on_success: "RecordingCallback", on_complete: "RecordingCallback") do |b|
-      3.times { |i| b.push(E2EWorker, { "n" => i }) }
+      3.times { |i| b.push(worker, { "n" => i }) }
     end
 
     # Stage 1: JobConsumer runs each job and emits a success event.
-    expect(drive(KafkaBatch::Consumers::JobConsumer, worker_topic, expect: 3)).to eq(3)
+    expect(drive(KafkaBatch::Consumers::JobConsumer, worker_topic, expect: 3, batch_id: batch.id)).to eq(3)
     expect(KafkaBatchSpec::WorkerRuns.runs.count { |r| r[:name] == :e2e }).to eq(3)
 
     # Stage 2: EventConsumer counts the 3 completions and finalizes the batch.
-    drive(KafkaBatch::Consumers::EventConsumer, KafkaBatch.config.events_topic, expect: 3)
+    drive(KafkaBatch::Consumers::EventConsumer, KafkaBatch.config.events_topic, expect: 3, batch_id: batch.id)
 
     reloaded = KafkaBatch.store.find_batch(batch.id)
     expect(reloaded[:status]).to eq("success")

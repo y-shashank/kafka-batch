@@ -203,6 +203,41 @@ module KafkaBatch
         end
       end
 
+      # Stable cross-language job identifier (used on the wire as +job_type+).
+      # Defaults to an underscored name derived from the class
+      # (e.g. ProcessOrderWorker → "process_order").
+      #
+      #   job_type "orders.process"
+      #
+      # @return [String]
+      def job_type(value = :__unset__)
+        if value != :__unset__
+          @job_type = value.to_s
+          KafkaBatch::HandlerRegistry.register_ruby(self)
+        else
+          @job_type || default_job_type
+        end
+      end
+
+      def default_job_type
+        if name && !name.to_s.empty?
+          KafkaBatch::Worker.infer_job_type(name)
+        else
+          "worker_#{object_id}"
+        end
+      end
+      private :default_job_type
+
+      # Execution runtime for this handler. Phase 1 supports :ruby only.
+      # @return [Symbol]
+      def executor(runtime = :__unset__)
+        if runtime == :__unset__
+          @executor || :ruby
+        else
+          @executor = runtime.to_sym
+        end
+      end
+
       # Sidekiq-compatible hook — runs once when a job exhausts its retry budget
       # (before the message is forwarded to the DLT).
       #
@@ -249,6 +284,19 @@ module KafkaBatch
         }
       end
       private :retries_exhausted_job_summary
+    end
+
+    # @param class_name [String]
+    # @return [String]
+    def self.infer_job_type(class_name)
+      base = class_name.to_s.split("::").last
+      return "" if base.nil? || base.empty?
+
+      base = base.sub(/Worker\z/, "")
+      base.gsub(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
+          .gsub(/([a-z\d])([A-Z])/, '\1_\2')
+          .tr("-", "_")
+          .downcase
     end
 
     # Job metadata set by JobConsumer (and tests) immediately before #perform.

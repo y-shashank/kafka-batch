@@ -688,6 +688,7 @@ module KafkaBatch
       msg = {
         "job_id"                 => job_id,
         "batch_id"               => batch_id,
+        "job_type"               => worker_class.job_type,
         "worker_class"           => worker_class.name,
         "payload"                => payload,
         "attempt"                => attempt,

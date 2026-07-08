@@ -27,6 +27,8 @@ module KafkaBatch
       # KafkaBatch.config.event_emit_retries / .event_emit_backoff.
 
       # Cache of worker class name → Class to avoid repeated const_get lookups.
+      # Deprecated: prefer HandlerRegistry; kept for subclasses that override
+      # resolve_worker.
       WORKER_CACHE       = {}
       WORKER_CACHE_MUTEX = Mutex.new
 
@@ -126,14 +128,14 @@ module KafkaBatch
         # slot is released exactly once on every exit path (success, retry, DLT,
         # cancel, unknown worker).
         begin
-        # Resolve the worker class. An unknown/renamed class is a poison pill:
-        # without handling it here the ArgumentError would bubble up, the offset
+        # Resolve the handler (job_type → executor). An unknown handler is a poison
+        # pill: without handling it here the error would bubble up, the offset
         # would never commit, and Karafka would redeliver forever (blocking the
         # partition). Route it to the DLT and advance the batch so it can finish.
-        worker_class =
+        handler =
           begin
-            resolve_worker(data["worker_class"])
-          rescue ArgumentError => e
+            resolve_handler(data)
+          rescue KafkaBatch::HandlerRegistry::UnknownHandler => e
             KafkaBatch.logger.error(
               "[KafkaBatch][JobConsumer] #{e.message} – forwarding to DLT"
             )
@@ -151,6 +153,8 @@ module KafkaBatch
             return
           end
 
+        worker_class = handler.worker_class
+
         attempt        = data["attempt"].to_i
         max_retries    = data.fetch("max_retries", KafkaBatch.config.max_retries).to_i
         complete_after = data.fetch("complete_after_retries", KafkaBatch.config.complete_after_retries).to_i
@@ -159,7 +163,7 @@ module KafkaBatch
         batch_counted  = data["batch_counted"] ? true : false
 
         KafkaBatch.logger.debug(
-          "[KafkaBatch][JobConsumer] #{worker_class}#perform " \
+          "[KafkaBatch][JobConsumer] #{handler.job_type} (#{worker_class}) " \
           "job_id=#{job_id} batch_id=#{batch_id} attempt=#{attempt}"
         )
 
@@ -197,9 +201,8 @@ module KafkaBatch
           # Only job-raised errors are caught here.  A successful perform
           # that subsequently fails at event emission is handled separately.
           begin
-            worker = worker_class.new
-            worker.bind_job_context!(data, worker_class: worker_class)
-            worker.perform(payload)
+            context = KafkaBatch::ExecutionContext.new(data: data, message: message, handler: handler)
+            handler.executor.call(context)
           rescue StandardError => e
             handle_failure(
               message:                message,
@@ -662,23 +665,17 @@ module KafkaBatch
         KafkaBatch::CancellationCache.cancelled?(batch_id)
       end
 
+      def resolve_handler(data)
+        KafkaBatch::HandlerRegistry.resolve!(data)
+      end
+
       def resolve_worker(class_name)
-        # Fast path: already cached
-        cached = WORKER_CACHE_MUTEX.synchronize { WORKER_CACHE[class_name] }
-        return cached if cached
-
-        WORKER_CACHE_MUTEX.synchronize do
-          # Double-check after acquiring the lock
-          return WORKER_CACHE[class_name] if WORKER_CACHE[class_name]
-
-          klass = Object.const_get(class_name)
-          raise ArgumentError, "#{class_name} does not include KafkaBatch::Worker" \
-            unless klass.include?(KafkaBatch::Worker)
-
-          WORKER_CACHE[class_name] = klass
-        end
-      rescue NameError
-        raise ArgumentError, "Unknown worker class: #{class_name}"
+        handler = KafkaBatch::HandlerRegistry.resolve!(
+          "worker_class" => class_name, "job_type" => nil
+        )
+        handler.worker_class
+      rescue KafkaBatch::HandlerRegistry::UnknownHandler => e
+        raise ArgumentError, e.message
       end
 
       def decode(raw)
