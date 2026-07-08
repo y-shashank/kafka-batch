@@ -85,6 +85,10 @@ jobs:
           done
           echo "Kafka did not become ready in time — integration specs will skip." >&2
 
+      - name: Build Go integration sidecar
+        working-directory: go
+        run: go build -trimpath -o ../bin/kbatch-ittest ./cmd/kbatch-ittest
+
       - name: Run Go tests
         working-directory: go
         run: go test ./...

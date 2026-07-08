@@ -22,6 +22,9 @@ require_relative "support/callback_doubles"
 require_relative "support/redis_helper"
 require_relative "support/test_workers"
 
+# Integration sidecar helper (loaded lazily by go_sidecar_spec).
+require_relative "support/go_sidecar_helper"
+
 RSpec.configure do |config|
   config.expect_with(:rspec) { |c| c.syntax = :expect }
   config.disable_monkey_patching!

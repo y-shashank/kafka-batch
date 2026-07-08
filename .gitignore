@@ -10,3 +10,7 @@
 /Gemfile.lock
 .DS_Store
 .byebug_history
+
+# Go binaries built locally / in CI (not shipped via RubyGems)
+/bin/kbatch-ittest
+/bin/kbatch
