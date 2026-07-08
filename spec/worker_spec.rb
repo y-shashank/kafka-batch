@@ -100,6 +100,79 @@ RSpec.describe KafkaBatch::Worker do
         expect(klass.complete_after_retries).to eq(1)
       end
     end
+
+    describe "retries_exhausted" do
+      it "stores a class-level callback block" do
+        received = []
+        klass = Class.new do
+          include KafkaBatch::Worker
+          retries_exhausted { |job, error| received << [job, error] }
+        end
+        expect(klass.retries_exhausted).to be_a(Proc)
+
+        error = RuntimeError.new("boom")
+        job = { "job_id" => "j1" }
+        klass.retries_exhausted.call(job, error)
+        expect(received).to eq([[job, error]])
+      end
+
+      it "aliases sidekiq_retries_exhausted for Sidekiq migration" do
+        klass = Class.new do
+          include KafkaBatch::Worker
+          sidekiq_retries_exhausted { |_| }
+        end
+        expect(klass.retries_exhausted).to be_a(Proc)
+      end
+    end
+  end
+
+  describe ".run_retries_exhausted!" do
+    it "builds a job summary hash and invokes the worker block" do
+      calls = []
+      klass = Class.new do
+        include KafkaBatch::Worker
+        max_retries 3
+        retries_exhausted { |job, error| calls << [job, error] }
+      end
+
+      error = RuntimeError.new("boom")
+      data = {
+        "job_id" => "j1", "batch_id" => "b1", "payload" => { "x" => 1 },
+        "attempt" => 3, "tenant_id" => "t1"
+      }
+
+      expect(
+        KafkaBatch::Worker.run_retries_exhausted!(
+          worker_class: klass, data: data, error: error, attempt: 3
+        )
+      ).to eq(true)
+
+      job, err = calls.first
+      expect(job).to include(
+        "job_id" => "j1",
+        "batch_id" => "b1",
+        "payload" => { "x" => 1 },
+        "attempt" => 3,
+        "max_retries" => 3,
+        "worker_class" => klass.to_s,
+        "tenant_id" => "t1",
+        "error_class" => "RuntimeError",
+        "error_message" => "boom"
+      )
+      expect(err).to eq(error)
+    end
+
+    it "returns false when no callback is defined" do
+      klass = Class.new { include KafkaBatch::Worker }
+      data = { "job_id" => "j1", "payload" => {} }
+      error = RuntimeError.new("boom")
+
+      expect(
+        KafkaBatch::Worker.run_retries_exhausted!(
+          worker_class: klass, data: data, error: error
+        )
+      ).to eq(false)
+    end
   end
 
   it "registers including classes in the global registry" do

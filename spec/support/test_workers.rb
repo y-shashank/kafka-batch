@@ -35,6 +35,38 @@ class FailingWorker
   end
 end
 
+class RetriesExhaustedWorker
+  include KafkaBatch::Worker
+  kafka_topic "test.retries_exhausted"
+  max_retries 2
+
+  retries_exhausted do |job, error|
+    KafkaBatchSpec::WorkerRuns.record(
+      :retries_exhausted,
+      job:         job,
+      error_class: error.class.name
+    )
+  end
+
+  def perform(_payload)
+    raise "always fails"
+  end
+end
+
+class RetriesExhaustedRaisingWorker
+  include KafkaBatch::Worker
+  kafka_topic "test.retries_exhausted_raising"
+  max_retries 2
+
+  retries_exhausted do |_job, _error|
+    raise "callback blew up"
+  end
+
+  def perform(_payload)
+    raise "always fails"
+  end
+end
+
 # Worker that opts into the multi-tenant fair lane (ingest -> ready).
 class FairWorker
   include KafkaBatch::Worker

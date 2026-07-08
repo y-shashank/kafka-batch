@@ -202,6 +202,53 @@ module KafkaBatch
           @retry_tier = tier&.to_sym
         end
       end
+
+      # Sidekiq-compatible hook — runs once when a job exhausts its retry budget
+      # (before the message is forwarded to the DLT).
+      #
+      #   retries_exhausted do |job, error|
+      #     # job: job_id, batch_id, payload, attempt, worker_class, error_class, …
+      #   end
+      #
+      # @return [Proc, nil]
+      def retries_exhausted(&block)
+        @retries_exhausted_block = block if block
+        @retries_exhausted_block
+      end
+
+      alias sidekiq_retries_exhausted retries_exhausted
+    end
+
+    class << self
+      # Invoked by JobConsumer when a job has no retries left. Best-effort —
+      # callback errors are logged and do not block DLT publish.
+      def run_retries_exhausted!(worker_class:, data:, error:, attempt: nil)
+        block = worker_class.retries_exhausted
+        return false unless block
+
+        summary = retries_exhausted_job_summary(
+          data, error: error, attempt: attempt, worker_class: worker_class
+        )
+        block.call(summary, error)
+        true
+      end
+
+      def retries_exhausted_job_summary(data, error:, attempt:, worker_class:)
+        {
+          "job_id"        => data["job_id"],
+          "batch_id"      => data["batch_id"],
+          "worker_class"  => worker_class.to_s,
+          "payload"       => data["payload"] || {},
+          "attempt"       => attempt || data["attempt"].to_i,
+          "max_retries"   => data["max_retries"] || worker_class.max_retries,
+          "batch_counted" => data["batch_counted"] ? true : false,
+          "enqueued_at"   => data["enqueued_at"],
+          "tenant_id"     => data["tenant_id"],
+          "error_class"   => error.class.name,
+          "error_message" => error.message
+        }
+      end
+      private :retries_exhausted_job_summary
     end
 
     # Job metadata set by JobConsumer (and tests) immediately before #perform.

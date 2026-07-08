@@ -429,9 +429,30 @@ module KafkaBatch
           error:        error
         )
 
+        invoke_retries_exhausted(
+          worker_class: worker_class,
+          data:         data,
+          error:        error,
+          attempt:      attempt
+        )
+
         publish_to_dlt(data: data, error: error, topic: message.topic)
         release_uniq_lock(data)
         mark_as_consumed!(message)
+      end
+
+      def invoke_retries_exhausted(worker_class:, data:, error:, attempt:)
+        KafkaBatch::Worker.run_retries_exhausted!(
+          worker_class: worker_class,
+          data:         data,
+          error:        error,
+          attempt:      attempt
+        )
+      rescue StandardError => e
+        KafkaBatch.logger.warn(
+          "[KafkaBatch][JobConsumer] retries_exhausted callback failed for " \
+          "job_id=#{data['job_id']}: #{e.class}: #{e.message}"
+        )
       end
 
       # ── Event emission ───────────────────────────────────────────────────

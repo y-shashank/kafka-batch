@@ -172,6 +172,31 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       expect(failures.first[:job_id]).to eq("jx")
       expect(failures.first[:error_class]).to eq("RuntimeError")
     end
+
+    it "invokes the worker retries_exhausted callback before forwarding to the DLT" do
+      consumer.send(:process_message, job_message(worker: RetriesExhaustedWorker, batch_id: "b1", attempt: 2, job_id: "re1"))
+
+      run = KafkaBatchSpec::WorkerRuns.runs.find { |r| r[:name] == :retries_exhausted }
+      expect(run).not_to be_nil
+      expect(run[:payload][:job]).to include(
+        "job_id" => "re1",
+        "batch_id" => "b1",
+        "worker_class" => "RetriesExhaustedWorker",
+        "attempt" => 2,
+        "error_class" => "RuntimeError"
+      )
+      expect(run[:payload][:error_class]).to eq("RuntimeError")
+
+      dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
+      expect(dlt.first.payload["job_id"]).to eq("re1")
+    end
+
+    it "still forwards to the DLT when retries_exhausted raises" do
+      consumer.send(:process_message, job_message(worker: RetriesExhaustedRaisingWorker, batch_id: "b1", attempt: 2, job_id: "rer1"))
+
+      dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
+      expect(dlt.first.payload["job_id"]).to eq("rer1")
+    end
   end
 
   describe "malformed payload" do
