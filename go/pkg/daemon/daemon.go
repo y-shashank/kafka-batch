@@ -22,6 +22,7 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
 	"github.com/y-shashank/kafka-batch/go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
+	"github.com/y-shashank/kafka-batch/go/pkg/priority"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/schedule"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
@@ -50,6 +51,30 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		jobTopics = manifest.JobTopics(prefixOr(cfg.TopicPrefix, "") + "kafka_batch.jobs")
 	}
 	if len(jobTopics) == 0 {
+		return fmt.Errorf("no job topics configured (set jobs_topics or handler manifest)")
+	}
+
+	var prioReg priority.Registry
+	if len(cfg.PriorityConfigPaths) > 0 {
+		var err error
+		prioReg, err = priority.LoadRegistry(cfg.PriorityConfigPaths, cfg, cfg.JobsTopics)
+		if err != nil {
+			return fmt.Errorf("priority config: %w", err)
+		}
+		reserved := map[string]struct{}{}
+		for _, t := range prioReg.AllTopics() {
+			reserved[t] = struct{}{}
+		}
+		filtered := make([]string, 0, len(jobTopics))
+		for _, t := range jobTopics {
+			if _, skip := reserved[t]; skip {
+				continue
+			}
+			filtered = append(filtered, t)
+		}
+		jobTopics = filtered
+	}
+	if len(jobTopics) == 0 && len(prioReg.Configs) == 0 {
 		return fmt.Errorf("no job topics configured (set jobs_topics or handler manifest)")
 	}
 
@@ -103,8 +128,24 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	errCh := make(chan error, 4)
-	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-jobs", jobTopics, handleJob, errCh)
+	errCh := make(chan error, 8)
+	if len(jobTopics) > 0 {
+		go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-jobs", jobTopics, handleJob, errCh)
+	}
+
+	lagClient, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
+	if err != nil {
+		return fmt.Errorf("lag client: %w", err)
+	}
+	defer lagClient.Close()
+	priorityLag := priority.NewLagReader(lagClient)
+	for _, pc := range prioReg.Configs {
+		gate := priority.NewGate(priorityLag, cfg.PriorityLagCheckInterval)
+		go runPriorityGroup(ctx, cfg, pc, gate, handleJob, errCh)
+	}
+	if len(prioReg.Configs) > 0 {
+		log.Printf("kbatch priority consumers enabled groups=%d", len(prioReg.Configs))
+	}
 
 	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-events", []string{cfg.EventsTopic}, func(rec *kgo.Record) error {
 		_, err := eventProc.ProcessBatch(ctx, [][]byte{rec.Value})
@@ -159,14 +200,17 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		defaultTopic := ""
 		if len(jobTopics) > 0 {
 			defaultTopic = jobTopics[0]
+		} else if topics := prioReg.AllTopics(); len(topics) > 0 {
+			defaultTopic = topics[0]
 		}
 		poller := &schedule.Poller{
 			Cfg:      cfg,
 			Store:    schedStore,
 			Reader:   reader,
 			Producer: prod,
-			Router: schedule.ManifestRouter{
+			Router: schedule.DaemonRouter{
 				Manifest: manifest,
+				Cfg:      cfg,
 				Default:  defaultTopic,
 			},
 			Cancelled: st.BatchCancelled,
@@ -217,6 +261,69 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		return nil
 	case err := <-errCh:
 		return err
+	}
+}
+
+func runPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, errCh chan<- error) {
+	specByTopic := map[string]priority.TopicSpec{}
+	for _, s := range pc.TopicSpecs() {
+		specByTopic[s.Topic] = s
+	}
+	weightedTicks := map[string]int{}
+
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(cfg.Brokers...),
+		kgo.ConsumerGroup(pc.ConsumerGroup),
+		kgo.ConsumeTopics(pc.Topics...),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.BlockRebalanceOnPoll(),
+		kgo.AutoCommitMarks(),
+	)
+	if err != nil {
+		errCh <- err
+		return
+	}
+	defer cl.Close()
+
+	yieldSleep := cfg.PriorityLagCheckInterval
+	if yieldSleep <= 0 {
+		yieldSleep = 2 * time.Second
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		fetches := cl.PollFetches(ctx)
+		if errs := fetches.Errors(); len(errs) > 0 {
+			for _, e := range errs {
+				if e.Err != nil {
+					errCh <- e.Err
+					return
+				}
+			}
+		}
+		fetches.EachRecord(func(rec *kgo.Record) {
+			spec, ok := specByTopic[rec.Topic]
+			if !ok {
+				return
+			}
+			tick := weightedTicks[rec.Topic]
+			if yield, _ := priority.ShouldYield(spec, gate, &tick, ctx); yield {
+				weightedTicks[rec.Topic] = tick
+				time.Sleep(yieldSleep)
+				return
+			}
+			weightedTicks[rec.Topic] = tick
+			if err := handle(rec); err != nil {
+				log.Printf("[kbatch-priority] handler error topic=%s offset=%d: %v", rec.Topic, rec.Offset, err)
+				return
+			}
+			cl.MarkCommitRecords(rec)
+		})
+		cl.AllowRebalance()
 	}
 }
 

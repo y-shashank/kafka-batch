@@ -1,0 +1,7 @@
+# Example priority group for Go daemon (mirrors config/kafka_batch/priority/jobs-fast.yml)
+consumer_group_suffix: jobs-fast
+mode: weighted
+weighted_interleave: 4
+topics:
+  - kafka_batch.jobs.p0
+  - kafka_batch.jobs.p1

@@ -49,6 +49,27 @@ func init() {
 		}
 		return nil
 	})
+
+	kbatch.Register("integration.go_scheduled", func(ctx *kbatch.Context) error {
+		if marker := os.Getenv("KBATCH_DAEMON_ITEST_MARKER"); marker != "" {
+			return os.WriteFile(marker, []byte(ctx.JobID), 0o644)
+		}
+		return nil
+	})
+
+	kbatch.Register("integration.go_p0", func(ctx *kbatch.Context) error {
+		if marker := os.Getenv("KBATCH_DAEMON_ITEST_MARKER_P0"); marker != "" {
+			return os.WriteFile(marker, []byte(ctx.JobID), 0o644)
+		}
+		return nil
+	})
+
+	kbatch.Register("integration.go_p1", func(ctx *kbatch.Context) error {
+		if marker := os.Getenv("KBATCH_DAEMON_ITEST_MARKER"); marker != "" {
+			return os.WriteFile(marker, []byte(ctx.JobID), 0o644)
+		}
+		return nil
+	})
 }
 
 func main() {

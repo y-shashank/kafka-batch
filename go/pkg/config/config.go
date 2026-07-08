@@ -38,6 +38,11 @@ type Daemon struct {
 	ScheduleLeaseSeconds  int
 	ScheduleBatchSize     int
 	ScheduleReclaimEvery  time.Duration
+	SchedulePollMaxInterval time.Duration
+	SchedulePollJitter    float64
+	PriorityConfigPaths   []string
+	PriorityLagCheckInterval time.Duration
+	PriorityWeightedInterleave int
 	FairnessEnabled       bool
 	FairnessTimeIngest    string
 	FairnessTimeReady     string
@@ -74,6 +79,9 @@ func DefaultDaemon() Daemon {
 		ScheduleLeaseSeconds: 60,
 		ScheduleBatchSize:    100,
 		ScheduleReclaimEvery: 30 * time.Second,
+		SchedulePollMaxInterval: 60 * time.Second,
+		PriorityLagCheckInterval: 2 * time.Second,
+		PriorityWeightedInterleave: 4,
 		FairnessTimeIngest:   "kafka_batch.fair_time_ingest",
 		FairnessTimeReady:    "kafka_batch.fair_time_ready",
 		FairnessReadyWindow:  100,
@@ -112,6 +120,13 @@ func LoadDaemon(path string) (Daemon, error) {
 		ScheduledTopic        string        `yaml:"scheduled_topic"`
 		ScheduleLeaseSeconds  int           `yaml:"schedule_lease_seconds"`
 		ScheduleBatchSize     int           `yaml:"schedule_batch_size"`
+		SchedulePollIntervalSec float64     `yaml:"schedule_poll_interval"`
+		ScheduleReclaimIntervalSec float64  `yaml:"schedule_reclaim_interval"`
+		SchedulePollMaxIntervalSec float64  `yaml:"schedule_poll_max_interval"`
+		SchedulePollJitter    float64       `yaml:"schedule_poll_jitter"`
+		PriorityConfigPaths   []string      `yaml:"priority_config_paths"`
+		PriorityLagCheckIntervalSec float64 `yaml:"priority_lag_check_interval"`
+		PriorityWeightedInterleave int      `yaml:"priority_weighted_interleave"`
 		FairnessEnabled       bool          `yaml:"fairness_enabled"`
 		FairnessTimeIngest    string        `yaml:"fairness_time_ingest"`
 		FairnessTimeReady     string        `yaml:"fairness_time_ready"`
@@ -176,6 +191,27 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.ScheduleBatchSize > 0 {
 		cfg.ScheduleBatchSize = doc.ScheduleBatchSize
 	}
+	if doc.SchedulePollIntervalSec > 0 {
+		cfg.SchedulePollInterval = time.Duration(doc.SchedulePollIntervalSec * float64(time.Second))
+	}
+	if doc.ScheduleReclaimIntervalSec > 0 {
+		cfg.ScheduleReclaimEvery = time.Duration(doc.ScheduleReclaimIntervalSec * float64(time.Second))
+	}
+	if doc.SchedulePollMaxIntervalSec > 0 {
+		cfg.SchedulePollMaxInterval = time.Duration(doc.SchedulePollMaxIntervalSec * float64(time.Second))
+	}
+	if doc.SchedulePollJitter > 0 {
+		cfg.SchedulePollJitter = doc.SchedulePollJitter
+	}
+	if len(doc.PriorityConfigPaths) > 0 {
+		cfg.PriorityConfigPaths = doc.PriorityConfigPaths
+	}
+	if doc.PriorityLagCheckIntervalSec > 0 {
+		cfg.PriorityLagCheckInterval = time.Duration(doc.PriorityLagCheckIntervalSec * float64(time.Second))
+	}
+	if doc.PriorityWeightedInterleave > 0 {
+		cfg.PriorityWeightedInterleave = doc.PriorityWeightedInterleave
+	}
 	if doc.FairnessEnabled {
 		cfg.FairnessEnabled = true
 	}
@@ -220,6 +256,16 @@ func applyEnv(cfg *Daemon) {
 	}
 	if v := os.Getenv("KAFKA_BATCH_HANDLER_MANIFEST"); v != "" {
 		cfg.HandlerManifest = v
+	}
+	if v := os.Getenv("KAFKA_BATCH_PRIORITY_CONFIG"); v != "" {
+		cfg.PriorityConfigPaths = append(cfg.PriorityConfigPaths, strings.TrimSpace(v))
+	}
+	if v := os.Getenv("KAFKA_BATCH_PRIORITY_CONFIGS"); v != "" {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				cfg.PriorityConfigPaths = append(cfg.PriorityConfigPaths, p)
+			}
+		}
 	}
 	cfg.prefixTopics()
 }
@@ -297,6 +343,7 @@ type HandlerEntry struct {
 	Topic            string `yaml:"topic"`
 	ApplyTopicPrefix bool   `yaml:"apply_topic_prefix"`
 	MaxRetries       int    `yaml:"max_retries"`
+	FairnessType     string `yaml:"fairness_type"`
 }
 
 func LoadManifest(path, topicPrefix string) (Manifest, error) {

@@ -379,6 +379,8 @@ Phase 3 covers **plain topics** first. **Phase 3b** adds schedule poller + prior
 ```yaml
 schedule_poller_enabled: true
 scheduled_topic: kafka_batch.scheduled
+priority_config_paths:
+  - config/kafka_batch/priority/jobs-fast.yml
 
 fairness_enabled: true
 fairness_time_ingest: kafka_batch.fair_time_ingest
@@ -386,7 +388,16 @@ fairness_time_ready: kafka_batch.fair_time_ready
 fairness_ready_window: 100
 ```
 
-Phase 3b schedule poller and Phase 3c fairness enqueue/dispatcher are in progress — checkout/forwarder and priority gate are next.
+**Integration tests** (real Kafka + Redis):
+
+```bash
+cd go && go build -o ../bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
+KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_schedule_spec.rb
+KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_priority_spec.rb
+KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_fairness_spec.rb
+```
+
+Phase 3b (schedule + priority) and Phase 3c time-lane fairness are implemented in the Go daemon. Throughput fairness lane and Ruby callback invocation remain future work.
 
 ### Standalone jobs (no batch)
 

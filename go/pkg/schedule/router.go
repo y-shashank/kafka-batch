@@ -6,34 +6,70 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
 )
 
-// ManifestRouter routes scheduled jobs using handler manifest topics.
-type ManifestRouter struct {
+// Route describes where a scheduled job should be re-produced.
+type Route struct {
+	Topic     string
+	Key       string
+	Partition *int32 // nil = broker assigns by key
+}
+
+// DaemonRouter routes scheduled jobs (mirrors Batch.route_for_definition).
+type DaemonRouter struct {
 	Manifest config.Manifest
+	Cfg      config.Daemon
 	Default  string
 }
 
-func (r ManifestRouter) Route(payload map[string]interface{}) (topic, key string, err error) {
+func (r DaemonRouter) Route(payload map[string]interface{}) (Route, error) {
 	jobType, _ := payload["job_type"].(string)
-	if jobType != "" {
-		if h, ok := r.Manifest.Handlers[jobType]; ok && h.Topic != "" {
-			return h.Topic, str(payload["job_id"]), nil
-		}
-	}
+	jobID, _ := payload["job_id"].(string)
+	tenantID, _ := payload["tenant_id"].(string)
+	batchID, _ := payload["batch_id"].(string)
 	worker, _ := payload["worker_class"].(string)
-	if worker != "" {
+
+	var entry config.HandlerEntry
+	var ok bool
+	if jobType != "" {
+		entry, ok = r.Manifest.Handlers[jobType]
+	}
+	if !ok && worker != "" {
 		for jt, h := range r.Manifest.Handlers {
-			if h.Runtime == "go" && ("go:"+jt) == worker && h.Topic != "" {
-				return h.Topic, str(payload["job_id"]), nil
+			if h.Runtime == "go" && ("go:"+jt) == worker {
+				entry = h
+				ok = true
+				jobType = jt
+				break
 			}
 		}
 	}
-	if r.Default != "" {
-		return r.Default, str(payload["job_id"]), nil
+
+	if ok && entry.FairnessType != "" {
+		return r.fairRoute(entry.FairnessType, jobID, tenantID, batchID)
 	}
-	return "", "", fmt.Errorf("no route for job_type=%q worker_class=%q", jobType, worker)
+
+	if ok && entry.Topic != "" {
+		return Route{Topic: entry.Topic, Key: jobID}, nil
+	}
+	if r.Default != "" {
+		return Route{Topic: r.Default, Key: jobID}, nil
+	}
+	return Route{}, fmt.Errorf("no route for job_type=%q worker_class=%q", jobType, worker)
 }
 
-func str(v interface{}) string {
-	s, _ := v.(string)
-	return s
+func (r DaemonRouter) fairRoute(fairnessType, jobID, tenantID, batchID string) (Route, error) {
+	switch fairnessType {
+	case "time":
+		key := tenantID
+		if key == "" {
+			key = batchID
+		}
+		if key == "" {
+			key = jobID
+		}
+		return Route{Topic: r.Cfg.FairnessTimeIngest, Key: key}, nil
+	case "throughput":
+		return Route{}, fmt.Errorf("throughput fairness lane not implemented in Go daemon")
+	default:
+		return Route{}, fmt.Errorf("unknown fairness_type %q", fairnessType)
+	}
 }

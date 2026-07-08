@@ -3,9 +3,11 @@ package schedule
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -13,6 +15,7 @@ import (
 type Reader struct {
 	topic  string
 	client *kgo.Client
+	adm    *kadm.Client
 }
 
 func NewReader(brokers []string, topic string) (*Reader, error) {
@@ -24,7 +27,7 @@ func NewReader(brokers []string, topic string) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Reader{topic: topic, client: cl}, nil
+	return &Reader{topic: topic, client: cl, adm: kadm.NewClient(cl)}, nil
 }
 
 type ReadResult struct {
@@ -39,17 +42,43 @@ func (r *Reader) Read(ctx context.Context, byPartition map[int32][]int64) (ReadR
 		return out, nil
 	}
 
+	startOffs, err := r.adm.ListStartOffsets(ctx, r.topic)
+	if err != nil {
+		return out, fmt.Errorf("list start offsets: %w", err)
+	}
+	endOffs, err := r.adm.ListEndOffsets(ctx, r.topic)
+	if err != nil {
+		return out, fmt.Errorf("list end offsets: %w", err)
+	}
+
 	for partition, offsets := range byPartition {
 		if len(offsets) == 0 {
 			continue
 		}
-		want := make(map[int64]struct{}, len(offsets))
-		minOff := offsets[0]
-		for _, off := range offsets {
+		sorted := append([]int64(nil), offsets...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+		low, _ := startOffs.Lookup(r.topic, partition)
+		high, _ := endOffs.Lookup(r.topic, partition)
+
+		want := make(map[int64]struct{})
+		minOff := int64(-1)
+		for _, off := range sorted {
+			loc := BuildKey(partition, off)
+			if off < low.Offset {
+				out.Lost = append(out.Lost, loc)
+				continue
+			}
+			if off >= high.Offset {
+				continue
+			}
 			want[off] = struct{}{}
-			if off < minOff {
+			if minOff < 0 || off < minOff {
 				minOff = off
 			}
+		}
+		if len(want) == 0 {
+			continue
 		}
 
 		assign := map[string]map[int32]kgo.Offset{
@@ -58,7 +87,9 @@ func (r *Reader) Read(ctx context.Context, byPartition map[int32][]int64) (ReadR
 		r.client.AddConsumePartitions(assign)
 
 		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) && len(want) > 0 {
+		scanned := 0
+		const scanSlack = 1000
+		for time.Now().Before(deadline) && len(want) > 0 && scanned < scanSlack {
 			fetches := r.client.PollFetches(ctx)
 			if errs := fetches.Errors(); len(errs) > 0 {
 				return out, fmt.Errorf("poll scheduled topic: %v", errs[0].Err)
@@ -67,6 +98,7 @@ func (r *Reader) Read(ctx context.Context, byPartition map[int32][]int64) (ReadR
 				if rec.Topic != r.topic || rec.Partition != partition {
 					return
 				}
+				scanned++
 				if _, ok := want[rec.Offset]; ok {
 					key := BuildKey(partition, rec.Offset)
 					out.Found[key] = append([]byte(nil), rec.Value...)
