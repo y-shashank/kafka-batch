@@ -78,6 +78,13 @@ func init() {
 		}
 		return nil
 	})
+
+	kbatch.Register("integration.go_hybrid_partner", func(ctx *kbatch.Context) error {
+		if marker := os.Getenv("KBATCH_GO_HYBRID_MARKER"); marker != "" {
+			return os.WriteFile(marker, []byte(ctx.JobID), 0o644)
+		}
+		return nil
+	})
 }
 
 func main() {

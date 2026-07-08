@@ -120,6 +120,14 @@ module KafkaBatch
     end
 
     def draw_routes(builder)
+      if config.daemon_mode?
+        KafkaBatch.logger.warn(
+          "[KafkaBatch] daemon_mode enabled — skipping Karafka consumers " \
+          "(kbatch daemon owns job/event/retry/callback consumption)"
+        )
+        return
+      end
+
       load_handler_manifest!
 
       cfg          = config

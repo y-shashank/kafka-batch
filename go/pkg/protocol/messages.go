@@ -20,6 +20,7 @@ type JobMessage struct {
 	BatchCounted         bool                   `json:"batch_counted,omitempty"`
 	RetryAfter           string                 `json:"retry_after,omitempty"`
 	RetryTo              string                 `json:"retry_to,omitempty"`
+	UniqFP               string                 `json:"_uniq_fp,omitempty"`
 }
 
 // EventMessage is produced to the events topic after job completion.

@@ -72,6 +72,8 @@ module KafkaBatch
 
       handler = HandlerRegistry.send(:lookup_by_job_type, job_type)
       handler&.worker_class
+    rescue NameError => e
+      raise ArgumentError, "worker_class #{name.inspect} not found: #{e.message}"
     end
     private_class_method :resolve_manifest_worker_class
 

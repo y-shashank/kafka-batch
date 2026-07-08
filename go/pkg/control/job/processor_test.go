@@ -89,3 +89,55 @@ func TestProcessHandlerErrorSchedulesRetry(t *testing.T) {
 		t.Fatal("expected retry payload")
 	}
 }
+
+func TestProcessExpiredJobDLT(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	raw, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", JobType: "any", ValidTill: "2000-01-01T00:00:00Z",
+		Payload: map[string]interface{}{}, Attempt: 0,
+	})
+	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{},
+		Now: func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) }}
+	out, err := p.Process(context.Background(), raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.DLTPayload == nil {
+		t.Fatal("expected DLT")
+	}
+}
+
+func TestProcessRubyUnknownHandlerDLTWithoutRetry(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	raw, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", JobType: "ruby.missing", WorkerClass: "Missing",
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
+	})
+	manifest := config.Manifest{Handlers: map[string]config.HandlerEntry{
+		"ruby.missing": {Runtime: "ruby", Topic: "jobs"},
+	}}
+	p := &Processor{
+		Cfg: config.DefaultDaemon(), Manifest: manifest, Store: st, Producer: &memProducer{},
+		RubyExec: rubyStub{err: &RubyExecutionError{Class: "UnknownHandler", Message: "missing"}},
+	}
+	out, err := p.Process(context.Background(), raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.RetryPayload != nil {
+		t.Fatal("expected DLT not retry")
+	}
+	if out.DLTPayload == nil {
+		t.Fatal("expected DLT")
+	}
+}
+
+type rubyStub struct{ err error }
+
+func (r rubyStub) Execute(context.Context, protocol.JobMessage) error { return r.err }

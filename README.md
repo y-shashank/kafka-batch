@@ -397,7 +397,52 @@ KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_priority_spec.rb
 KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_fairness_spec.rb
 ```
 
-Phase 3b (schedule + priority) and Phase 3c time-lane fairness are implemented in the Go daemon. Throughput fairness lane and Ruby callback invocation remain future work.
+Phase 3b/3c (schedule, priority, fairness lanes, consumption control, Ruby callbacks) are implemented in the Go daemon.
+
+### Ruby execution from Go daemon (Phase 4)
+
+For hybrid workloads, run **`kbatch daemon`** for the control plane and a thin **Ruby worker server** for `Worker#perform`:
+
+**1. Manifest** — declare `runtime: ruby` handlers with `worker_class`:
+
+```yaml
+handlers:
+  orders.process:
+    runtime: ruby
+    worker_class: Orders::ProcessWorker
+    topic: kafka_batch.jobs
+```
+
+**2. Daemon config** (`config/kbatch_daemon.yml`):
+
+```yaml
+ruby_worker_socket: /var/run/kbatch-ruby.sock
+ruby_worker_timeout: 300
+```
+
+**3. API pods** (produce only):
+
+```ruby
+config.daemon_mode = true   # skips Karafka job consumers
+```
+
+**4. Worker pods** (Ruby `#perform` only):
+
+```bash
+KAFKA_BATCH_WORKER_SOCKET=/var/run/kbatch-ruby.sock bundle exec rake kafka_batch:worker_server
+```
+
+The daemon dispatches `runtime: go` handlers in-process and `runtime: ruby` via `POST /v1/execute` (same protocol as Phase 2 sidecar, roles reversed).
+
+**Integration tests** (real Kafka + Redis + WorkerServer):
+
+```bash
+cd go && go build -o ../bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
+KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_ruby_worker_spec.rb
+KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_hybrid_batch_spec.rb
+KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_ruby_fair_spec.rb
+KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_ruby_priority_spec.rb
+```
 
 ### Standalone jobs (no batch)
 

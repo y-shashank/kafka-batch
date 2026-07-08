@@ -420,6 +420,14 @@ module KafkaBatch
     # when set. Also via ENV KAFKA_BATCH_HANDLER_MANIFEST.
     attr_accessor :handler_manifest_path
 
+    # ── Go daemon mode (Phase 4) ─────────────────────────────────────────────
+    # When true, Karafka job/control consumers are skipped — kbatch daemon owns
+    # consumption. API pods set this; worker pods run WorkerServer instead.
+    attr_accessor :daemon_mode                 # Boolean – default false
+    # Unix socket for Ruby Worker#perform when daemon dispatches runtime:ruby jobs.
+    attr_accessor :ruby_worker_socket           # String – e.g. /var/run/kbatch-ruby.sock
+    attr_accessor :ruby_worker_timeout         # Float – default 300
+
     # ── Passthrough rdkafka config ───────────────────────────────────────────
     attr_accessor :producer_config  # Hash – merged on top of producer defaults
     attr_accessor :consumer_config  # Hash – merged on top of consumer defaults
@@ -528,6 +536,9 @@ module KafkaBatch
       @go_executor_socket       = ENV["KAFKA_BATCH_GO_SOCKET"].to_s.strip
       @go_executor_timeout      = 300.0
       @go_executor_open_timeout = 1.0
+      @daemon_mode              = truthy_env?("KAFKA_BATCH_DAEMON_MODE")
+      @ruby_worker_socket       = ENV["KAFKA_BATCH_WORKER_SOCKET"].to_s.strip
+      @ruby_worker_timeout      = 300.0
       @handler_manifest_path    = ENV["KAFKA_BATCH_HANDLER_MANIFEST"].to_s.strip
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
@@ -649,7 +660,15 @@ module KafkaBatch
       paths.map { |p| File.expand_path(p) }.uniq
     end
 
+    def daemon_mode?
+      @daemon_mode == true
+    end
+
     private
+
+    def truthy_env?(key)
+      %w[1 true yes].include?(ENV[key].to_s.strip.downcase)
+    end
 
     # Apply topic_prefix to a base name: "" → base, "myapp" → "myapp.base".
     def prefixed(base)

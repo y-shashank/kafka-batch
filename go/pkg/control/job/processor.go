@@ -9,6 +9,7 @@ import (
 
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
 	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
+	"github.com/y-shashank/kafka-batch/go/pkg/jobexpiry"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
@@ -58,8 +59,21 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 			return out, err
 		}
 		if cancelled {
+			p.releaseUniq(ctx, job)
 			return out, nil
 		}
+	}
+
+	if jobexpiry.Expired(job.ValidTill, p.now()) {
+		if job.BatchID != nil && job.BatchSeq != nil {
+			ev := p.buildEvent(job, "failed", src)
+			out.Event = &ev
+		}
+		dlt, key := p.dltPayload(jobMap(raw), src.Topic, "ExpiredError", "job expired")
+		out.DLTPayload = dlt
+		out.DLTKey = key
+		p.releaseUniq(ctx, job)
+		return out, nil
 	}
 
 	entry, fromManifest := p.Manifest.Handlers[job.JobType]
@@ -74,6 +88,7 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		dlt, key := p.dltPayload(jobMap(raw), src.Topic, "UnknownHandler", err.Error())
 		out.DLTPayload = dlt
 		out.DLTKey = key
+		p.releaseUniq(ctx, job)
 		return out, nil
 	}
 	if rubyHandler && p.RubyExec == nil {
@@ -88,6 +103,7 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		dlt, key := p.dltPayload(jobMap(raw), src.Topic, rubyClassName(err), err.Error())
 		out.DLTPayload = dlt
 		out.DLTKey = key
+		p.releaseUniq(ctx, job)
 		return out, nil
 	}
 
@@ -119,6 +135,7 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		ev := p.buildEvent(job, "success", src)
 		out.Event = &ev
 	}
+	p.releaseUniq(ctx, job)
 	return out, nil
 }
 
@@ -131,6 +148,18 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 	completeAfter := job.CompleteAfterRetries
 	if completeAfter == 0 {
 		completeAfter = p.Cfg.CompleteAfter
+	}
+
+	if nonRetryable(execErr) {
+		if job.BatchID != nil && !job.BatchCounted && job.BatchSeq != nil {
+			ev := p.buildEvent(job, "failed", src)
+			out.Event = &ev
+		}
+		dlt, key := p.dltPayload(jobMap(raw), src.Topic, className(execErr), execErr.Error())
+		out.DLTPayload = dlt
+		out.DLTKey = key
+		p.releaseUniq(ctx, job)
+		return out, nil
 	}
 
 	if job.Attempt < maxRetries {
@@ -162,7 +191,15 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 	dlt, key := p.dltPayload(jobMap(raw), src.Topic, className(execErr), execErr.Error())
 	out.DLTPayload = dlt
 	out.DLTKey = key
+	p.releaseUniq(ctx, job)
 	return out, nil
+}
+
+func (p *Processor) releaseUniq(ctx context.Context, job protocol.JobMessage) {
+	if p.Store == nil {
+		return
+	}
+	_ = p.Store.ReleaseUniqLock(ctx, job.UniqFP, job.JobID)
 }
 
 func (p *Processor) buildEvent(job protocol.JobMessage, status string, src protocol.SourceCoords) protocol.EventMessage {
@@ -252,4 +289,13 @@ func className(err error) string {
 		return he.Class
 	}
 	return "GoExecutionError"
+}
+
+func nonRetryable(err error) bool {
+	switch className(err) {
+	case "UnknownHandler", "NotRubyHandler":
+		return true
+	default:
+		return false
+	}
 }

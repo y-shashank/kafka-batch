@@ -29,7 +29,10 @@ module KafkaBatch
       end
 
       def default_socket_path
-        ENV["KAFKA_BATCH_WORKER_SOCKET"].to_s.strip
+        path = ENV["KAFKA_BATCH_WORKER_SOCKET"].to_s.strip
+        return path unless path.empty?
+
+        KafkaBatch.config.ruby_worker_socket.to_s.strip
       end
     end
 
@@ -43,6 +46,9 @@ module KafkaBatch
       @server      = nil
       @thread      = nil
       @running     = false
+      @max_inflight = Integer(ENV.fetch("KAFKA_BATCH_WORKER_MAX_THREADS", "64"))
+      @inflight     = 0
+      @inflight_mu  = Mutex.new
     end
 
     def run!
@@ -89,10 +95,32 @@ module KafkaBatch
         break unless @running
 
         client = @server.accept
-        Thread.new(client) { |c| handle_client(c) }
+        unless acquire_slot
+          write_json(client, 503, "ok" => false, "error_class" => "Overloaded", "error_message" => "worker server at capacity")
+          client.close
+          next
+        end
+        Thread.new(client) do |c|
+          handle_client(c)
+        ensure
+          release_slot
+        end
       end
     rescue IOError, Errno::EBADF, Errno::ENOTSOCK
       nil
+    end
+
+    def acquire_slot
+      @inflight_mu.synchronize do
+        return false if @inflight >= @max_inflight
+
+        @inflight += 1
+        true
+      end
+    end
+
+    def release_slot
+      @inflight_mu.synchronize { @inflight -= 1 if @inflight.positive? }
     end
 
     def handle_client(client)
@@ -189,11 +217,23 @@ module KafkaBatch
 
     def write_json(client, status, payload)
       body = Oj.dump(payload, mode: :compat)
-      client.print "HTTP/1.1 #{status} OK\r\n"
+      client.print "HTTP/1.1 #{status} #{http_reason(status)}\r\n"
       client.print "Content-Type: application/json\r\n"
       client.print "Content-Length: #{body.bytesize}\r\n"
       client.print "Connection: close\r\n\r\n"
       client.print body
+    end
+
+    def http_reason(status)
+      case status
+      when 200 then "OK"
+      when 400 then "Bad Request"
+      when 404 then "Not Found"
+      when 422 then "Unprocessable Entity"
+      when 500 then "Internal Server Error"
+      when 503 then "Service Unavailable"
+      else "OK"
+      end
     end
   end
 end
