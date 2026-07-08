@@ -61,6 +61,35 @@ module KafkaBatch
         KafkaBatch.config.audit_enabled
       end
 
+      # Newest-first page of audit rows for the dashboard. Fetches +limit + 1+ so
+      # the caller can tell whether a next page exists. Each row is a plain Hash
+      # with a parsed +metadata+. Returns [] when auditing is off or the table is
+      # unavailable (best-effort — the dashboard never 500s on a read).
+      # @return [Array<Hash>]
+      def list(limit: 25, offset: 0, action: nil)
+        return [] unless enabled?
+
+        lim = limit.to_i.clamp(1, 500)
+        off = [offset.to_i, 0].max
+        scope = model.order(created_at: :desc, id: :desc)
+        scope = scope.where(action: action.to_s) if action && !action.to_s.empty?
+        scope.limit(lim).offset(off).map { |r| row_to_h(r) }
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch][AuditLog] read failed: #{e.message}")
+        []
+      end
+
+      # Distinct action names present in the table (for the filter chips), capped.
+      # @return [Array<String>]
+      def actions(limit: 50)
+        return [] unless enabled?
+
+        model.distinct.order(:action).limit(limit.to_i).pluck(:action)
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch][AuditLog] actions read failed: #{e.message}")
+        []
+      end
+
       def reset!
         @model = nil
       end
@@ -135,6 +164,31 @@ module KafkaBatch
         Oj.dump(metadata || {}, mode: :compat)
       rescue StandardError
         metadata.to_s
+      end
+
+      # Normalize an AR audit row into a plain Hash with parsed metadata so the
+      # web layer never touches ActiveRecord objects directly.
+      def row_to_h(record)
+        {
+          id:         record.id,
+          action:     record.action,
+          path:       record.path,
+          method:     record.method,
+          actor:      record.actor,
+          node_id:    record.node_id,
+          status:     record.status,
+          metadata:   parse_metadata(record.metadata),
+          created_at: record.created_at
+        }
+      end
+
+      def parse_metadata(raw)
+        return {} if raw.nil? || raw == ""
+        return raw if raw.is_a?(Hash)
+
+        Oj.load(raw.to_s)
+      rescue StandardError
+        { "raw" => raw.to_s }
       end
     end
   end

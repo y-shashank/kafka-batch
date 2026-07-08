@@ -641,6 +641,53 @@ RSpec.describe KafkaBatch::Web do
     expect(status).to eq(404)
   end
 
+  describe "GET /audit" do
+    it "shows a disabled notice and no nav link when audit is off" do
+      status, _h, body = get("/audit")
+      html = body.join
+      expect(status).to eq(200)
+      expect(html).to include("audit log is disabled")
+      expect(html).not_to include(">📝 Audit<")
+    end
+
+    context "when enabled" do
+      before do
+        KafkaBatchSpec::ActiveRecordSupport.establish!
+        KafkaBatchSpec::ActiveRecordSupport.truncate!
+        KafkaBatch::AuditLog.reset!
+        KafkaBatch.config.audit_enabled = true
+      end
+
+      after do
+        KafkaBatch::AuditLog.reset!
+        KafkaBatch.config.audit_enabled = false
+      end
+
+      it "renders recorded actions newest-first with a nav link and filter chips" do
+        KafkaBatch::AuditLog.record(action: "batches.cancel", path: "/batches/a/cancel", status: "ok", metadata: { "n" => 1 })
+        KafkaBatch::AuditLog.record(action: "lag.pause", path: "/lag/pause", status: "error", metadata: { "n" => 2 })
+
+        status, _h, body = get("/audit")
+        html = body.join
+        expect(status).to eq(200)
+        expect(html).to include(">📝 Audit<")                 # nav link present
+        expect(html).to include("chip")                        # action filter chips
+        # Assert on the request paths, which appear only in table rows (not chips).
+        expect(html).to include("/lag/pause").and include("/batches/a/cancel")
+        expect(html.index("/lag/pause")).to be < html.index("/batches/a/cancel")  # newest first
+      end
+
+      it "filters by action" do
+        KafkaBatch::AuditLog.record(action: "batches.delete", path: "/batches/a/delete", status: "ok")
+        KafkaBatch::AuditLog.record(action: "lag.resume", path: "/lag/resume", status: "ok")
+
+        html = get("/audit", query: "action=lag.resume").last.join
+        expect(html).to include("/lag/resume")           # kept row
+        expect(html).not_to include("/batches/a/delete") # filtered-out row (path only in rows)
+      end
+    end
+  end
+
   describe "time formatting" do
     let(:web) { described_class.new }
 

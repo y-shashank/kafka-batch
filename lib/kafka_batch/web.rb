@@ -139,6 +139,8 @@ module KafkaBatch
           html(render_reconciler, title: "Reconciler")
         elsif method == "GET" && path == "/dead_letter"
           html(render_dead_letter(params), title: "Dead letter")
+        elsif method == "GET" && path == "/audit"
+          html(render_audit(params), title: "Audit log")
         elsif method == "GET" && (path == "/weights" || path == "/weights/time")
           html(render_weights(params, type: :time), title: "Time Fairness Weights")
         elsif method == "GET" && path == "/weights/throughput"
@@ -797,6 +799,80 @@ module KafkaBatch
         </div>
         #{pager}
       HTML
+    end
+
+    def render_audit(params)
+      back = "<p><a class=\"back\" href=\"#{index_path}\">← All batches</a></p>"
+
+      unless defined?(KafkaBatch::AuditLog) && KafkaBatch::AuditLog.enabled?
+        return <<~HTML
+          #{back}
+          <div class="card">
+            <h2>Audit log</h2>
+            <p class="muted">The Web UI audit log is disabled. Enable it with
+            <code>config.audit_enabled = true</code> (and run the audit migration —
+            <code>rails generate kafka_batch:install --audit</code>).</p>
+          </div>
+        HTML
+      end
+
+      action = non_empty(params["action"])
+      page   = [params["page"].to_i, 1].max
+      offset = (page - 1) * PER_PAGE
+      rows_data = KafkaBatch::AuditLog.list(limit: PER_PAGE + 1, offset: offset, action: action)
+      has_next  = rows_data.size > PER_PAGE
+      rows_data = rows_data.first(PER_PAGE)
+
+      filter_links = ["<a class='#{action ? 'chip' : 'chip active'}' href='#{audit_path}'>All</a>"]
+      KafkaBatch::AuditLog.actions.each do |a|
+        cls = action == a ? "chip active" : "chip"
+        filter_links << "<a class='#{cls}' href='#{audit_path}?action=#{url_encode(a)}'>#{h(a)}</a>"
+      end
+
+      rows = rows_data.map do |r|
+        color = r[:status] == "ok" ? "#10b981" : "#ef4444"
+        <<~ROW.gsub(/\n\s*/, "")
+          <tr>
+            <td>#{fmt_time(r[:created_at])}</td>
+            <td>#{h(non_empty(r[:actor]) || "—")}</td>
+            <td class="mono">#{h(r[:action])}</td>
+            <td class="mono">#{h(r[:method])} #{h(r[:path])}</td>
+            <td><span class="badge" style="background:#{color}">#{h(r[:status])}</span></td>
+            <td class="mono">#{h(short_id(r[:node_id]))}</td>
+            <td><code>#{h(audit_metadata_preview(r[:metadata]))}</code></td>
+          </tr>
+        ROW
+      end.join
+      rows = "<tr><td colspan='7' class='empty'>No audit entries recorded yet.</td></tr>" if rows_data.empty?
+
+      qs        = action ? "&action=#{url_encode(action)}" : ""
+      prev_link = page > 1 ? "<a class='btn' href='#{audit_path}?page=#{page - 1}#{qs}'>← Prev</a>" : ""
+      next_link = has_next ? "<a class='btn' href='#{audit_path}?page=#{page + 1}#{qs}'>Next →</a>" : ""
+      pager     = (prev_link.empty? && next_link.empty?) ? "" : "<div class='pager'>#{prev_link}<span class='page'>Page #{page}</span>#{next_link}</div>"
+
+      <<~HTML
+        #{back}
+        <div class="chips">#{filter_links.join}</div>
+        <div class="card">
+          <h2>Web UI audit log</h2>
+          <p class="muted">Mutating dashboard actions (cancel/delete, pause/resume, weight changes), newest first.</p>
+          <table>
+            <thead><tr><th>When (UTC)</th><th>Actor</th><th>Action</th><th>Request</th><th>Status</th><th>Node</th><th>Metadata</th></tr></thead>
+            <tbody>#{rows}</tbody>
+          </table>
+        </div>
+        #{pager}
+      HTML
+    end
+
+    # Compact one-line preview of the metadata hash for the table cell.
+    def audit_metadata_preview(metadata, limit: 160)
+      return "—" if metadata.nil? || (metadata.respond_to?(:empty?) && metadata.empty?)
+
+      str = metadata.is_a?(String) ? metadata : Oj.dump(metadata, mode: :compat)
+      str.length > limit ? "#{str[0, limit]}…" : str
+    rescue StandardError
+      metadata.to_s
     end
 
     def render_live
@@ -2149,6 +2225,10 @@ module KafkaBatch
       "#{@script_name}/dead_letter"
     end
 
+    def audit_path
+      "#{@script_name}/audit"
+    end
+
     def weights_reset_path(type = :time)
       "#{@script_name}/weights/#{type}/reset"
     end
@@ -2308,6 +2388,7 @@ module KafkaBatch
               #{nav_btn("/lag", "▦ Kafka Lag")}
               #{nav_btn("/scheduled", "⏰ Scheduled")}
               #{nav_btn("/reconciler", "⟳ Reconciler")}
+              #{audit_nav_btn}
               #{nav_btn("/fairness/time", "⏱ Time Fairness")}
               #{nav_btn("/weights/time", "⚖ Time Weights")}
               #{nav_btn("/fairness/throughput", "⚡ Throughput Fairness")}
@@ -2328,6 +2409,14 @@ module KafkaBatch
       active = @path == path_suffix
       cls = active ? "btn nav-active" : "btn"
       %(<a class="#{cls}" href="#{href}">#{label}</a>)
+    end
+
+    # The audit link only appears when the audit log is enabled, so the nav
+    # doesn't advertise a page that would just say "disabled".
+    def audit_nav_btn
+      return "" unless defined?(KafkaBatch::AuditLog) && KafkaBatch::AuditLog.enabled?
+
+      nav_btn("/audit", "📝 Audit")
     end
 
     CSS = <<~CSS

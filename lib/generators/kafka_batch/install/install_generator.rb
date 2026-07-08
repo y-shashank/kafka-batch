@@ -25,9 +25,14 @@ module KafkaBatch
                                     desc: "Delayed-job (perform_in/at) index store: redis (default) or mysql. " \
                                           "Independent of --store."
 
+      class_option :audit, type: :boolean, default: false,
+                           desc: "Also copy the kafka_batch_audit_logs migration (Web UI action audit log). " \
+                                 "Requires ActiveRecord; enable at runtime with config.audit_enabled = true."
+
       # Migration filenames per store (kept verbatim so they stay idempotent/skippable).
       LEDGER_MIGRATION    = "20240101000001_create_kafka_batch_tables.rb".freeze
       SCHEDULED_MIGRATION = "20240101000002_create_kafka_batch_scheduled_jobs.rb".freeze
+      AUDIT_MIGRATION     = "20240101000004_create_kafka_batch_audit_logs.rb".freeze
 
       def validate_store_options
         %i[store schedule_store].each do |opt|
@@ -38,6 +43,7 @@ module KafkaBatch
         end
         @store          = options[:store]
         @schedule_store = options[:schedule_store]
+        @audit          = options[:audit]
       end
 
       def create_initializer
@@ -56,11 +62,13 @@ module KafkaBatch
       end
 
       def copy_migrations
-        # Copy only what each chosen store needs:
+        # Copy only what each chosen store / feature needs:
         #   --store mysql          → failures / pauses tables
         #   --schedule-store mysql → kafka_batch_scheduled_jobs table
+        #   --audit                → kafka_batch_audit_logs table (Web UI audit log)
         copy_file LEDGER_MIGRATION,    "db/migrate/#{LEDGER_MIGRATION}"    if @store == "mysql"
         copy_file SCHEDULED_MIGRATION, "db/migrate/#{SCHEDULED_MIGRATION}" if @schedule_store == "mysql"
+        copy_file AUDIT_MIGRATION,     "db/migrate/#{AUDIT_MIGRATION}"     if @audit
       end
 
       def show_next_steps
@@ -79,12 +87,17 @@ module KafkaBatch
           end
         ROUTES
 
-        if @store == "mysql" || @schedule_store == "mysql"
+        if @store == "mysql" || @schedule_store == "mysql" || @audit
           copied = []
-          copied << "failures / pauses" if @store == "mysql"
-          copied << "scheduled-jobs index"               if @schedule_store == "mysql"
+          copied << "failures / pauses"     if @store == "mysql"
+          copied << "scheduled-jobs index"  if @schedule_store == "mysql"
+          copied << "audit log"             if @audit
           say "\n2. Run the migrations (#{copied.join(' + ')}):\n"
           say "     rails db:migrate\n"
+          if @audit
+            say "   Then enable the Web UI audit log in the initializer:\n"
+            say "     config.audit_enabled = true\n"
+          end
           say "\n3. Create Kafka topics (choose one):\n"
         else
           say "\n2. Create Kafka topics (choose one):\n"
