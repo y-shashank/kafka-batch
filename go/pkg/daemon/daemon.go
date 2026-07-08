@@ -46,10 +46,14 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	if err := manifest.Validate(); err != nil {
 		return err
 	}
+	if manifest.HasRubyHandlers() && cfg.RubyWorkerSocket == "" {
+		return fmt.Errorf("handler manifest includes runtime:ruby handlers but ruby_worker_socket is not set")
+	}
 
+	rubyTopics := cfg.RubyWorkerSocket != ""
 	jobTopics := cfg.JobsTopics
 	if len(jobTopics) == 0 {
-		jobTopics = manifest.JobTopics(prefixOr(cfg.TopicPrefix, "") + "kafka_batch.jobs")
+		jobTopics = manifest.JobTopics(prefixOr(cfg.TopicPrefix, "")+"kafka_batch.jobs", rubyTopics)
 	}
 	if len(jobTopics) == 0 {
 		return fmt.Errorf("no job topics configured (set jobs_topics or handler manifest)")
@@ -93,7 +97,18 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 	defer prod.Close()
 
-	jobProc := &job.Processor{Cfg: cfg, Store: st, Producer: prod}
+	jobProc := &job.Processor{
+		Cfg:      cfg,
+		Manifest: manifest,
+		Store:    st,
+		Producer: prod,
+	}
+	if cfg.RubyWorkerSocket != "" {
+		jobProc.RubyExec = job.RubySocketExecutor{
+			SocketPath: cfg.RubyWorkerSocket,
+			Timeout:    cfg.RubyWorkerTimeout,
+		}
+	}
 	handleJob := func(rec *kgo.Record) error {
 		src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 		out, err := jobProc.Process(ctx, rec.Value, src)

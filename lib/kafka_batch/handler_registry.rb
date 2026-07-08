@@ -118,6 +118,11 @@ module KafkaBatch
         handler.definition
       end
 
+      def lookup_by_job_type(job_type)
+        @mutex.synchronize { @by_job_type[job_type.to_s] }
+      end
+      private :lookup_by_job_type
+
       def resolve_by_worker_class!(worker_name)
         handler = @mutex.synchronize { @by_worker_class[worker_name] }
         return handler if handler

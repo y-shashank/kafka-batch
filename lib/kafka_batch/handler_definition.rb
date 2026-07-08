@@ -48,9 +48,12 @@ module KafkaBatch
       fairness = entry["fairness_type"] || entry["fairness"]
       fairness = fairness.to_sym if fairness && !fairness.is_a?(Symbol)
 
+      worker_class = resolve_manifest_worker_class(entry["worker_class"], job_type, runtime)
+
       new(
         job_type:               job_type,
         runtime:                runtime,
+        worker_class:           worker_class,
         topic:                  entry["topic"],
         apply_topic_prefix:     entry.fetch("apply_topic_prefix", true),
         max_retries:            entry["max_retries"],
@@ -59,6 +62,18 @@ module KafkaBatch
         retry_tier:             entry["retry_tier"]
       )
     end
+
+    def self.resolve_manifest_worker_class(name, job_type, runtime)
+      return nil unless runtime == :ruby
+
+      if name && !name.to_s.empty?
+        return Object.const_get(name.to_s)
+      end
+
+      handler = HandlerRegistry.send(:lookup_by_job_type, job_type)
+      handler&.worker_class
+    end
+    private_class_method :resolve_manifest_worker_class
 
     def kafka_topic
       if @topic_base && !@topic_base.empty?

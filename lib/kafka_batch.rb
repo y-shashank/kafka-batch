@@ -40,6 +40,7 @@ require_relative "kafka_batch/consumers/priority_job_consumer"
 require_relative "kafka_batch/consumers/retry_consumer"
 require_relative "kafka_batch/consumers/event_consumer"
 require_relative "kafka_batch/consumers/callback_consumer"
+require_relative "kafka_batch/worker_server"
 
 module KafkaBatch
   class << self

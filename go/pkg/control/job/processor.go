@@ -21,12 +21,14 @@ type Producer interface {
 
 // Processor runs plain-topic job messages (no fairness).
 type Processor struct {
-	Cfg      config.Daemon
-	Store    *store.RedisStore
-	Producer Producer
-	FairTime        *fairness.Scheduler
-	FairThroughput  *fairness.Scheduler
-	Now      func() time.Time
+	Cfg            config.Daemon
+	Manifest       config.Manifest
+	Store          *store.RedisStore
+	Producer       Producer
+	FairTime       *fairness.Scheduler
+	FairThroughput *fairness.Scheduler
+	RubyExec       RubyExecutor
+	Now            func() time.Time
 }
 
 // Outcome describes what happened to one job message.
@@ -60,8 +62,10 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		}
 	}
 
-	handler, ok := kbatch.Lookup(job.JobType)
-	if !ok {
+	entry, fromManifest := p.Manifest.Handlers[job.JobType]
+	_, goHandler := kbatch.Lookup(job.JobType)
+	rubyHandler := fromManifest && entry.Runtime == "ruby"
+	if !goHandler && !rubyHandler {
 		err := fmt.Errorf("unknown job_type %q", job.JobType)
 		if job.BatchID != nil && job.BatchSeq != nil {
 			ev := p.buildEvent(job, "failed", src)
@@ -72,20 +76,39 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		out.DLTKey = key
 		return out, nil
 	}
-
-	hctx := &kbatch.Context{
-		JobType: job.JobType,
-		JobID:   job.JobID,
-		Attempt: job.Attempt,
-		Payload: job.Payload,
+	if rubyHandler && p.RubyExec == nil {
+		err := &RubyExecutionError{
+			Class:   "RubyWorkerUnavailable",
+			Message: "ruby_worker_socket is not configured",
+		}
+		if job.BatchID != nil && job.BatchSeq != nil {
+			ev := p.buildEvent(job, "failed", src)
+			out.Event = &ev
+		}
+		dlt, key := p.dltPayload(jobMap(raw), src.Topic, rubyClassName(err), err.Error())
+		out.DLTPayload = dlt
+		out.DLTKey = key
+		return out, nil
 	}
-	if job.BatchID != nil {
-		hctx.BatchID = *job.BatchID
-	}
 
-	if err := p.withFairSlot(ctx, raw, func() error {
+	run := func() error {
+		if rubyHandler {
+			return p.RubyExec.Execute(ctx, job)
+		}
+		handler, _ := kbatch.Lookup(job.JobType)
+		hctx := &kbatch.Context{
+			JobType: job.JobType,
+			JobID:   job.JobID,
+			Attempt: job.Attempt,
+			Payload: job.Payload,
+		}
+		if job.BatchID != nil {
+			hctx.BatchID = *job.BatchID
+		}
 		return handler(hctx)
-	}); err != nil {
+	}
+
+	if err := p.withFairSlot(ctx, raw, run); err != nil {
 		if errors.Is(err, errFairSkipped) {
 			return out, nil
 		}
@@ -222,6 +245,9 @@ func deref(s *string) string {
 }
 
 func className(err error) string {
+	if re, ok := err.(*RubyExecutionError); ok && re.Class != "" {
+		return re.Class
+	}
 	if he, ok := err.(*kbatch.HandlerError); ok && he.Class != "" {
 		return he.Class
 	}

@@ -47,6 +47,8 @@ type Daemon struct {
 	PriorityWeightedInterleave int
 	ConsumptionControlRefreshInterval time.Duration
 	RubyCallbackSocket    string
+	RubyWorkerSocket      string
+	RubyWorkerTimeout     time.Duration
 	FairnessEnabled       bool
 	FairnessTimeIngest    string
 	FairnessTimeReady     string
@@ -140,6 +142,8 @@ func LoadDaemon(path string) (Daemon, error) {
 		PriorityWeightedInterleave int      `yaml:"priority_weighted_interleave"`
 		ConsumptionControlRefreshIntervalSec float64 `yaml:"consumption_control_refresh_interval"`
 		RubyCallbackSocket    string        `yaml:"ruby_callback_socket"`
+		RubyWorkerSocket      string        `yaml:"ruby_worker_socket"`
+		RubyWorkerTimeoutSec  float64       `yaml:"ruby_worker_timeout"`
 		FairnessEnabled       bool          `yaml:"fairness_enabled"`
 		FairnessTimeIngest    string        `yaml:"fairness_time_ingest"`
 		FairnessTimeReady     string        `yaml:"fairness_time_ready"`
@@ -239,6 +243,12 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.RubyCallbackSocket != "" {
 		cfg.RubyCallbackSocket = doc.RubyCallbackSocket
 	}
+	if doc.RubyWorkerSocket != "" {
+		cfg.RubyWorkerSocket = doc.RubyWorkerSocket
+	}
+	if doc.RubyWorkerTimeoutSec > 0 {
+		cfg.RubyWorkerTimeout = time.Duration(doc.RubyWorkerTimeoutSec * float64(time.Second))
+	}
 	if doc.FairnessEnabled {
 		cfg.FairnessEnabled = true
 	}
@@ -295,6 +305,9 @@ func applyEnv(cfg *Daemon) {
 	}
 	if v := os.Getenv("KAFKA_BATCH_RUBY_CALLBACK_SOCKET"); v != "" {
 		cfg.RubyCallbackSocket = v
+	}
+	if v := os.Getenv("KAFKA_BATCH_RUBY_WORKER_SOCKET"); v != "" {
+		cfg.RubyWorkerSocket = v
 	}
 	if v := os.Getenv("KAFKA_BATCH_PRIORITY_CONFIG"); v != "" {
 		cfg.PriorityConfigPaths = append(cfg.PriorityConfigPaths, strings.TrimSpace(v))
@@ -409,32 +422,48 @@ func LoadManifest(path, topicPrefix string) (Manifest, error) {
 	return m, nil
 }
 
-func (m Manifest) JobTopics(defaultTopic string) []string {
+func (m Manifest) JobTopics(defaultTopic string, includeRuby bool) []string {
 	seen := map[string]struct{}{}
 	var out []string
 	for _, h := range m.Handlers {
-		if h.Runtime != "go" {
-			continue
+		rt := strings.ToLower(strings.TrimSpace(h.Runtime))
+		if rt == "go" || (includeRuby && rt == "ruby") {
+			t := h.Topic
+			if t == "" {
+				t = defaultTopic
+			}
+			if _, ok := seen[t]; ok {
+				continue
+			}
+			seen[t] = struct{}{}
+			out = append(out, t)
 		}
-		t := h.Topic
-		if t == "" {
-			t = defaultTopic
-		}
-		if _, ok := seen[t]; ok {
-			continue
-		}
-		seen[t] = struct{}{}
-		out = append(out, t)
 	}
 	return out
 }
 
+func (m Manifest) HasRubyHandlers() bool {
+	for _, h := range m.Handlers {
+		if strings.EqualFold(h.Runtime, "ruby") {
+			return true
+		}
+	}
+	return false
+}
+
 func (m Manifest) Validate() error {
 	for jobType, h := range m.Handlers {
-		if h.Runtime == "go" {
+		switch strings.ToLower(strings.TrimSpace(h.Runtime)) {
+		case "go":
 			if _, ok := lookupRegistered(jobType); !ok {
 				return fmt.Errorf("handler %q not registered in Go (missing kbatch.Register)", jobType)
 			}
+		case "ruby":
+			// Ruby handlers execute via worker-server socket (Phase 4).
+		case "":
+			return fmt.Errorf("handler %q missing runtime", jobType)
+		default:
+			return fmt.Errorf("handler %q has unsupported runtime %q", jobType, h.Runtime)
 		}
 	}
 	return nil
