@@ -35,6 +35,45 @@ RSpec.describe "KafkaBatch::Batch delayed scheduling (perform_in / perform_at)" 
     end
   end
 
+  describe ".enqueue_job_at / .enqueue_job_in" do
+    let(:definition) do
+      instance_double(
+        "HandlerDefinition",
+        job_type: "test.go_job",
+        worker_class: nil,
+        worker_class_name: "go:test.go_job",
+        max_retries: 3,
+        complete_after_retries: nil,
+        retry_tier: nil
+      )
+    end
+
+    before(:each) do
+      allow(KafkaBatch::HandlerRegistry).to receive(:definition!).with("test.go_job").and_return(definition)
+    end
+
+    it "produces manifest jobs to the scheduled topic with a compact pointer" do
+      at = Time.now + 1800
+      job_id = KafkaBatch::Batch.enqueue_job_at(at, "test.go_job", { "id" => 1 })
+
+      produced = FakeProducer.for_topic(KafkaBatch.config.scheduled_topic)
+      expect(produced.size).to eq(1)
+      expect(produced.first[:payload]["job_type"]).to eq("test.go_job")
+      expect(produced.first[:payload]["worker_class"]).to eq("go:test.go_job")
+      expect(sched).to have_received(:schedule).with(
+        hash_including(job_id: job_id, partition: 2, offset: 77, batch_id: nil)
+      )
+    end
+
+    it "enqueue_job_in schedules relative to now" do
+      KafkaBatch::Batch.enqueue_job_in(90, "test.go_job", {})
+
+      expect(sched).to have_received(:schedule) do |args|
+        expect(args[:run_at]).to be_between(Time.now + 85, Time.now + 95)
+      end
+    end
+  end
+
   describe ".enqueue_in" do
     it "schedules relative to now" do
       KafkaBatch::Batch.enqueue_in(120, SuccessfulWorker, {})

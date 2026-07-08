@@ -79,19 +79,32 @@ func (s *Scheduler) Enqueue(ctx context.Context, tenantID string, payload []byte
 }
 
 func (s *Scheduler) Checkout(ctx context.Context) (*CheckoutResult, error) {
-	if s.Lane != LaneTime {
-		return nil, fmt.Errorf("checkout: throughput lane not implemented yet")
+	if err := ValidateLane(s.Lane); err != nil {
+		return nil, err
 	}
 	view := s.activeViewCached()
 	slotID := uuid.NewString()
 	weighted := s.Settings.weightedFlag()
-	res, err := s.Client.Eval(ctx, CheckoutLuaTime,
-		[]string{ringKey(s.Lane), leasesKey(s.Lane), weightKey(s.Lane), forwardingKey(s.Lane), forwardingMetaKey(s.Lane)},
-		s.Settings.GlobalConcurrency, s.Settings.MaxInflightPerTenant, readyPrefix(s.Lane),
-		s.Settings.fetchN(), s.Settings.DefaultWeight, weighted,
-		view.count, view.sumWeight,
-		"0", s.Settings.EffectiveLeaseTTL(), slotID, leasePrefix(s.Lane),
-	).Slice()
+
+	var res []interface{}
+	var err error
+	if s.Lane == LaneTime {
+		res, err = s.Client.Eval(ctx, CheckoutLuaTime,
+			[]string{ringKey(s.Lane), leasesKey(s.Lane), weightKey(s.Lane), forwardingKey(s.Lane), forwardingMetaKey(s.Lane)},
+			s.Settings.GlobalConcurrency, s.Settings.MaxInflightPerTenant, readyPrefix(s.Lane),
+			s.Settings.fetchN(), s.Settings.DefaultWeight, weighted,
+			view.count, view.sumWeight,
+			"0", s.Settings.EffectiveLeaseTTL(), slotID, leasePrefix(s.Lane),
+		).Slice()
+	} else {
+		res, err = s.Client.Eval(ctx, CheckoutLuaCount,
+			[]string{ringKey(s.Lane), vtimeKey(s.Lane), leasesKey(s.Lane), weightKey(s.Lane), forwardingKey(s.Lane), forwardingMetaKey(s.Lane)},
+			s.Settings.GlobalConcurrency, s.Settings.MaxInflightPerTenant, readyPrefix(s.Lane),
+			s.Settings.DefaultWeight, s.Settings.fetchN(), weighted,
+			view.count, view.sumWeight,
+			"0", s.Settings.EffectiveLeaseTTL(), slotID, leasePrefix(s.Lane),
+		).Slice()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -121,16 +134,35 @@ func (s *Scheduler) AbortForward(ctx context.Context, slotID, tenantID string) (
 	if slotID == "" || tenantID == "" {
 		return false, nil
 	}
-	n, err := s.Client.Eval(ctx, AbortForwardLuaTime,
-		[]string{forwardingKey(s.Lane), forwardingMetaKey(s.Lane), leasesKey(s.Lane), TenantLeaseKey(s.Lane, tenantID)},
-		slotID, tenantID, readyPrefix(s.Lane),
-	).Int()
+	var n int
+	var err error
+	if s.Lane == LaneTime {
+		n, err = s.Client.Eval(ctx, AbortForwardLuaTime,
+			[]string{forwardingKey(s.Lane), forwardingMetaKey(s.Lane), leasesKey(s.Lane), TenantLeaseKey(s.Lane, tenantID)},
+			slotID, tenantID, readyPrefix(s.Lane),
+		).Int()
+	} else {
+		n, err = s.Client.Eval(ctx, AbortForwardLuaCount,
+			[]string{forwardingKey(s.Lane), forwardingMetaKey(s.Lane), leasesKey(s.Lane), TenantLeaseKey(s.Lane, tenantID), ringKey(s.Lane), vtimeKey(s.Lane), weightKey(s.Lane)},
+			slotID, tenantID, readyPrefix(s.Lane), s.Settings.DefaultWeight,
+		).Int()
+	}
 	return n == 1, err
 }
 
 func (s *Scheduler) Complete(ctx context.Context, tenantID, slotID string, durationSec float64) error {
-	if s.Lane != LaneTime {
+	if slotID == "" && s.Lane == LaneThroughput {
 		return nil
+	}
+	if s.Lane == LaneThroughput {
+		if slotID == "" {
+			return nil
+		}
+		_, err := s.Client.Eval(ctx, CompleteLuaCountLease,
+			[]string{leasesKey(s.Lane), TenantLeaseKey(s.Lane, tenantID)},
+			slotID,
+		).Result()
+		return err
 	}
 	w := s.WeightFor(ctx, tenantID)
 	inc := durationSec

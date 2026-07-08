@@ -339,6 +339,31 @@ module KafkaBatch
       job_id
     end
 
+    # Enqueue a manifest/Go job to run at an absolute time (Sidekiq perform_at).
+    # @return [String, nil] job_id
+    def self.enqueue_job_at(time, job_type, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil, valid_till: nil)
+      definition = resolve_definition!(job_type)
+      return nil if uniq_duplicate_for_definition?(definition, payload, job_id: job_id)
+
+      message = build_message_for(
+        definition: definition, payload: payload,
+        job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id,
+        valid_till: valid_till
+      )
+      begin
+        schedule_message(message, run_at: clamp_run_at(to_time(time)), batch_id: nil)
+      rescue StandardError
+        release_uniq_for_definition!(definition, payload, job_id: job_id)
+        raise
+      end
+      job_id
+    end
+
+    # Enqueue a manifest/Go job to run after +interval+ seconds.
+    def self.enqueue_job_in(interval, job_type, payload = {}, **opts)
+      enqueue_job_at(Time.now + interval, job_type, payload, **opts)
+    end
+
     # Enqueue a single job outside of any batch context. @return [String, nil] job_id
     def self.enqueue(worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil, valid_till: nil)
       ensure_worker!(worker_class)

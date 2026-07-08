@@ -40,12 +40,18 @@ type Daemon struct {
 	ScheduleReclaimEvery  time.Duration
 	SchedulePollMaxInterval time.Duration
 	SchedulePollJitter    float64
+	ScheduleStore         string
+	ScheduleMySQLDSN      string
 	PriorityConfigPaths   []string
 	PriorityLagCheckInterval time.Duration
 	PriorityWeightedInterleave int
+	ConsumptionControlRefreshInterval time.Duration
+	RubyCallbackSocket    string
 	FairnessEnabled       bool
 	FairnessTimeIngest    string
 	FairnessTimeReady     string
+	FairnessThroughputIngest string
+	FairnessThroughputReady  string
 	FairnessReadyWindow   int
 	FairnessGlobalConcurrency int
 	FairnessMaxInflightPerTenant int
@@ -82,8 +88,11 @@ func DefaultDaemon() Daemon {
 		SchedulePollMaxInterval: 60 * time.Second,
 		PriorityLagCheckInterval: 2 * time.Second,
 		PriorityWeightedInterleave: 4,
+		ConsumptionControlRefreshInterval: 30 * time.Second,
 		FairnessTimeIngest:   "kafka_batch.fair_time_ingest",
 		FairnessTimeReady:    "kafka_batch.fair_time_ready",
+		FairnessThroughputIngest: "kafka_batch.fair_throughput_ingest",
+		FairnessThroughputReady:  "kafka_batch.fair_throughput_ready",
 		FairnessReadyWindow:  100,
 		FairnessGlobalConcurrency: 50,
 		FairnessLeaseTTL:          1800,
@@ -124,12 +133,18 @@ func LoadDaemon(path string) (Daemon, error) {
 		ScheduleReclaimIntervalSec float64  `yaml:"schedule_reclaim_interval"`
 		SchedulePollMaxIntervalSec float64  `yaml:"schedule_poll_max_interval"`
 		SchedulePollJitter    float64       `yaml:"schedule_poll_jitter"`
+		ScheduleStore         string        `yaml:"schedule_store"`
+		ScheduleMySQLDSN      string        `yaml:"schedule_mysql_dsn"`
 		PriorityConfigPaths   []string      `yaml:"priority_config_paths"`
 		PriorityLagCheckIntervalSec float64 `yaml:"priority_lag_check_interval"`
 		PriorityWeightedInterleave int      `yaml:"priority_weighted_interleave"`
+		ConsumptionControlRefreshIntervalSec float64 `yaml:"consumption_control_refresh_interval"`
+		RubyCallbackSocket    string        `yaml:"ruby_callback_socket"`
 		FairnessEnabled       bool          `yaml:"fairness_enabled"`
 		FairnessTimeIngest    string        `yaml:"fairness_time_ingest"`
 		FairnessTimeReady     string        `yaml:"fairness_time_ready"`
+		FairnessThroughputIngest string     `yaml:"fairness_throughput_ingest"`
+		FairnessThroughputReady  string     `yaml:"fairness_throughput_ready"`
 		FairnessReadyWindow   int           `yaml:"fairness_ready_window"`
 		FairnessGlobalConcurrency int       `yaml:"fairness_global_concurrency"`
 		FairnessMaxInflightPerTenant int    `yaml:"fairness_max_inflight_per_tenant"`
@@ -203,6 +218,12 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.SchedulePollJitter > 0 {
 		cfg.SchedulePollJitter = doc.SchedulePollJitter
 	}
+	if doc.ScheduleStore != "" {
+		cfg.ScheduleStore = doc.ScheduleStore
+	}
+	if doc.ScheduleMySQLDSN != "" {
+		cfg.ScheduleMySQLDSN = doc.ScheduleMySQLDSN
+	}
 	if len(doc.PriorityConfigPaths) > 0 {
 		cfg.PriorityConfigPaths = doc.PriorityConfigPaths
 	}
@@ -212,6 +233,12 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.PriorityWeightedInterleave > 0 {
 		cfg.PriorityWeightedInterleave = doc.PriorityWeightedInterleave
 	}
+	if doc.ConsumptionControlRefreshIntervalSec > 0 {
+		cfg.ConsumptionControlRefreshInterval = time.Duration(doc.ConsumptionControlRefreshIntervalSec * float64(time.Second))
+	}
+	if doc.RubyCallbackSocket != "" {
+		cfg.RubyCallbackSocket = doc.RubyCallbackSocket
+	}
 	if doc.FairnessEnabled {
 		cfg.FairnessEnabled = true
 	}
@@ -220,6 +247,12 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.FairnessTimeReady != "" {
 		cfg.FairnessTimeReady = doc.FairnessTimeReady
+	}
+	if doc.FairnessThroughputIngest != "" {
+		cfg.FairnessThroughputIngest = doc.FairnessThroughputIngest
+	}
+	if doc.FairnessThroughputReady != "" {
+		cfg.FairnessThroughputReady = doc.FairnessThroughputReady
 	}
 	if doc.FairnessReadyWindow > 0 {
 		cfg.FairnessReadyWindow = doc.FairnessReadyWindow
@@ -257,6 +290,12 @@ func applyEnv(cfg *Daemon) {
 	if v := os.Getenv("KAFKA_BATCH_HANDLER_MANIFEST"); v != "" {
 		cfg.HandlerManifest = v
 	}
+	if v := os.Getenv("KAFKA_BATCH_SCHEDULE_MYSQL_DSN"); v != "" {
+		cfg.ScheduleMySQLDSN = v
+	}
+	if v := os.Getenv("KAFKA_BATCH_RUBY_CALLBACK_SOCKET"); v != "" {
+		cfg.RubyCallbackSocket = v
+	}
 	if v := os.Getenv("KAFKA_BATCH_PRIORITY_CONFIG"); v != "" {
 		cfg.PriorityConfigPaths = append(cfg.PriorityConfigPaths, strings.TrimSpace(v))
 	}
@@ -282,6 +321,8 @@ func (c *Daemon) prefixTopics() {
 	c.ScheduledTopic = prefixName(p, c.ScheduledTopic)
 	c.FairnessTimeIngest = prefixName(p, c.FairnessTimeIngest)
 	c.FairnessTimeReady = prefixName(p, c.FairnessTimeReady)
+	c.FairnessThroughputIngest = prefixName(p, c.FairnessThroughputIngest)
+	c.FairnessThroughputReady = prefixName(p, c.FairnessThroughputReady)
 	for i, t := range c.JobsTopics {
 		c.JobsTopics[i] = prefixName(p, t)
 	}

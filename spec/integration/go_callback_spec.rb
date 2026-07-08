@@ -5,8 +5,10 @@ require "yaml"
 require "fileutils"
 
 require_relative "../support/go_daemon_helper"
+require_relative "../support/ruby_callback_server"
+require_relative "../support/callback_doubles"
 
-RSpec.describe "Go daemon schedule poller (integration)", :integration do
+RSpec.describe "Go daemon Ruby callbacks (integration)", :integration do
   def configured_brokers
     ENV["KAFKA_BATCH_TEST_BROKERS"].to_s
   end
@@ -39,29 +41,34 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     skip "no Kafka broker reachable at #{brokers}" unless broker_reachable?
     skip "Go daemon binary unavailable" unless go_available?
 
-    @tmpdir = Dir.mktmpdir("kbatch-sched-#{suffix}")
+    KafkaBatchSpec::CallbackDoubles.reset!
+
+    @tmpdir = Dir.mktmpdir("kbatch-cb-#{suffix}")
     @marker_path = File.join(@tmpdir, "marker")
-    @worker_topic = "kb.sched.worker.#{suffix}"
-    @scheduled_topic = "kb.sched.scheduled.#{suffix}"
-    @events_topic = "kb.sched.events.#{suffix}"
-    @callbacks_topic = "kb.sched.callbacks.#{suffix}"
-    @dlt_topic = "kb.sched.dlt.#{suffix}"
-    @retry_base = "kb.sched.retry.#{suffix}"
+    @callback_socket = File.join(Dir.tmpdir, "kb-cb-#{suffix}.sock")
+    @worker_topic = "kb.cb.worker.#{suffix}"
+    @events_topic = "kb.cb.events.#{suffix}"
+    @callbacks_topic = "kb.cb.callbacks.#{suffix}"
+    @dlt_topic = "kb.cb.dlt.#{suffix}"
+    @retry_base = "kb.cb.retry.#{suffix}"
 
     write_manifest!
     write_daemon_config!
 
-    [@worker_topic, @scheduled_topic, @events_topic, @callbacks_topic, @dlt_topic,
+    [@worker_topic, @events_topic, @callbacks_topic, @dlt_topic,
      "#{@retry_base}.short", "#{@retry_base}.medium", "#{@retry_base}.large"].each do |t|
       create_topic!(t)
     end
 
     configure_kafka_batch!
+    @callback_server = KafkaBatchSpec::RubyCallbackServer.new(socket_path: @callback_socket)
+    @callback_server.start!
     start_daemon!
   end
 
   after(:each) do
     stop_daemon! if @daemon_pid
+    @callback_server&.stop!
     FileUtils.rm_rf(@tmpdir) if @tmpdir
     KafkaBatch::Producer.reset! if opted_in?
   end
@@ -70,7 +77,7 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     @manifest_path = File.join(@tmpdir, "handlers.yml")
     File.write(@manifest_path, {
       "handlers" => {
-        "integration.go_scheduled" => {
+        "integration.go_daemon" => {
           "runtime" => "go",
           "topic" => @worker_topic,
           "apply_topic_prefix" => false,
@@ -85,7 +92,7 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     @config_path = File.join(@tmpdir, "daemon.yml")
     File.write(@config_path, {
       "brokers" => brokers.split(","),
-      "consumer_group" => "kb-sched-#{suffix}",
+      "consumer_group" => "kb-cb-#{suffix}",
       "jobs_topics" => [@worker_topic],
       "events_topic" => @events_topic,
       "callbacks_topic" => @callbacks_topic,
@@ -93,14 +100,10 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
       "retry_topic" => @retry_base,
       "redis_url" => KafkaBatchSpec::RedisHelper::TEST_URL,
       "handler_manifest" => @manifest_path,
+      "ruby_callback_socket" => @callback_socket,
       "max_retries" => 2,
       "complete_after_retries" => 1,
-      "retry_tiers" => { "short" => 0, "medium" => 0, "large" => 0 },
-      "schedule_poller_enabled" => true,
-      "scheduled_topic" => @scheduled_topic,
-      "schedule_lease_seconds" => 30,
-      "schedule_batch_size" => 50,
-      "schedule_poll_interval" => 0.5
+      "retry_tiers" => { "short" => 0, "medium" => 0, "large" => 0 }
     }.to_yaml)
   end
 
@@ -113,8 +116,6 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
       c.go_executor_socket = ""
       c.handler_manifest_path = @manifest_path
       c.callbacks_topic = @callbacks_topic
-      c.scheduled_topic = @scheduled_topic
-      c.schedule_store = :redis
     end
     KafkaBatch::HandlerManifest.load!(@manifest_path)
     KafkaBatchSpec::RedisHelper.flush!
@@ -180,14 +181,45 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     Process.kill("KILL", @daemon_pid) rescue nil
   end
 
-  it "dispatches enqueue_job_in jobs via schedule poller to the worker topic" do
-    job_id = KafkaBatch::Batch.enqueue_job_in(1, "integration.go_scheduled", { "n" => 1 })
-
-    deadline = Time.now + 45
-    until File.exist?(@marker_path) || Time.now >= deadline
+  def wait_for_batch!(batch_id, status: %w[success complete], timeout: 45)
+    deadline = Time.now + timeout
+    loop do
+      data = KafkaBatch.store.find_batch(batch_id)
+      return data if data && status.include?(data[:status])
+      raise "timeout waiting for batch #{batch_id} (last=#{data&.dig(:status)})" if Time.now >= deadline
       sleep 0.25
     end
-    expect(File.exist?(@marker_path)).to be(true)
-    expect(File.read(@marker_path)).to eq(job_id)
+  end
+
+  def wait_for_callbacks!(batch_id, timeout: 45)
+    deadline = Time.now + timeout
+    loop do
+      inv = KafkaBatchSpec::CallbackDoubles.invocations
+      return inv if inv.any? { |i| i[:args]["batch_id"] == batch_id }
+      raise "timeout waiting for Ruby callbacks batch=#{batch_id}" if Time.now >= deadline
+      sleep 0.25
+    end
+  end
+
+  it "invokes on_success and on_complete via the Ruby callback socket" do
+    batch = KafkaBatch::Batch.create(
+      description: "ruby cb #{suffix}",
+      on_success: "RecordingCallback",
+      on_complete: "RecordingCallback"
+    ) do |b|
+      b.push_job("integration.go_daemon", { "ping" => 1 })
+    end
+
+    wait_for_batch!(batch.id)
+    invocations = wait_for_callbacks!(batch.id)
+
+    methods = invocations.map { |i| i[:name] }
+    expect(methods).to include(:on_success, :on_complete)
+
+    success = invocations.find { |i| i[:name] == :on_success }
+    expect(success[:args]["batch_id"]).to eq(batch.id)
+    expect(success[:args]["outcome"]).to eq("success")
+
+    expect(KafkaBatch.store.callback_dispatched?(batch.id)).to be(true)
   end
 end

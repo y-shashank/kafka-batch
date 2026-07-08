@@ -24,7 +24,8 @@ type Processor struct {
 	Cfg      config.Daemon
 	Store    *store.RedisStore
 	Producer Producer
-	FairTime *fairness.Scheduler
+	FairTime        *fairness.Scheduler
+	FairThroughput  *fairness.Scheduler
 	Now      func() time.Time
 }
 

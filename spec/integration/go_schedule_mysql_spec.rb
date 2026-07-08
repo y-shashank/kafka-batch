@@ -5,8 +5,9 @@ require "yaml"
 require "fileutils"
 
 require_relative "../support/go_daemon_helper"
+require_relative "../support/mysql_schedule_helper"
 
-RSpec.describe "Go daemon schedule poller (integration)", :integration do
+RSpec.describe "Go daemon schedule poller (MySQL store, integration)", :integration do
   def configured_brokers
     ENV["KAFKA_BATCH_TEST_BROKERS"].to_s
   end
@@ -35,18 +36,23 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
 
   before(:each) do
     skip "set KAFKA_BATCH_INTEGRATION=1 to run" unless opted_in?
+    skip "set KAFKA_BATCH_TEST_MYSQL_DSN for MySQL schedule integration" unless KafkaBatchSpec::MysqlScheduleHelper.available?
+
     require "rdkafka"
     skip "no Kafka broker reachable at #{brokers}" unless broker_reachable?
     skip "Go daemon binary unavailable" unless go_available?
 
-    @tmpdir = Dir.mktmpdir("kbatch-sched-#{suffix}")
+    KafkaBatchSpec::MysqlScheduleHelper.prepare!
+
+    @tmpdir = Dir.mktmpdir("kbatch-sched-mysql-#{suffix}")
     @marker_path = File.join(@tmpdir, "marker")
-    @worker_topic = "kb.sched.worker.#{suffix}"
-    @scheduled_topic = "kb.sched.scheduled.#{suffix}"
-    @events_topic = "kb.sched.events.#{suffix}"
-    @callbacks_topic = "kb.sched.callbacks.#{suffix}"
-    @dlt_topic = "kb.sched.dlt.#{suffix}"
-    @retry_base = "kb.sched.retry.#{suffix}"
+    @worker_topic = "kb.sched.mysql.worker.#{suffix}"
+    @scheduled_topic = "kb.sched.mysql.scheduled.#{suffix}"
+    @events_topic = "kb.sched.mysql.events.#{suffix}"
+    @callbacks_topic = "kb.sched.mysql.callbacks.#{suffix}"
+    @dlt_topic = "kb.sched.mysql.dlt.#{suffix}"
+    @retry_base = "kb.sched.mysql.retry.#{suffix}"
+    @mysql_dsn = KafkaBatchSpec::MysqlScheduleHelper.dsn
 
     write_manifest!
     write_daemon_config!
@@ -64,6 +70,7 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     stop_daemon! if @daemon_pid
     FileUtils.rm_rf(@tmpdir) if @tmpdir
     KafkaBatch::Producer.reset! if opted_in?
+    KafkaBatchSpec::MysqlScheduleHelper.truncate! if KafkaBatchSpec::MysqlScheduleHelper.available?
   end
 
   def write_manifest!
@@ -85,7 +92,7 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     @config_path = File.join(@tmpdir, "daemon.yml")
     File.write(@config_path, {
       "brokers" => brokers.split(","),
-      "consumer_group" => "kb-sched-#{suffix}",
+      "consumer_group" => "kb-sched-mysql-#{suffix}",
       "jobs_topics" => [@worker_topic],
       "events_topic" => @events_topic,
       "callbacks_topic" => @callbacks_topic,
@@ -98,6 +105,8 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
       "retry_tiers" => { "short" => 0, "medium" => 0, "large" => 0 },
       "schedule_poller_enabled" => true,
       "scheduled_topic" => @scheduled_topic,
+      "schedule_store" => "mysql",
+      "schedule_mysql_dsn" => @mysql_dsn,
       "schedule_lease_seconds" => 30,
       "schedule_batch_size" => 50,
       "schedule_poll_interval" => 0.5
@@ -114,7 +123,8 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
       c.handler_manifest_path = @manifest_path
       c.callbacks_topic = @callbacks_topic
       c.scheduled_topic = @scheduled_topic
-      c.schedule_store = :redis
+      c.schedule_store = :mysql
+      c.schedule_store_database_connection = { url: @mysql_dsn }
     end
     KafkaBatch::HandlerManifest.load!(@manifest_path)
     KafkaBatchSpec::RedisHelper.flush!
@@ -180,8 +190,8 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     Process.kill("KILL", @daemon_pid) rescue nil
   end
 
-  it "dispatches enqueue_job_in jobs via schedule poller to the worker topic" do
-    job_id = KafkaBatch::Batch.enqueue_job_in(1, "integration.go_scheduled", { "n" => 1 })
+  it "dispatches enqueue_job_at jobs via MySQL index and Go schedule poller" do
+    job_id = KafkaBatch::Batch.enqueue_job_at(Time.now + 1, "integration.go_scheduled", { "n" => 1 })
 
     deadline = Time.now + 45
     until File.exist?(@marker_path) || Time.now >= deadline
@@ -189,5 +199,10 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     end
     expect(File.exist?(@marker_path)).to be(true)
     expect(File.read(@marker_path)).to eq(job_id)
+
+    KafkaBatchSpec::MysqlScheduleHelper.with_client do |c|
+      rows = c.query("SELECT COUNT(*) AS n FROM kafka_batch_scheduled_jobs").first
+      expect(rows["n"]).to eq(0)
+    end
   end
 end

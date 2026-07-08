@@ -68,7 +68,14 @@ func (r DaemonRouter) fairRoute(fairnessType, jobID, tenantID, batchID string) (
 		}
 		return Route{Topic: r.Cfg.FairnessTimeIngest, Key: key}, nil
 	case "throughput":
-		return Route{}, fmt.Errorf("throughput fairness lane not implemented in Go daemon")
+		key := tenantID
+		if key == "" {
+			key = batchID
+		}
+		if key == "" {
+			key = jobID
+		}
+		return Route{Topic: r.Cfg.FairnessThroughputIngest, Key: key}, nil
 	default:
 		return Route{}, fmt.Errorf("unknown fairness_type %q", fairnessType)
 	}

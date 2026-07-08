@@ -50,6 +50,14 @@ func init() {
 		return nil
 	})
 
+	kbatch.Register("integration.go_fair_throughput", func(ctx *kbatch.Context) error {
+		if marker := os.Getenv("KBATCH_DAEMON_ITEST_MARKER_TP"); marker != "" {
+			tenant, _ := ctx.Payload["tenant"].(string)
+			return os.WriteFile(marker, []byte(ctx.JobID+":"+tenant), 0o644)
+		}
+		return nil
+	})
+
 	kbatch.Register("integration.go_scheduled", func(ctx *kbatch.Context) error {
 		if marker := os.Getenv("KBATCH_DAEMON_ITEST_MARKER"); marker != "" {
 			return os.WriteFile(marker, []byte(ctx.JobID), 0o644)

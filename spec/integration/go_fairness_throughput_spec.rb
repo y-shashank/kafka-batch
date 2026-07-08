@@ -6,7 +6,7 @@ require "fileutils"
 
 require_relative "../support/go_daemon_helper"
 
-RSpec.describe "Go daemon schedule poller (integration)", :integration do
+RSpec.describe "Go daemon throughput fairness (integration)", :integration do
   def configured_brokers
     ENV["KAFKA_BATCH_TEST_BROKERS"].to_s
   end
@@ -33,26 +33,40 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     File.executable?(daemon_binary) || system("which go >/dev/null 2>&1")
   end
 
+  def throughput_handlers
+    {
+      "integration.go_fair_throughput" => {
+        "runtime" => "go",
+        "topic" => @worker_topic,
+        "apply_topic_prefix" => false,
+        "fairness_type" => "throughput",
+        "max_retries" => 2
+      }
+    }
+  end
+
   before(:each) do
     skip "set KAFKA_BATCH_INTEGRATION=1 to run" unless opted_in?
     require "rdkafka"
     skip "no Kafka broker reachable at #{brokers}" unless broker_reachable?
     skip "Go daemon binary unavailable" unless go_available?
 
-    @tmpdir = Dir.mktmpdir("kbatch-sched-#{suffix}")
-    @marker_path = File.join(@tmpdir, "marker")
-    @worker_topic = "kb.sched.worker.#{suffix}"
-    @scheduled_topic = "kb.sched.scheduled.#{suffix}"
-    @events_topic = "kb.sched.events.#{suffix}"
-    @callbacks_topic = "kb.sched.callbacks.#{suffix}"
-    @dlt_topic = "kb.sched.dlt.#{suffix}"
-    @retry_base = "kb.sched.retry.#{suffix}"
+    @tmpdir = Dir.mktmpdir("kbatch-fair-tp-#{suffix}")
+    @marker_path = File.join(@tmpdir, "marker_tp")
+    @worker_topic = "kb.fair.tp.worker.#{suffix}"
+    @fair_ingest_topic = "kb.fair.tp.ingest.#{suffix}"
+    @fair_ready_topic = "kb.fair.tp.ready.#{suffix}"
+    @events_topic = "kb.fair.tp.events.#{suffix}"
+    @callbacks_topic = "kb.fair.tp.callbacks.#{suffix}"
+    @dlt_topic = "kb.fair.tp.dlt.#{suffix}"
+    @retry_base = "kb.fair.tp.retry.#{suffix}"
 
-    write_manifest!
+    write_manifest!(throughput_handlers)
     write_daemon_config!
 
-    [@worker_topic, @scheduled_topic, @events_topic, @callbacks_topic, @dlt_topic,
-     "#{@retry_base}.short", "#{@retry_base}.medium", "#{@retry_base}.large"].each do |t|
+    [@worker_topic, @fair_ingest_topic, @fair_ready_topic, @events_topic,
+     @callbacks_topic, @dlt_topic, "#{@retry_base}.short",
+     "#{@retry_base}.medium", "#{@retry_base}.large"].each do |t|
       create_topic!(t)
     end
 
@@ -66,18 +80,9 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     KafkaBatch::Producer.reset! if opted_in?
   end
 
-  def write_manifest!
+  def write_manifest!(handlers)
     @manifest_path = File.join(@tmpdir, "handlers.yml")
-    File.write(@manifest_path, {
-      "handlers" => {
-        "integration.go_scheduled" => {
-          "runtime" => "go",
-          "topic" => @worker_topic,
-          "apply_topic_prefix" => false,
-          "max_retries" => 2
-        }
-      }
-    }.to_yaml)
+    File.write(@manifest_path, { "handlers" => handlers }.to_yaml)
   end
 
   def write_daemon_config!
@@ -85,7 +90,7 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     @config_path = File.join(@tmpdir, "daemon.yml")
     File.write(@config_path, {
       "brokers" => brokers.split(","),
-      "consumer_group" => "kb-sched-#{suffix}",
+      "consumer_group" => "kb-fair-tp-#{suffix}",
       "jobs_topics" => [@worker_topic],
       "events_topic" => @events_topic,
       "callbacks_topic" => @callbacks_topic,
@@ -96,11 +101,14 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
       "max_retries" => 2,
       "complete_after_retries" => 1,
       "retry_tiers" => { "short" => 0, "medium" => 0, "large" => 0 },
-      "schedule_poller_enabled" => true,
-      "scheduled_topic" => @scheduled_topic,
-      "schedule_lease_seconds" => 30,
-      "schedule_batch_size" => 50,
-      "schedule_poll_interval" => 0.5
+      "fairness_enabled" => true,
+      "fairness_throughput_ingest" => @fair_ingest_topic,
+      "fairness_throughput_ready" => @fair_ready_topic,
+      "fairness_ready_window" => 100,
+      "fairness_global_concurrency" => 4,
+      "fairness_lease_ttl" => 300,
+      "fairness_default_weight" => 1.0,
+      "fairness_weighted_concurrency" => false
     }.to_yaml)
   end
 
@@ -113,8 +121,8 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
       c.go_executor_socket = ""
       c.handler_manifest_path = @manifest_path
       c.callbacks_topic = @callbacks_topic
-      c.scheduled_topic = @scheduled_topic
-      c.schedule_store = :redis
+      c.fair_throughput_ingest_topic = @fair_ingest_topic
+      c.fair_throughput_ready_topic = @fair_ready_topic
     end
     KafkaBatch::HandlerManifest.load!(@manifest_path)
     KafkaBatchSpec::RedisHelper.flush!
@@ -134,7 +142,7 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     admin&.close
   end
 
-  def create_topic!(name, partitions: 1)
+  def create_topic!(name, partitions: 3)
     cfg   = Rdkafka::Config.new(:"bootstrap.servers" => brokers)
     admin = cfg.admin
     admin.create_topic(name, partitions, 1).wait(max_wait_timeout: 15)
@@ -146,7 +154,7 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
 
   def start_daemon!
     env = ENV.to_h.merge(
-      "KBATCH_DAEMON_ITEST_MARKER" => @marker_path,
+      "KBATCH_DAEMON_ITEST_MARKER_TP" => @marker_path,
       "KBATCH_DAEMON_READY_FILE" => @ready_path,
       "REDIS_URL" => KafkaBatchSpec::RedisHelper::TEST_URL,
       "KAFKA_PREFIX" => ""
@@ -180,14 +188,52 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     Process.kill("KILL", @daemon_pid) rescue nil
   end
 
-  it "dispatches enqueue_job_in jobs via schedule poller to the worker topic" do
-    job_id = KafkaBatch::Batch.enqueue_job_in(1, "integration.go_scheduled", { "n" => 1 })
-
-    deadline = Time.now + 45
-    until File.exist?(@marker_path) || Time.now >= deadline
+  def wait_for_batch!(batch_id, status: %w[success complete], timeout: 60)
+    deadline = Time.now + timeout
+    loop do
+      data = KafkaBatch.store.find_batch(batch_id)
+      return data if data && status.include?(data[:status])
+      raise "timeout waiting for batch #{batch_id} (last=#{data&.dig(:status)})" if Time.now >= deadline
       sleep 0.25
     end
+  end
+
+  def fair_inflight_total
+    r = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+    r.zcard("kafka_batch:fair_throughput:leases")
+  ensure
+    r&.close
+  end
+
+  it "routes throughput-fair jobs through ingest → forwarder → ready and completes the batch" do
+    job_id = nil
+    batch = KafkaBatch::Batch.create(description: "go fair throughput #{suffix}") do |b|
+      job_id = b.push_job("integration.go_fair_throughput", { "tenant" => "acme" }, tenant_id: "acme")
+    end
+
+    wait_for_batch!(batch.id)
+
     expect(File.exist?(@marker_path)).to be(true)
-    expect(File.read(@marker_path)).to eq(job_id)
+    expect(File.read(@marker_path)).to eq("#{job_id}:acme")
+
+    reloaded = KafkaBatch.store.find_batch(batch.id)
+    expect(reloaded[:status]).to eq("success")
+    expect(reloaded[:completed_count]).to eq(1)
+    expect(fair_inflight_total).to eq(0)
+  end
+
+  it "interleaves two tenants on the throughput lane without leaking slots" do
+    batch = KafkaBatch::Batch.create(description: "tp two-tenant #{suffix}") do |b|
+      b.push_job("integration.go_fair_throughput", { "tenant" => "A" }, tenant_id: "A")
+      b.push_job("integration.go_fair_throughput", { "tenant" => "B" }, tenant_id: "B")
+      b.push_job("integration.go_fair_throughput", { "tenant" => "A" }, tenant_id: "A")
+    end
+
+    wait_for_batch!(batch.id)
+
+    reloaded = KafkaBatch.store.find_batch(batch.id)
+    expect(reloaded[:status]).to eq("success")
+    expect(reloaded[:completed_count]).to eq(3)
+    expect(fair_inflight_total).to eq(0)
   end
 end

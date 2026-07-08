@@ -117,6 +117,34 @@ func TestClaimSlotExecutionDedup(t *testing.T) {
 	}
 }
 
+func TestThroughputCheckoutAdvancesVtimeAtDispatch(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	s := NewScheduler(rdb, Settings{
+		Lane: LaneThroughput, ReadyWindow: 100, GlobalConcurrency: 4,
+		LeaseTTL: 120, DefaultWeight: 1.0, WeightedConcurrency: false,
+	})
+	ctx := context.Background()
+	_, _ = s.Enqueue(ctx, "acme", mustJSON(t, map[string]interface{}{"job_id": "j1", "tenant_id": "acme"}))
+
+	job, err := s.Checkout(ctx)
+	if err != nil || job == nil {
+		t.Fatalf("checkout %+v err=%v", job, err)
+	}
+	vt, _ := s.Vtime(ctx, "acme")
+	if vt <= 0 {
+		t.Fatalf("throughput vtime should advance at dispatch, got %f", vt)
+	}
+	_, _ = s.ConfirmForward(ctx, job.SlotID)
+	if err := s.Complete(ctx, job.TenantID, job.SlotID, 0); err != nil {
+		t.Fatal(err)
+	}
+	stats, _ := s.Stats(ctx)
+	if stats.InflightTotal != 0 {
+		t.Fatalf("inflight after complete %d", stats.InflightTotal)
+	}
+}
+
 func TestDispatcherTenantFallback(t *testing.T) {
 	s, _ := testScheduler(t)
 	d := &Dispatcher{Lane: LaneTime, Scheduler: s}

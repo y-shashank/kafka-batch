@@ -42,16 +42,13 @@ func parseFairMeta(raw []byte) fairMeta {
 }
 
 func (p *Processor) withFairSlot(ctx context.Context, raw []byte, perform func() error) error {
-	if p.FairTime == nil {
+	sched := p.fairScheduler(raw)
+	if sched == nil {
 		return perform()
 	}
 	fm := parseFairMeta(raw)
 	if !fm.slot || fm.slotID == "" {
 		return perform()
-	}
-	sched := p.FairTime
-	if fm.lane != fairness.LaneTime {
-		return perform() // throughput lane deferred
 	}
 	tenant := fm.tenantID
 	if tenant == "" {
@@ -66,7 +63,7 @@ func (p *Processor) withFairSlot(ctx context.Context, raw []byte, perform func()
 	}
 	start := p.now()
 	renewStop := make(chan struct{})
-	go p.renewFairLease(renewStop, tenant, fm.slotID)
+	go p.renewFairLease(renewStop, tenant, fm.slotID, sched)
 	defer close(renewStop)
 
 	performErr := perform()
@@ -75,11 +72,19 @@ func (p *Processor) withFairSlot(ctx context.Context, raw []byte, perform func()
 	return performErr
 }
 
-func (p *Processor) renewFairLease(stop <-chan struct{}, tenantID, slotID string) {
-	if p.FairTime == nil {
+func (p *Processor) fairScheduler(raw []byte) *fairness.Scheduler {
+	fm := parseFairMeta(raw)
+	if fm.lane == fairness.LaneThroughput {
+		return p.FairThroughput
+	}
+	return p.FairTime
+}
+
+func (p *Processor) renewFairLease(stop <-chan struct{}, tenantID, slotID string, sched *fairness.Scheduler) {
+	if sched == nil {
 		return
 	}
-	ttl := p.FairTime.Settings.EffectiveLeaseTTL()
+	ttl := sched.Settings.EffectiveLeaseTTL()
 	interval := ttl / 3
 	if interval < 10 {
 		interval = 10
@@ -91,7 +96,7 @@ func (p *Processor) renewFairLease(stop <-chan struct{}, tenantID, slotID string
 		case <-stop:
 			return
 		case <-ticker.C:
-			_ = p.FairTime.RenewLease(context.Background(), tenantID, slotID)
+			_ = sched.RenewLease(context.Background(), tenantID, slotID)
 		}
 	}
 }

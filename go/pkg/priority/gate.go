@@ -52,11 +52,19 @@ func (l *LagReader) GroupHasLag(ctx context.Context, group string, topics []stri
 
 // Gate caches lag checks (mirrors Ruby PriorityGate).
 type Gate struct {
-	Reader   LagChecker
-	Interval time.Duration
-	mu       sync.Mutex
-	lastCheck time.Time
+	Reader        LagChecker
+	Interval      time.Duration
+	Consumption   TopicPauseFilter
+	ConsumerGroup string
+
+	mu         sync.Mutex
+	lastCheck  time.Time
 	lastResult bool
+}
+
+// TopicPauseFilter excludes topic-level-paused topics from lag gating.
+type TopicPauseFilter interface {
+	ActiveHigherTopics(ctx context.Context, group string, higher []string) []string
 }
 
 func NewGate(reader LagChecker, interval time.Duration) *Gate {
@@ -69,6 +77,7 @@ func NewGate(reader LagChecker, interval time.Duration) *Gate {
 // HigherTopicsHaveLag returns true when higher-ranked topics still have backlog.
 // On error, returns the last successful result (fail open when never checked).
 func (g *Gate) HigherTopicsHaveLag(ctx context.Context, group string, topics []string, force bool) bool {
+	topics = g.filterHigher(ctx, group, topics)
 	if len(topics) == 0 {
 		return false
 	}
@@ -88,6 +97,13 @@ func (g *Gate) HigherTopicsHaveLag(ctx context.Context, group string, topics []s
 	g.lastCheck = now
 	g.lastResult = hasLag
 	return hasLag
+}
+
+func (g *Gate) filterHigher(ctx context.Context, group string, topics []string) []string {
+	if g.Consumption != nil {
+		return g.Consumption.ActiveHigherTopics(ctx, group, topics)
+	}
+	return topics
 }
 
 // ShouldYield decides whether a lower-ranked message should pause (Ruby PriorityJobConsumer).

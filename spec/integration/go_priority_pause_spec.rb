@@ -6,7 +6,7 @@ require "fileutils"
 
 require_relative "../support/go_daemon_helper"
 
-RSpec.describe "Go daemon schedule poller (integration)", :integration do
+RSpec.describe "Go daemon priority + consumption pause (integration)", :integration do
   def configured_brokers
     ENV["KAFKA_BATCH_TEST_BROKERS"].to_s
   end
@@ -33,25 +33,30 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     File.executable?(daemon_binary) || system("which go >/dev/null 2>&1")
   end
 
+  def priority_group
+    "kb-pause-#{suffix}-jobs-fast"
+  end
+
   before(:each) do
     skip "set KAFKA_BATCH_INTEGRATION=1 to run" unless opted_in?
     require "rdkafka"
     skip "no Kafka broker reachable at #{brokers}" unless broker_reachable?
     skip "Go daemon binary unavailable" unless go_available?
 
-    @tmpdir = Dir.mktmpdir("kbatch-sched-#{suffix}")
+    @tmpdir = Dir.mktmpdir("kbatch-pause-#{suffix}")
     @marker_path = File.join(@tmpdir, "marker")
-    @worker_topic = "kb.sched.worker.#{suffix}"
-    @scheduled_topic = "kb.sched.scheduled.#{suffix}"
-    @events_topic = "kb.sched.events.#{suffix}"
-    @callbacks_topic = "kb.sched.callbacks.#{suffix}"
-    @dlt_topic = "kb.sched.dlt.#{suffix}"
-    @retry_base = "kb.sched.retry.#{suffix}"
+    @p0_topic = "kb.pause.p0.#{suffix}"
+    @p1_topic = "kb.pause.p1.#{suffix}"
+    @events_topic = "kb.pause.events.#{suffix}"
+    @callbacks_topic = "kb.pause.callbacks.#{suffix}"
+    @dlt_topic = "kb.pause.dlt.#{suffix}"
+    @retry_base = "kb.pause.retry.#{suffix}"
 
+    write_priority_yaml!
     write_manifest!
     write_daemon_config!
 
-    [@worker_topic, @scheduled_topic, @events_topic, @callbacks_topic, @dlt_topic,
+    [@p0_topic, @p1_topic, @events_topic, @callbacks_topic, @dlt_topic,
      "#{@retry_base}.short", "#{@retry_base}.medium", "#{@retry_base}.large"].each do |t|
       create_topic!(t)
     end
@@ -66,13 +71,28 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     KafkaBatch::Producer.reset! if opted_in?
   end
 
+  def write_priority_yaml!
+    @priority_path = File.join(@tmpdir, "priority.yml")
+    File.write(@priority_path, {
+      "consumer_group_suffix" => "jobs-fast",
+      "mode" => "strict",
+      "topics" => [@p0_topic, @p1_topic]
+    }.to_yaml)
+  end
+
   def write_manifest!
     @manifest_path = File.join(@tmpdir, "handlers.yml")
     File.write(@manifest_path, {
       "handlers" => {
-        "integration.go_scheduled" => {
+        "integration.go_p0" => {
           "runtime" => "go",
-          "topic" => @worker_topic,
+          "topic" => @p0_topic,
+          "apply_topic_prefix" => false,
+          "max_retries" => 2
+        },
+        "integration.go_p1" => {
+          "runtime" => "go",
+          "topic" => @p1_topic,
           "apply_topic_prefix" => false,
           "max_retries" => 2
         }
@@ -85,8 +105,7 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     @config_path = File.join(@tmpdir, "daemon.yml")
     File.write(@config_path, {
       "brokers" => brokers.split(","),
-      "consumer_group" => "kb-sched-#{suffix}",
-      "jobs_topics" => [@worker_topic],
+      "consumer_group" => "kb-pause-#{suffix}",
       "events_topic" => @events_topic,
       "callbacks_topic" => @callbacks_topic,
       "dead_letter_topic" => @dlt_topic,
@@ -96,11 +115,9 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
       "max_retries" => 2,
       "complete_after_retries" => 1,
       "retry_tiers" => { "short" => 0, "medium" => 0, "large" => 0 },
-      "schedule_poller_enabled" => true,
-      "scheduled_topic" => @scheduled_topic,
-      "schedule_lease_seconds" => 30,
-      "schedule_batch_size" => 50,
-      "schedule_poll_interval" => 0.5
+      "priority_config_paths" => [@priority_path],
+      "priority_lag_check_interval" => 1,
+      "consumption_control_refresh_interval" => 1
     }.to_yaml)
   end
 
@@ -113,8 +130,6 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
       c.go_executor_socket = ""
       c.handler_manifest_path = @manifest_path
       c.callbacks_topic = @callbacks_topic
-      c.scheduled_topic = @scheduled_topic
-      c.schedule_store = :redis
     end
     KafkaBatch::HandlerManifest.load!(@manifest_path)
     KafkaBatchSpec::RedisHelper.flush!
@@ -180,14 +195,22 @@ RSpec.describe "Go daemon schedule poller (integration)", :integration do
     Process.kill("KILL", @daemon_pid) rescue nil
   end
 
-  it "dispatches enqueue_job_in jobs via schedule poller to the worker topic" do
-    job_id = KafkaBatch::Batch.enqueue_job_in(1, "integration.go_scheduled", { "n" => 1 })
+  it "processes p1 while p0 is topic-paused even when p0 has backlog" do
+    KafkaBatch::ConsumptionControl.pause_topic(group: priority_group, topic: @p0_topic)
+
+    # Seed unread p0 backlog (consumer is paused on p0, so lag remains).
+    KafkaBatch::Batch.enqueue_job("integration.go_p0", { "n" => 1 })
+
+    job_id = KafkaBatch::Batch.enqueue_job("integration.go_p1", { "n" => 2 })
 
     deadline = Time.now + 45
     until File.exist?(@marker_path) || Time.now >= deadline
       sleep 0.25
     end
+
     expect(File.exist?(@marker_path)).to be(true)
     expect(File.read(@marker_path)).to eq(job_id)
+  ensure
+    KafkaBatch::ConsumptionControl.resume_topic(group: priority_group, topic: @p0_topic)
   end
 end

@@ -15,6 +15,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
+	"github.com/y-shashank/kafka-batch/go/pkg/consumption"
 	"github.com/y-shashank/kafka-batch/go/pkg/control/callback"
 	"github.com/y-shashank/kafka-batch/go/pkg/control/event"
 	"github.com/y-shashank/kafka-batch/go/pkg/control/job"
@@ -123,14 +124,23 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 	eventProc := &event.Processor{Cfg: cfg, Store: st, Producer: prod}
 	retryProc := &retry.Processor{Producer: prod, MaxPause: cfg.RetryMaxPause}
-	cbProc := &callback.Processor{Store: st, Invoker: callback.LogInvoker{}, NodeID: cfg.NodeID}
+
+	var cbInvoker callback.Invoker = callback.LogInvoker{}
+	if cfg.RubyCallbackSocket != "" {
+		cbInvoker = callback.RubySocketInvoker{SocketPath: cfg.RubyCallbackSocket}
+	}
+	cbProc := &callback.Processor{
+		Store: st, Invoker: cbInvoker, NodeID: cfg.NodeID,
+		DLT: callbackDLT{prod: prod, topic: cfg.DeadLetterTopic},
+	}
+	pauseCtl := consumption.NewControl(rdb, cfg.ConsumptionControlRefreshInterval)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	errCh := make(chan error, 8)
 	if len(jobTopics) > 0 {
-		go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-jobs", jobTopics, handleJob, errCh)
+		go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-jobs", jobTopics, handleJob, errCh, pauseCtl)
 	}
 
 	lagClient, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
@@ -141,7 +151,8 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	priorityLag := priority.NewLagReader(lagClient)
 	for _, pc := range prioReg.Configs {
 		gate := priority.NewGate(priorityLag, cfg.PriorityLagCheckInterval)
-		go runPriorityGroup(ctx, cfg, pc, gate, handleJob, errCh)
+		gate.Consumption = pauseCtl
+		go runPriorityGroup(ctx, cfg, pc, gate, handleJob, errCh, pauseCtl)
 	}
 	if len(prioReg.Configs) > 0 {
 		log.Printf("kbatch priority consumers enabled groups=%d", len(prioReg.Configs))
@@ -150,7 +161,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-events", []string{cfg.EventsTopic}, func(rec *kgo.Record) error {
 		_, err := eventProc.ProcessBatch(ctx, [][]byte{rec.Value})
 		return err
-	}, errCh)
+	}, errCh, nil)
 
 	retryTopics := cfg.RetryTopics()
 	if len(retryTopics) > 0 {
@@ -182,16 +193,29 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 				return fmt.Errorf("retry paused")
 			}
 			return nil
-		}, errCh)
+		}, errCh, pauseCtl)
 	}
 
 	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-callbacks", []string{cfg.CallbacksTopic}, func(rec *kgo.Record) error {
 		_, err := cbProc.Process(ctx, rec.Value)
 		return err
-	}, errCh)
+	}, errCh, pauseCtl)
 
 	if cfg.SchedulePollerEnabled {
-		schedStore := schedule.NewRedisStore(rdb, cfg.ScheduleBatchSize*5)
+		var schedStore schedule.IndexStore
+		var mysqlSched *schedule.MysqlStore
+		switch strings.ToLower(cfg.ScheduleStore) {
+		case "mysql":
+			ms, err := schedule.NewMysqlStore(cfg.ScheduleMySQLDSN, cfg.ScheduleBatchSize*5)
+			if err != nil {
+				return fmt.Errorf("schedule mysql store: %w", err)
+			}
+			mysqlSched = ms
+			schedStore = ms
+			defer mysqlSched.Close()
+		default:
+			schedStore = schedule.NewRedisStore(rdb, cfg.ScheduleBatchSize*5)
+		}
 		reader, err := schedule.NewReader(cfg.Brokers, cfg.ScheduledTopic)
 		if err != nil {
 			return fmt.Errorf("schedule reader: %w", err)
@@ -220,36 +244,12 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 
 	if cfg.FairnessEnabled {
-		fairSched := fairness.NewScheduler(rdb, cfg.FairnessTimeSettings())
-		jobProc.FairTime = fairSched
-		coord := fairness.NewCoordinator(func(lane fairness.Lane) {
-			if lane != fairness.LaneTime {
-				return
-			}
-			fwd := &fairness.Forwarder{
-				Lane: lane, Scheduler: fairSched,
-				ReadyTopic: cfg.FairnessTimeReady, Producer: prod,
-			}
-			go fwd.Run(ctx)
-		})
-		fairDisp := &fairness.Dispatcher{
-			Lane: fairness.LaneTime, Scheduler: fairSched,
-			OnStartFwd: coord.OnStart(fairness.LaneTime),
-		}
-		go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-dispatch-time",
-			[]string{cfg.FairnessTimeIngest}, func(rec *kgo.Record) error {
-				out, err := fairDisp.Process(ctx, rec.Value)
-				if err != nil {
-					return err
-				}
-				if !out.CommitOffset {
-					return fmt.Errorf("fair ingest backpressure tenant=%s", out.TenantID)
-				}
-				return nil
-			}, errCh)
-		go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-ready-time",
-			[]string{cfg.FairnessTimeReady}, handleJob, errCh)
-		log.Printf("kbatch fairness enabled ingest=%s ready=%s", cfg.FairnessTimeIngest, cfg.FairnessTimeReady)
+		wireFairLane(ctx, cfg, rdb, prod, jobProc, handleJob, errCh, pauseCtl,
+			fairness.LaneTime, cfg.FairnessTimeIngest, cfg.FairnessTimeReady, cfg.FairnessTimeSettings())
+		wireFairLane(ctx, cfg, rdb, prod, jobProc, handleJob, errCh, pauseCtl,
+			fairness.LaneThroughput, cfg.FairnessThroughputIngest, cfg.FairnessThroughputReady, cfg.FairnessThroughputSettings())
+		log.Printf("kbatch fairness enabled time=%s throughput=%s",
+			cfg.FairnessTimeIngest, cfg.FairnessThroughputIngest)
 	}
 
 	log.Printf("kbatch daemon running group=%s topics=%v", cfg.ConsumerGroup, jobTopics)
@@ -264,7 +264,59 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 }
 
-func runPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, errCh chan<- error) {
+func wireFairLane(
+	ctx context.Context,
+	cfg config.Daemon,
+	rdb *redis.Client,
+	prod *kafkaclient.Client,
+	jobProc *job.Processor,
+	handleJob func(*kgo.Record) error,
+	errCh chan<- error,
+	pauseCtl *consumption.Control,
+	lane fairness.Lane,
+	ingest, ready string,
+	settings fairness.Settings,
+) {
+	sched := fairness.NewScheduler(rdb, settings)
+	if lane == fairness.LaneTime {
+		jobProc.FairTime = sched
+	} else {
+		jobProc.FairThroughput = sched
+	}
+	coord := fairness.NewCoordinator(func(l fairness.Lane) {
+		if l != lane {
+			return
+		}
+		fwd := &fairness.Forwarder{Lane: l, Scheduler: sched, ReadyTopic: ready, Producer: prod}
+		go fwd.Run(ctx)
+	})
+	disp := &fairness.Dispatcher{Lane: lane, Scheduler: sched, OnStartFwd: coord.OnStart(lane)}
+	suffix := string(lane)
+	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-dispatch-"+suffix,
+		[]string{ingest}, func(rec *kgo.Record) error {
+			out, err := disp.Process(ctx, rec.Value)
+			if err != nil {
+				return err
+			}
+			if !out.CommitOffset {
+				return fmt.Errorf("fair ingest backpressure lane=%s tenant=%s", lane, out.TenantID)
+			}
+			return nil
+		}, errCh, pauseCtl)
+	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-ready-"+suffix,
+		[]string{ready}, handleJob, errCh, pauseCtl)
+}
+
+type callbackDLT struct {
+	prod  *kafkaclient.Client
+	topic string
+}
+
+func (d callbackDLT) ProduceDLT(ctx context.Context, key string, payload []byte) error {
+	return d.prod.Produce(ctx, d.topic, key, payload)
+}
+
+func runPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, errCh chan<- error, pauseCtl *consumption.Control) {
 	specByTopic := map[string]priority.TopicSpec{}
 	for _, s := range pc.TopicSpecs() {
 		specByTopic[s.Topic] = s
@@ -310,6 +362,10 @@ func runPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config
 			if !ok {
 				return
 			}
+			if pauseCtl != nil && pauseCtl.Paused(ctx, pc.ConsumerGroup, rec.Topic, rec.Partition) {
+				time.Sleep(yieldSleep)
+				return
+			}
 			tick := weightedTicks[rec.Topic]
 			if yield, _ := priority.ShouldYield(spec, gate, &tick, ctx); yield {
 				weightedTicks[rec.Topic] = tick
@@ -327,7 +383,7 @@ func runPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config
 	}
 }
 
-func runConsumer(ctx context.Context, brokers []string, group string, topics []string, handle func(*kgo.Record) error, errCh chan<- error) {
+func runConsumer(ctx context.Context, brokers []string, group string, topics []string, handle func(*kgo.Record) error, errCh chan<- error, pauseCtl *consumption.Control) {
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(group),
@@ -358,6 +414,10 @@ func runConsumer(ctx context.Context, brokers []string, group string, topics []s
 			}
 		}
 		fetches.EachRecord(func(rec *kgo.Record) {
+			if pauseCtl != nil && pauseCtl.Paused(ctx, group, rec.Topic, rec.Partition) {
+				time.Sleep(time.Second)
+				return
+			}
 			if err := handle(rec); err != nil {
 				log.Printf("[kbatch-daemon] handler error topic=%s offset=%d: %v", rec.Topic, rec.Offset, err)
 				return
