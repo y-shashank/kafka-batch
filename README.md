@@ -221,7 +221,7 @@ class MyWorker
   job_type "orders.process"    # stable cross-language ID (optional — see below)
   kafka_topic "orders.process" # optional — defaults to config.jobs_topic;
                                # topic_prefix applied automatically (see below)
-  executor :ruby               # default; :go in a future release
+  executor :ruby               # default; :go delegates #perform to the kbatch sidecar
   max_retries 5
   retry_tier :large            # pin all retries to one tier (optional)
   fairness_type :time          # :time or :throughput — opts into WFQ lane (optional)
@@ -265,7 +265,61 @@ job_type "campaign.fast_p0"
 }
 ```
 
-Legacy messages with only `worker_class` still work. Phase 1 supports **`executor :ruby`** only; the registry API is the extension point for a future Go sidecar (`executor :go`).
+Legacy messages with only `worker_class` still work.
+
+**Executors:**
+
+| `executor` | Where `#perform` runs |
+|------------|----------------------|
+| `:ruby` (default) | In-process Ruby `Worker#perform` |
+| `:go` | Go handler via `kbatch serve` sidecar (Unix socket RPC) |
+
+### Go handlers (Phase 2)
+
+Hybrid hosts run Ruby Karafka for the control plane (fairness, retries, batches) and a **Go sidecar** for hot handlers.
+
+**1. Register handlers in Go** (`go/pkg/kbatch`):
+
+```go
+kbatch.Register("segment.export", func(ctx *kbatch.Context) error {
+    return exportSegment(ctx.Payload)
+})
+```
+
+**2. Start the sidecar** (alongside `karafka server`):
+
+```bash
+kbatch serve --socket /var/run/kbatch.sock
+```
+
+**3. Configure the Ruby host:**
+
+```ruby
+# config/initializers/kafka_batch.rb
+config.go_executor_socket = "/var/run/kbatch.sock"
+config.handler_manifest_path = Rails.root.join("config/kafka_batch_handlers.yml").to_s
+```
+
+**Manifest** (`config/kafka_batch_handlers.yml`) — for Go-only handlers with no Ruby worker class:
+
+```yaml
+handlers:
+  segment.export:
+    runtime: go
+    topic: segment.exports
+    max_retries: 25
+```
+
+Or declare a thin Ruby worker that owns routing/topic and sets `executor :go`.
+
+**Enqueue by `job_type`:**
+
+```ruby
+batch.push_job("segment.export", "segment_id" => 42)
+KafkaBatch::Batch.enqueue_job("segment.export", "segment_id" => 42)
+```
+
+Protocol fixtures live in `protocol/`; the Go module is under `go/` (same repo, separate artifact — not shipped via RubyGems).
 
 ### Standalone jobs (no batch)
 

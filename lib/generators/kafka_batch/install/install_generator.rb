@@ -59,6 +59,7 @@ module KafkaBatch
       def copy_priority_examples
         copy_file "priority/jobs-fast.yml", "config/kafka_batch/priority/jobs-fast.yml"
         copy_file "priority/jobs-slow.yml", "config/kafka_batch/priority/jobs-slow.yml"
+        copy_file "kafka_batch_handlers.yml", "config/kafka_batch_handlers.yml"
       end
 
       def copy_migrations

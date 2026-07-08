@@ -1,12 +1,15 @@
 # frozen_string_literal: true
 
 module KafkaBatch
-  # Maps stable job_type identifiers to execution handlers.
-  # Phase 1: Ruby workers only; future phases add :go executors for hybrid hosts.
+# Maps stable job_type identifiers to execution handlers (:ruby in-process, :go sidecar).
   class HandlerRegistry
     class UnknownHandler < Error; end
 
-    Handler = Struct.new(:job_type, :runtime, :worker_class, :executor, keyword_init: true)
+    Handler = Struct.new(:job_type, :runtime, :worker_class, :executor, :definition, keyword_init: true) do
+      def worker_class_name
+        definition&.worker_class_name || worker_class&.name.to_s
+      end
+    end
 
     @mutex           = Mutex.new
     @by_job_type     = {}
@@ -19,27 +22,64 @@ module KafkaBatch
         end
 
         runtime = worker_class.executor
+        if runtime == :go
+          return register_go(worker_class)
+        end
         unless runtime == :ruby
-          raise ArgumentError, "unsupported executor #{runtime.inspect} for #{worker_class} (Phase 1: :ruby only)"
+          raise ArgumentError, "unsupported executor #{runtime.inspect} for #{worker_class}"
         end
 
-        job_type = worker_class.job_type
-        handler  = Handler.new(
+        register_definition(HandlerDefinition.from_worker(worker_class))
+      end
+
+      def register_go(worker_class = nil, definition: nil)
+        definition ||= HandlerDefinition.from_worker(worker_class)
+        unless definition.runtime == :go
+          raise ArgumentError, "register_go requires runtime :go (got #{definition.runtime.inspect})"
+        end
+
+        register_definition(definition, executor: Executors::Go.new)
+      end
+
+      def register_definition(definition, executor: nil)
+        job_type = definition.job_type
+        worker_class = definition.worker_class
+        runtime = definition.runtime
+
+        exec =
+          case runtime
+          when :ruby
+            raise ArgumentError, "ruby handler missing worker_class for #{job_type}" unless worker_class
+            executor || Executors::Ruby.new(worker_class)
+          when :go
+            executor || Executors::Go.new
+          else
+            raise ArgumentError, "unsupported runtime #{runtime.inspect} for #{job_type}"
+          end
+
+        handler = Handler.new(
           job_type:      job_type,
-          runtime:       :ruby,
+          runtime:       runtime,
           worker_class:  worker_class,
-          executor:      Executors::Ruby.new(worker_class)
+          executor:      exec,
+          definition:    definition
         )
 
         @mutex.synchronize do
           existing = @by_job_type[job_type]
-          if existing && existing.worker_class != worker_class
-            raise ArgumentError,
-                  "job_type #{job_type.inspect} already registered to #{existing.worker_class}"
+          if existing
+            same_worker = existing.worker_class == worker_class
+            same_worker ||= worker_class.nil? && existing.definition&.worker_class_name == definition.worker_class_name
+            unless same_worker
+              raise ArgumentError,
+                    "job_type #{job_type.inspect} already registered to #{existing.worker_class || existing.definition&.worker_class_name}"
+            end
           end
 
-          @by_job_type[job_type]             = handler
-          @by_worker_class[worker_class.name] = handler
+          @by_job_type[job_type] = handler
+          if worker_class&.name && !worker_class.name.to_s.empty?
+            @by_worker_class[worker_class.name] = handler
+          end
         end
 
         handler
@@ -69,6 +109,13 @@ module KafkaBatch
         raise UnknownHandler, "Unknown job_type: #{job_type}" if job_type && !job_type.to_s.empty?
 
         raise UnknownHandler, "Missing job_type and worker_class"
+      end
+
+      def definition!(job_type)
+        handler = @mutex.synchronize { @by_job_type[job_type.to_s] }
+        raise UnknownHandler, "Unknown job_type: #{job_type}" unless handler
+
+        handler.definition
       end
 
       def resolve_by_worker_class!(worker_name)

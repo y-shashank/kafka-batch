@@ -410,6 +410,16 @@ module KafkaBatch
     attr_accessor :metrics_proc      # alias hook for :proc adapter
     attr_accessor :metrics_prefix    # metric name prefix; default "kafka_batch"
 
+    # ── Go execution sidecar (Phase 2) ─────────────────────────────────────────
+    # Unix socket path for `kbatch serve`. Required when any handler uses
+    # executor :go or a manifest entry with runtime: go.
+    attr_accessor :go_executor_socket          # String – e.g. /var/run/kbatch.sock
+    attr_accessor :go_executor_timeout         # Float – read timeout seconds; default 300
+    attr_accessor :go_executor_open_timeout    # Float – connect timeout seconds; default 1
+    # Optional YAML listing Go-only handlers (runtime/topic/retries). Loaded at boot
+    # when set. Also via ENV KAFKA_BATCH_HANDLER_MANIFEST.
+    attr_accessor :handler_manifest_path
+
     # ── Passthrough rdkafka config ───────────────────────────────────────────
     attr_accessor :producer_config  # Hash – merged on top of producer defaults
     attr_accessor :consumer_config  # Hash – merged on top of consumer defaults
@@ -515,6 +525,10 @@ module KafkaBatch
       @validate_topics_on_boot  = false
       @extra_job_topics         = []
       @web_authenticator        = nil
+      @go_executor_socket       = ENV["KAFKA_BATCH_GO_SOCKET"].to_s.strip
+      @go_executor_timeout      = 300.0
+      @go_executor_open_timeout = 1.0
+      @handler_manifest_path    = ENV["KAFKA_BATCH_HANDLER_MANIFEST"].to_s.strip
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
 
@@ -617,6 +631,13 @@ module KafkaBatch
 
     # All priority YAML paths from config + ENV.
     # @return [Array<String>]
+    def resolved_handler_manifest_path
+      path = @handler_manifest_path.to_s.strip
+      return nil if path.empty?
+
+      File.expand_path(path)
+    end
+
     def resolved_priority_config_paths
       paths = Array(@priority_config_paths).map(&:to_s).map(&:strip).reject(&:empty?)
       single = ENV["KAFKA_BATCH_PRIORITY_CONFIG"].to_s.strip

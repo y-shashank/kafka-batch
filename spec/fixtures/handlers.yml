@@ -1,0 +1,5 @@
+handlers:
+  segment.export:
+    runtime: go
+    topic: segment.exports
+    max_retries: 25

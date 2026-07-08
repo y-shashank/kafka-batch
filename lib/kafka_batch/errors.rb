@@ -44,6 +44,16 @@ module KafkaBatch
   # Raised on store read/write failures
   class StoreError < Error; end
 
+  # Raised when the Go sidecar reports handler failure or is unreachable.
+  class GoExecutionError < Error
+    attr_reader :error_class
+
+    def initialize(message, error_class: "GoExecutionError")
+      @error_class = error_class
+      super(message)
+    end
+  end
+
   # Raised when a job exhausts all retry attempts.
   # Note: does not override Exception#cause – use Ruby's native exception
   # chaining (`raise ... ` inside a rescue) to preserve the original error.

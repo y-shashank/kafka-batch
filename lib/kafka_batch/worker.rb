@@ -228,13 +228,14 @@ module KafkaBatch
       end
       private :default_job_type
 
-      # Execution runtime for this handler. Phase 1 supports :ruby only.
+      # Execution runtime for this handler. :ruby (default) or :go (sidecar).
       # @return [Symbol]
       def executor(runtime = :__unset__)
         if runtime == :__unset__
           @executor || :ruby
         else
           @executor = runtime.to_sym
+          KafkaBatch::HandlerRegistry.register_ruby(self) if name && !name.to_s.empty?
         end
       end
 

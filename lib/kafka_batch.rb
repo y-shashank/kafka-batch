@@ -21,8 +21,11 @@ require_relative "kafka_batch/fairness/tenant_partitions"
 require_relative "kafka_batch/fairness/forwarder"
 require_relative "kafka_batch/fairness/dispatcher"
 require_relative "kafka_batch/execution_context"
+require_relative "kafka_batch/handler_definition"
 require_relative "kafka_batch/executors/ruby"
+require_relative "kafka_batch/executors/go"
 require_relative "kafka_batch/handler_registry"
+require_relative "kafka_batch/handler_manifest"
 require_relative "kafka_batch/worker"
 require_relative "kafka_batch/uniqueness"
 require_relative "kafka_batch/job_expiry"
@@ -107,16 +110,29 @@ module KafkaBatch
 
     # ── Karafka routing ────────────────────────────────────────────────────
 
+    # Load handler manifest (Go-only handlers) when config.handler_manifest_path is set.
+    def load_handler_manifest!
+      path = config.resolved_handler_manifest_path
+      return unless path
+
+      HandlerManifest.load!(path)
+    end
+
     def draw_routes(builder)
+      load_handler_manifest!
+
       cfg          = config
       registry     = priority_registry
       all_workers  = KafkaBatch.workers
       fair_workers = all_workers.select(&:fairness?)
       plain_topics = all_workers.reject(&:fairness?).map(&:kafka_topic).uniq
+      manifest_topics = HandlerManifest.loaded? ? HandlerManifest.topics : []
       active_fair_types = active_fairness_types
 
       reserved           = registry.reserved_topics
       other_plain_topics = plain_topics.reject { |t| reserved.include?(t) }
+      manifest_plain     = manifest_topics.reject { |t| reserved.include?(t) }
+      all_plain_topics   = (other_plain_topics + manifest_plain).uniq
       registry.validate_plain_topics!(other_plain_topics) unless registry.empty?
 
       builder.instance_eval do
@@ -156,9 +172,9 @@ module KafkaBatch
           end
         end
 
-        unless other_plain_topics.empty?
+        unless all_plain_topics.empty?
           consumer_group "#{cfg.consumer_group}-jobs" do
-            other_plain_topics.uniq.each do |job_topic|
+            all_plain_topics.uniq.each do |job_topic|
               topic(job_topic) { consumer KafkaBatch::Consumers::JobConsumer }
             end
           end
@@ -271,6 +287,7 @@ module KafkaBatch
       AuditLog.reset! if defined?(AuditLog)
       Metrics.reset!  if defined?(Metrics)
       HandlerRegistry.reset! if defined?(HandlerRegistry)
+      HandlerManifest.reset! if defined?(HandlerManifest)
     end
 
     private

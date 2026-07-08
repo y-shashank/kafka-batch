@@ -1,0 +1,9 @@
+# Go handlers registered with kbatch.Register in your app.
+# Ruby Karafka still owns fairness, retries, batches, and Kafka consumption.
+#
+#   handlers:
+#     segment.export:
+#       runtime: go
+#       topic: segment.exports
+#       max_retries: 25
+handlers: {}

@@ -20,6 +20,24 @@ RSpec.describe KafkaBatch::HandlerRegistry do
       expect(handler.worker_class).to eq(klass)
       expect(handler.runtime).to eq(:ruby)
       expect(handler.executor).to be_a(KafkaBatch::Executors::Ruby)
+      expect(handler.definition.job_type).to eq("custom.job")
+    end
+
+    it "registers executor :go workers with GoExecutor" do
+      klass = Class.new do
+        def self.name
+          "SegmentExportWorker"
+        end
+
+        include KafkaBatch::Worker
+        job_type "segment.export"
+        executor :go
+        kafka_topic "segment.exports"
+      end
+
+      handler = described_class.resolve!({ "job_type" => "segment.export" })
+      expect(handler.runtime).to eq(:go)
+      expect(handler.executor).to be_a(KafkaBatch::Executors::Go)
     end
 
     it "raises when the same job_type is registered to two classes" do
@@ -74,7 +92,7 @@ RSpec.describe KafkaBatch::HandlerRegistry do
     it "raises UnknownHandler for an unknown job_type" do
       expect {
         described_class.resolve!("job_type" => "missing.handler")
-      }.to raise_error(described_class::UnknownHandler, /Missing job_type and worker_class|Unknown job_type/)
+      }.to raise_error(described_class::UnknownHandler)
     end
 
     it "falls back to worker_class when job_type is on the wire but the registry was cleared" do

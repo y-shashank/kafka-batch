@@ -1,0 +1,5 @@
+{
+  "ok": false,
+  "error_class": "segment.NotFound",
+  "error_message": "segment 42 not found"
+}

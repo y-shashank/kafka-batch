@@ -154,6 +154,7 @@ module KafkaBatch
           end
 
         worker_class = handler.worker_class
+        worker_name  = handler.worker_class_name
 
         attempt        = data["attempt"].to_i
         max_retries    = data.fetch("max_retries", KafkaBatch.config.max_retries).to_i
@@ -163,7 +164,7 @@ module KafkaBatch
         batch_counted  = data["batch_counted"] ? true : false
 
         KafkaBatch.logger.debug(
-          "[KafkaBatch][JobConsumer] #{handler.job_type} (#{worker_class}) " \
+          "[KafkaBatch][JobConsumer] #{handler.job_type} (#{worker_name}) " \
           "job_id=#{job_id} batch_id=#{batch_id} attempt=#{attempt}"
         )
 
@@ -178,7 +179,7 @@ module KafkaBatch
           KafkaBatch::Instrumentation.job_cancelled(
             job_id:       job_id,
             batch_id:     batch_id,
-            worker_class: worker_class
+            worker_class: worker_name
           )
           release_uniq_lock(data)
           mark_as_consumed!(message)
@@ -188,7 +189,7 @@ module KafkaBatch
         # Record this job as running (best-effort, Redis-backed, TTL'd) so the
         # dashboard can show in-flight work. Cleared in the ensure below.
         KafkaBatch::Liveness.job_started(
-          job_id: job_id, batch_id: batch_id, worker_class: worker_class,
+          job_id: job_id, batch_id: batch_id, worker_class: worker_name,
           topic: message.topic, partition: message.partition
         )
 
@@ -210,7 +211,7 @@ module KafkaBatch
               error:                  e,
               job_id:                 job_id,
               batch_id:               batch_id,
-              worker_class:           worker_class,
+              worker_class:           worker_name,
               attempt:                attempt,
               max_retries:            max_retries,
               complete_after_retries: complete_after,
@@ -237,7 +238,7 @@ module KafkaBatch
               batch_id:     batch_id,
               job_id:       job_id,
               status:       "success",
-              worker_class: worker_class,
+              worker_class: worker_name,
               message:      message
             )
           end
@@ -246,7 +247,7 @@ module KafkaBatch
           KafkaBatch::Instrumentation.job_processed(
             job_id:       job_id,
             batch_id:     batch_id,
-            worker_class: worker_class,
+            worker_class: worker_name,
             duration:     duration
           )
 
@@ -469,8 +470,20 @@ module KafkaBatch
       end
 
       def invoke_retries_exhausted(worker_class:, data:, error:, attempt:)
+        klass =
+          case worker_class
+          when Class then worker_class
+          when String
+            begin
+              Object.const_get(worker_class)
+            rescue NameError
+              nil
+            end
+          end
+        return false unless klass.is_a?(Class) && klass.include?(KafkaBatch::Worker)
+
         KafkaBatch::Worker.run_retries_exhausted!(
-          worker_class: worker_class,
+          worker_class: klass,
           data:         data,
           error:        error,
           attempt:      attempt

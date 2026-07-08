@@ -119,6 +119,26 @@ module KafkaBatch
       )
     end
 
+    # Push a job by stable +job_type+ (Ruby worker class or manifest Go handler).
+    # @return [String, nil] job_id
+    def push_job(job_type, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil, valid_till: nil)
+      definition = self.class.resolve_definition!(job_type)
+      return nil if self.class.uniq_duplicate_for_definition?(definition, payload, job_id: job_id, batch_id: @id)
+
+      batch_seq = reserve!(1)
+
+      begin
+        produce_job_for(definition, payload, job_id, tenant_id || @tenant_id,
+                        batch_seq: batch_seq, valid_till: valid_till)
+      rescue StandardError
+        self.class.release_uniq_for_definition!(definition, payload, job_id: job_id)
+        KafkaBatch.store.add_jobs(@id, -1) rescue nil
+        raise
+      end
+
+      job_id
+    end
+
     # Push a job into this (open) batch: atomically grows total_jobs and produces
     # the job. Raises BatchClosedError if the batch has completed or been
     # cancelled. Returns nil when the worker opts into uniq and a duplicate is
@@ -297,6 +317,28 @@ module KafkaBatch
       KafkaBatch.store.update_batch_status(id, "cancelled")
     end
 
+    # Enqueue a standalone job by +job_type+. @return [String, nil] job_id
+    def self.enqueue_job(job_type, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil, valid_till: nil)
+      definition = resolve_definition!(job_type)
+      return nil if uniq_duplicate_for_definition?(definition, payload, job_id: job_id)
+
+      message = build_message_for(
+        definition: definition, payload: payload,
+        job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id,
+        valid_till: valid_till
+      )
+      route = route_for_definition(definition, job_id: job_id, tenant_id: tenant_id)
+      begin
+        KafkaBatch::Producer.produce_sync(
+          topic: route[:topic], payload: message, key: route[:key], partition: route[:partition]
+        )
+      rescue StandardError
+        release_uniq_for_definition!(definition, payload, job_id: job_id)
+        raise
+      end
+      job_id
+    end
+
     # Enqueue a single job outside of any batch context. @return [String, nil] job_id
     def self.enqueue(worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil, valid_till: nil)
       ensure_worker!(worker_class)
@@ -399,8 +441,13 @@ module KafkaBatch
     #   plain worker → worker.kafka_topic, keyed by job_id
     # @return [Hash] { topic:, key:, partition: }
     def self.route_for(worker_class, job_id:, tenant_id: nil, batch_id: nil)
-      if worker_class.fairness?
-        type   = worker_class.fairness_type
+      route_for_definition(HandlerDefinition.from_worker(worker_class),
+                           job_id: job_id, tenant_id: tenant_id, batch_id: batch_id)
+    end
+
+    def self.route_for_definition(definition, job_id:, tenant_id: nil, batch_id: nil)
+      if definition.fairness?
+        type   = definition.fairness_type
         ingest = KafkaBatch.config.fairness_ingest_topic(type)
         explicit = KafkaBatch.tenant_ingest_partition(tenant_id, type)
         if explicit
@@ -409,7 +456,7 @@ module KafkaBatch
           { topic: ingest, key: (tenant_id || batch_id || job_id).to_s, partition: nil }
         end
       else
-        { topic: worker_class.kafka_topic, key: job_id, partition: nil }
+        { topic: definition.kafka_topic, key: job_id, partition: nil }
       end
     end
 
@@ -685,26 +732,57 @@ module KafkaBatch
     end
 
     def self.build_message(worker_class:, payload:, job_id:, batch_id:, attempt:, tenant_id: nil, batch_seq: nil, valid_till: nil)
+      build_message_for(
+        definition: HandlerDefinition.from_worker(worker_class),
+        payload: payload, job_id: job_id, batch_id: batch_id, attempt: attempt,
+        tenant_id: tenant_id, batch_seq: batch_seq, valid_till: valid_till,
+        worker_class: worker_class
+      )
+    end
+
+    def self.build_message_for(definition:, payload:, job_id:, batch_id:, attempt:, tenant_id: nil,
+                               batch_seq: nil, valid_till: nil, worker_class: nil)
+      worker_class ||= definition.worker_class
       msg = {
         "job_id"                 => job_id,
         "batch_id"               => batch_id,
-        "job_type"               => worker_class.job_type,
-        "worker_class"           => worker_class.name,
+        "job_type"               => definition.job_type,
+        "worker_class"           => definition.worker_class_name,
         "payload"                => payload,
         "attempt"                => attempt,
-        "max_retries"            => worker_class.max_retries,
-        "complete_after_retries" => worker_class.complete_after_retries,
+        "max_retries"            => definition.max_retries,
+        "complete_after_retries" => definition.complete_after_retries,
         "enqueued_at"            => Time.now.utc.iso8601
       }
       msg["tenant_id"]   = tenant_id            if tenant_id
       msg["batch_seq"]   = batch_seq            if batch_seq && batch_id
-      msg["retry_tier"]  = worker_class.retry_tier.to_s if worker_class.retry_tier
+      msg["retry_tier"]  = definition.retry_tier.to_s if definition.retry_tier
       normalized_till    = JobExpiry.normalize_valid_till(valid_till)
       msg["valid_till"]  = normalized_till      if normalized_till
-      if worker_class.uniq? && KafkaBatch.config.uniq_enabled
+      if worker_class&.uniq? && KafkaBatch.config.uniq_enabled
         msg["_uniq_fp"] = KafkaBatch::Uniqueness.digest_hex(worker_class, payload)
       end
       msg
+    end
+
+    def self.resolve_definition!(job_type)
+      HandlerRegistry.definition!(job_type)
+    rescue HandlerRegistry::UnknownHandler => e
+      raise ArgumentError, e.message
+    end
+
+    def self.uniq_duplicate_for_definition?(definition, payload, job_id:, batch_id: nil)
+      worker_class = definition.worker_class
+      return false unless worker_class&.uniq? && KafkaBatch.config.uniq_enabled
+
+      uniq_duplicate?(worker_class, payload, job_id: job_id, batch_id: batch_id)
+    end
+
+    def self.release_uniq_for_definition!(definition, payload, job_id:)
+      worker_class = definition.worker_class
+      return unless worker_class
+
+      release_uniq!(worker_class, payload, job_id: job_id)
     end
 
     private
@@ -827,6 +905,18 @@ module KafkaBatch
         batch_seq: batch_seq, valid_till: valid_till
       )
       route = self.class.route_for(worker_class, job_id: job_id, tenant_id: tenant_id, batch_id: @id)
+      KafkaBatch::Producer.produce_sync(
+        topic: route[:topic], payload: message, key: route[:key], partition: route[:partition]
+      )
+    end
+
+    def produce_job_for(definition, payload, job_id, tenant_id = nil, batch_seq: nil, valid_till: nil)
+      message = self.class.build_message_for(
+        definition: definition, payload: payload,
+        job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tenant_id,
+        batch_seq: batch_seq, valid_till: valid_till
+      )
+      route = self.class.route_for_definition(definition, job_id: job_id, tenant_id: tenant_id, batch_id: @id)
       KafkaBatch::Producer.produce_sync(
         topic: route[:topic], payload: message, key: route[:key], partition: route[:partition]
       )

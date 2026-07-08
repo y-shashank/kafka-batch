@@ -9,6 +9,10 @@ module KafkaBatch
       KafkaBatch.config.logger = Rails.logger if KafkaBatch.config.logger.is_a?(Logger)
     end
 
+    initializer "kafka_batch.handler_manifest", after: :load_config_initializers do
+      KafkaBatch.load_handler_manifest! if defined?(KafkaBatch.load_handler_manifest!)
+    end
+
     # Validate configuration once the app is fully loaded
     initializer "kafka_batch.validate_config", after: :load_config_initializers do
       KafkaBatch.config.validate!
