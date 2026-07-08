@@ -122,6 +122,21 @@ func buildRubyExecuteRequest(job protocol.JobMessage) map[string]interface{} {
 	if job.EnqueuedAt != "" {
 		req["enqueued_at"] = job.EnqueuedAt
 	}
+	if job.BatchSeq != nil {
+		req["batch_seq"] = *job.BatchSeq
+	}
+	if job.MaxRetries > 0 {
+		req["max_retries"] = job.MaxRetries
+	}
+	if job.RetryTier != "" {
+		req["retry_tier"] = job.RetryTier
+	}
+	if job.ValidTill != "" {
+		req["valid_till"] = job.ValidTill
+	}
+	if job.UniqFP != "" {
+		req["_uniq_fp"] = job.UniqFP
+	}
 	return req
 }
 

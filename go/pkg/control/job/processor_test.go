@@ -108,6 +108,11 @@ func TestProcessExpiredJobDLT(t *testing.T) {
 	if out.DLTPayload == nil {
 		t.Fatal("expected DLT")
 	}
+	var dlt map[string]interface{}
+	_ = json.Unmarshal(out.DLTPayload, &dlt)
+	if dlt["dlt_type"] != "expired" {
+		t.Fatalf("dlt_type %v", dlt["dlt_type"])
+	}
 }
 
 func TestProcessRubyUnknownHandlerDLTWithoutRetry(t *testing.T) {

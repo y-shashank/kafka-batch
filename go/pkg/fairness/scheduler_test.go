@@ -7,6 +7,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 )
 
 func testScheduler(t *testing.T) (*Scheduler, *miniredis.Miniredis) {
@@ -149,7 +150,7 @@ func TestDispatcherTenantFallback(t *testing.T) {
 	s, _ := testScheduler(t)
 	d := &Dispatcher{Lane: LaneTime, Scheduler: s}
 	raw, _ := json.Marshal(map[string]interface{}{"job_id": "j1", "batch_id": "batch-x"})
-	out, err := d.Process(context.Background(), raw)
+	out, err := d.Process(context.Background(), raw, protocol.SourceCoords{Topic: "ingest"})
 	if err != nil || !out.Enqueued || out.TenantID != "batch-x" {
 		t.Fatalf("out %+v err=%v", out, err)
 	}

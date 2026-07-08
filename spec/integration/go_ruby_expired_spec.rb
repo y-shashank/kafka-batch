@@ -50,8 +50,8 @@ RSpec.describe "Go daemon Ruby job expiry (integration)", :integration do
     expect(KafkaBatchSpec::WorkerRuns.runs).to be_empty
 
     dlt = poll_dlt!(batch_id: batch.id)
-    expect(dlt["dlt_type"]).to eq("job")
-    expect(dlt["dlt_error_class"]).to eq("ExpiredError")
+    expect(dlt["dlt_type"]).to eq("expired")
+    expect(dlt["dlt_error_class"]).to eq("KafkaBatch::JobExpiry::ExpiredError")
 
     reloaded = KafkaBatch.store.find_batch(batch.id)
     expect(reloaded[:status]).to eq("complete")

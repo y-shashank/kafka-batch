@@ -21,6 +21,7 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/control/job"
 	"github.com/y-shashank/kafka-batch/go/pkg/control/retry"
 	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
+	"github.com/y-shashank/kafka-batch/go/pkg/jobexpiry"
 	"github.com/y-shashank/kafka-batch/go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch/go/pkg/priority"
@@ -259,9 +260,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 
 	if cfg.FairnessEnabled {
-		wireFairLane(ctx, cfg, rdb, prod, jobProc, handleJob, errCh, pauseCtl,
+		wireFairLane(ctx, cfg, rdb, prod, st, jobProc, handleJob, errCh, pauseCtl,
 			fairness.LaneTime, cfg.FairnessTimeIngest, cfg.FairnessTimeReady, cfg.FairnessTimeSettings())
-		wireFairLane(ctx, cfg, rdb, prod, jobProc, handleJob, errCh, pauseCtl,
+		wireFairLane(ctx, cfg, rdb, prod, st, jobProc, handleJob, errCh, pauseCtl,
 			fairness.LaneThroughput, cfg.FairnessThroughputIngest, cfg.FairnessThroughputReady, cfg.FairnessThroughputSettings())
 		log.Printf("kbatch fairness enabled time=%s throughput=%s",
 			cfg.FairnessTimeIngest, cfg.FairnessThroughputIngest)
@@ -284,6 +285,7 @@ func wireFairLane(
 	cfg config.Daemon,
 	rdb *redis.Client,
 	prod *kafkaclient.Client,
+	st *store.RedisStore,
 	jobProc *job.Processor,
 	handleJob func(*kgo.Record) error,
 	errCh chan<- error,
@@ -298,18 +300,33 @@ func wireFairLane(
 	} else {
 		jobProc.FairThroughput = sched
 	}
+	expPub := newExpiredPublisher(cfg, prod, st)
 	coord := fairness.NewCoordinator(func(l fairness.Lane) {
 		if l != lane {
 			return
 		}
-		fwd := &fairness.Forwarder{Lane: l, Scheduler: sched, ReadyTopic: ready, Producer: prod}
+		fwd := &fairness.Forwarder{
+			Lane: l, Scheduler: sched, ReadyTopic: ready, Producer: prod,
+			OnExpired: func(ctx context.Context, _ *fairness.CheckoutResult, raw []byte) error {
+				var m map[string]interface{}
+				_ = json.Unmarshal(raw, &m)
+				src := jobexpiry.SourceCoords(m)
+				return expPub.publish(ctx, raw, src)
+			},
+		}
 		go fwd.Run(ctx)
 	})
-	disp := &fairness.Dispatcher{Lane: lane, Scheduler: sched, OnStartFwd: coord.OnStart(lane)}
+	disp := &fairness.Dispatcher{
+		Lane: lane, Scheduler: sched, OnStartFwd: coord.OnStart(lane),
+		OnExpired: func(ctx context.Context, raw []byte, src protocol.SourceCoords) error {
+			return expPub.publish(ctx, raw, src)
+		},
+	}
 	suffix := string(lane)
 	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-dispatch-"+suffix,
 		[]string{ingest}, func(rec *kgo.Record) error {
-			out, err := disp.Process(ctx, rec.Value)
+			src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
+			out, err := disp.Process(ctx, rec.Value, src)
 			if err != nil {
 				return err
 			}

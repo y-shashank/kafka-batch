@@ -65,13 +65,19 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 	}
 
 	if jobexpiry.Expired(job.ValidTill, p.now()) {
-		if job.BatchID != nil && job.BatchSeq != nil {
-			ev := p.buildEvent(job, "failed", src)
-			out.Event = &ev
+		p.releaseFairSlotIfHeld(ctx, raw)
+		drop := jobexpiry.BuildDrop(raw, src, p.now())
+		out.Event = drop.Event
+		out.DLTPayload = drop.DLTPayload
+		out.DLTKey = drop.DLTKey
+		if drop.Failure != nil && p.Store != nil {
+			_ = p.Store.RecordFailure(ctx, store.FailureEntry{
+				BatchID: drop.Failure.BatchID, JobID: drop.Failure.JobID,
+				WorkerClass: drop.Failure.WorkerClass, ErrorClass: drop.Failure.ErrorClass,
+				ErrorMessage: drop.Failure.ErrorMessage, Status: drop.Failure.Status,
+				Attempt: drop.Failure.Attempt,
+			})
 		}
-		dlt, key := p.dltPayload(jobMap(raw), src.Topic, "ExpiredError", "job expired")
-		out.DLTPayload = dlt
-		out.DLTKey = key
 		p.releaseUniq(ctx, job)
 		return out, nil
 	}
@@ -293,7 +299,7 @@ func className(err error) string {
 
 func nonRetryable(err error) bool {
 	switch className(err) {
-	case "UnknownHandler", "NotRubyHandler":
+	case "UnknownHandler", "NotRubyHandler", "Overloaded":
 		return true
 	default:
 		return false

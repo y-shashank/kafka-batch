@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"time"
+
+	"github.com/y-shashank/kafka-batch/go/pkg/jobexpiry"
+	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 )
 
 // Dispatcher consumes fair ingest messages and enqueues into the WFQ scheduler.
@@ -11,6 +15,8 @@ type Dispatcher struct {
 	Lane       Lane
 	Scheduler  *Scheduler
 	OnStartFwd func(lane Lane)
+	Now        func() time.Time
+	OnExpired  func(ctx context.Context, raw []byte, src protocol.SourceCoords) error
 }
 
 // Outcome describes one ingest message.
@@ -21,7 +27,7 @@ type Outcome struct {
 	TenantID     string
 }
 
-func (d *Dispatcher) Process(ctx context.Context, raw []byte) (Outcome, error) {
+func (d *Dispatcher) Process(ctx context.Context, raw []byte, src protocol.SourceCoords) (Outcome, error) {
 	out := Outcome{CommitOffset: true}
 	if d.OnStartFwd != nil {
 		d.OnStartFwd(d.Lane)
@@ -33,10 +39,26 @@ func (d *Dispatcher) Process(ctx context.Context, raw []byte) (Outcome, error) {
 	tenantID := TenantFromMessage(m)
 	out.TenantID = tenantID
 
+	if validTill, _ := m["valid_till"].(string); jobexpiry.Expired(validTill, d.now()) {
+		if d.OnExpired != nil {
+			if err := d.OnExpired(ctx, raw, src); err != nil {
+				return out, err
+			}
+		}
+		return out, nil
+	}
+
 	if d.Scheduler == nil {
 		return out, nil
 	}
-	ok, err := d.Scheduler.Enqueue(ctx, tenantID, raw)
+
+	jobexpiry.StampSource(m, src)
+	stamped, err := json.Marshal(m)
+	if err != nil {
+		return out, err
+	}
+
+	ok, err := d.Scheduler.Enqueue(ctx, tenantID, stamped)
 	if err != nil {
 		return out, err
 	}
@@ -47,6 +69,13 @@ func (d *Dispatcher) Process(ctx context.Context, raw []byte) (Outcome, error) {
 	}
 	out.Enqueued = true
 	return out, nil
+}
+
+func (d *Dispatcher) now() time.Time {
+	if d.Now != nil {
+		return d.Now()
+	}
+	return time.Now()
 }
 
 // Coordinator starts forwarder goroutines per lane (idempotent).

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log"
 	"time"
+
+	"github.com/y-shashank/kafka-batch/go/pkg/jobexpiry"
 )
 
 // Producer publishes to Kafka.
@@ -20,6 +22,8 @@ type Forwarder struct {
 	Producer   Producer
 	IdleSleep  time.Duration
 	Burst      int
+	Now        func() time.Time
+	OnExpired  func(ctx context.Context, job *CheckoutResult, raw []byte) error
 
 	lastLeaseReclaim   time.Time
 	lastForwardReclaim time.Time
@@ -40,9 +44,31 @@ func (f *Forwarder) ForwardOnce(ctx context.Context) bool {
 	if err != nil || job == nil {
 		return false
 	}
+	if f.handleExpired(ctx, job) {
+		return true
+	}
 	if err := f.forwardJob(ctx, job); err != nil {
 		log.Printf("[kbatch-fair-forwarder] forward error lane=%s: %v", f.Lane, err)
 		return false
+	}
+	return true
+}
+
+func (f *Forwarder) handleExpired(ctx context.Context, job *CheckoutResult) bool {
+	var m map[string]interface{}
+	if err := json.Unmarshal(job.Payload, &m); err != nil {
+		return false
+	}
+	validTill, _ := m["valid_till"].(string)
+	if !jobexpiry.Expired(validTill, f.now()) {
+		return false
+	}
+	_ = f.Scheduler.Complete(ctx, job.TenantID, job.SlotID, 0)
+	_, _ = f.Scheduler.ConfirmForward(ctx, job.SlotID)
+	if f.OnExpired != nil {
+		if err := f.OnExpired(ctx, job, job.Payload); err != nil {
+			log.Printf("[kbatch-fair-forwarder] expired drop lane=%s: %v", f.Lane, err)
+		}
 	}
 	return true
 }
@@ -118,11 +144,9 @@ func (f *Forwarder) maybeReclaim(ctx context.Context) {
 	}
 }
 
-// DropExpired completes a zero-duration slot for expired forwarded jobs.
-func DropExpired(ctx context.Context, sched *Scheduler, job *CheckoutResult) error {
-	var m map[string]interface{}
-	_ = json.Unmarshal(job.Payload, &m)
-	_ = sched.Complete(ctx, job.TenantID, job.SlotID, 0)
-	_, err := sched.ConfirmForward(ctx, job.SlotID)
-	return err
+func (f *Forwarder) now() time.Time {
+	if f.Now != nil {
+		return f.Now()
+	}
+	return time.Now()
 }

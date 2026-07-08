@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/y-shashank/kafka-batch/go/pkg/jobexpiry"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 )
 
@@ -51,6 +52,14 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		dlt, key := dltMap(m, raw, src.Topic)
 		out.DLTPayload = dlt
 		out.DLTKey = key
+		return out, nil
+	}
+
+	if validTill, _ := m["valid_till"].(string); jobexpiry.Expired(validTill, p.now()) {
+		drop := jobexpiry.BuildDrop(raw, src, p.now())
+		out.Event = drop.Event
+		out.DLTPayload = drop.DLTPayload
+		out.DLTKey = drop.DLTKey
 		return out, nil
 	}
 

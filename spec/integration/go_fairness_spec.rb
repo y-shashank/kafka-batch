@@ -224,6 +224,28 @@ RSpec.describe "Go daemon fairness (integration)", :integration do
     expect(fair_inflight_total).to eq(0)
   end
 
+  it "drops expired fair jobs at ingest without invoking the worker" do
+    batch = KafkaBatch::Batch.create(description: "go fair expired #{suffix}") do |b|
+      b.push_job("integration.go_fair", { "tenant" => "acme" }, tenant_id: "acme",
+                 valid_till: "2000-01-01T00:00:00Z")
+    end
+
+    dlt = KafkaBatchSpec::GoDaemonHelper.poll_topic(
+      brokers: brokers, topic: @dlt_topic, group_suffix: suffix, timeout: 30,
+      match: ->(m) { m["batch_id"] == batch.id }
+    )
+    expect(dlt).not_to be_nil
+    expect(dlt["dlt_type"]).to eq("expired")
+    expect(File.exist?(@marker_path)).to be(false)
+
+    wait_for_batch!(batch.id, status: %w[complete])
+
+    reloaded = KafkaBatch.store.find_batch(batch.id)
+    expect(reloaded[:status]).to eq("complete")
+    expect(reloaded[:failed_count]).to eq(1)
+    expect(fair_inflight_total).to eq(0)
+  end
+
   it "completes jobs for two tenants without leaking fair slots" do
     ids = []
     batch = KafkaBatch::Batch.create(description: "two-tenant #{suffix}") do |b|

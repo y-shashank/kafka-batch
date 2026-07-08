@@ -201,7 +201,12 @@ module KafkaBatch
         "payload"       => req["payload"] || {},
         "attempt"       => req.fetch("attempt", 0).to_i,
         "tenant_id"     => req["tenant_id"],
-        "enqueued_at"   => req["enqueued_at"]
+        "enqueued_at"   => req["enqueued_at"],
+        "batch_seq"     => req["batch_seq"],
+        "max_retries"   => req["max_retries"],
+        "retry_tier"    => req["retry_tier"],
+        "valid_till"    => req["valid_till"],
+        "_uniq_fp"      => req["_uniq_fp"]
       }
       data.compact!
       data

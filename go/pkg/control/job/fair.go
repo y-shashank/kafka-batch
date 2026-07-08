@@ -80,6 +80,22 @@ func (p *Processor) fairScheduler(raw []byte) *fairness.Scheduler {
 	return p.FairTime
 }
 
+func (p *Processor) releaseFairSlotIfHeld(ctx context.Context, raw []byte) {
+	fm := parseFairMeta(raw)
+	if !fm.slot || fm.slotID == "" {
+		return
+	}
+	sched := p.fairScheduler(raw)
+	if sched == nil {
+		return
+	}
+	tenant := fm.tenantID
+	if tenant == "" {
+		tenant = "default"
+	}
+	_ = sched.Complete(ctx, tenant, fm.slotID, 0)
+}
+
 func (p *Processor) renewFairLease(stop <-chan struct{}, tenantID, slotID string, sched *fairness.Scheduler) {
 	if sched == nil {
 		return
