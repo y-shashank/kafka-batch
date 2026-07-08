@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -26,6 +27,7 @@ func unixClient(socket string) *http.Client {
 }
 
 func TestServerExecuteOverUnixSocket(t *testing.T) {
+	kbatch.Reset()
 	t.Cleanup(kbatch.Reset)
 
 	var seenJobID string
@@ -38,7 +40,7 @@ func TestServerExecuteOverUnixSocket(t *testing.T) {
 		return nil
 	})
 
-	socket := filepath.Join(t.TempDir(), "kbatch.sock")
+	socket := testSocket(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -46,7 +48,7 @@ func TestServerExecuteOverUnixSocket(t *testing.T) {
 	go func() {
 		errCh <- kbatch.NewServer(kbatch.ServerConfig{SocketPath: socket}).ListenAndServe(ctx)
 	}()
-	waitForSocket(t, socket)
+	waitForSocket(t, socket, errCh)
 
 	client := unixClient(socket)
 	reqBody := readFixture(t, "../../../protocol/execute_request.json")
@@ -76,18 +78,22 @@ func TestServerExecuteOverUnixSocket(t *testing.T) {
 }
 
 func TestServerHandlerErrorResponse(t *testing.T) {
+	kbatch.Reset()
 	t.Cleanup(kbatch.Reset)
 
 	kbatch.Register("segment.export", func(ctx *kbatch.Context) error {
 		return &kbatch.HandlerError{Class: "segment.NotFound", Message: "segment 42 not found"}
 	})
 
-	socket := filepath.Join(t.TempDir(), "kbatch.sock")
+	socket := testSocket(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go kbatch.NewServer(kbatch.ServerConfig{SocketPath: socket}).ListenAndServe(ctx)
-	waitForSocket(t, socket)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- kbatch.NewServer(kbatch.ServerConfig{SocketPath: socket}).ListenAndServe(ctx)
+	}()
+	waitForSocket(t, socket, errCh)
 
 	client := unixClient(socket)
 	resp := post(t, client, "/v1/execute", readFixture(t, "../../../protocol/execute_request.json"))
@@ -99,10 +105,26 @@ func TestServerHandlerErrorResponse(t *testing.T) {
 	}
 }
 
-func waitForSocket(t *testing.T, path string) {
+func testSocket(t *testing.T) string {
+	t.Helper()
+	// macOS limits unix socket paths to ~104 bytes; t.TempDir() paths are too long.
+	socket := filepath.Join("/tmp", fmt.Sprintf("kbatch-test-%d-%d.sock", os.Getpid(), time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.Remove(socket) })
+	return socket
+}
+
+func waitForSocket(t *testing.T, path string, errCh <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("server failed: %v", err)
+			}
+			t.Fatal("server exited before socket ready")
+		default:
+		}
 		conn, err := net.Dial("unix", path)
 		if err == nil {
 			conn.Close()

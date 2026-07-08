@@ -1,0 +1,34 @@
+# Example kbatch daemon config (Phase 3).
+# Copy to your app as config/kbatch_daemon.yml and adjust.
+#
+# Environment overrides: KAFKA_BROKERS, KAFKA_PREFIX, REDIS_URL,
+# KAFKA_BATCH_HANDLER_MANIFEST
+
+brokers:
+  - localhost:9092
+
+# Optional — when set, prefixes events/callbacks/retry topics and consumer_group
+# topic_prefix: mothership
+
+consumer_group: kafka-batch
+
+# Optional explicit job topics; when omitted, derived from handler manifest Go topics
+# jobs_topics:
+#   - kafka_batch.jobs
+#   - segment.exports
+
+handler_manifest: config/kafka_batch_handlers.yml
+
+events_topic: kafka_batch.events
+callbacks_topic: kafka_batch.callbacks
+dead_letter_topic: kafka_batch.dead_letter
+retry_topic: kafka_batch.jobs.retry
+
+redis_url: redis://localhost:6379/0
+
+max_retries: 3
+
+retry_tiers:
+  short: 30
+  medium: 420
+  large: 1200

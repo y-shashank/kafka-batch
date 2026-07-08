@@ -1,0 +1,91 @@
+package job
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/y-shashank/kafka-batch/go/pkg/config"
+	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
+	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
+	"github.com/y-shashank/kafka-batch/go/pkg/store"
+)
+
+type memProducer struct {
+	msgs []struct {
+		topic string
+		key   string
+		body  []byte
+	}
+}
+
+func (m *memProducer) Produce(_ context.Context, topic, key string, payload []byte) error {
+	m.msgs = append(m.msgs, struct {
+		topic string
+		key   string
+		body  []byte
+	}{topic, key, payload})
+	return nil
+}
+
+func TestProcessSuccessEmitsEvent(t *testing.T) {
+	kbatch.Reset()
+	kbatch.Register("test.echo", func(ctx *kbatch.Context) error { return nil })
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	batchID := "b1"
+	seq := int64(1)
+	raw, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", BatchID: &batchID, JobType: "test.echo", WorkerClass: "go:test.echo",
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3, CompleteAfterRetries: 3,
+		BatchSeq: &seq,
+	})
+
+	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{}}
+	out, err := p.Process(context.Background(), raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Event == nil || out.Event.Status != "success" {
+		t.Fatalf("event %+v", out.Event)
+	}
+	if out.Event.BatchSeq != 1 {
+		t.Fatalf("batch_seq %d", out.Event.BatchSeq)
+	}
+}
+
+func TestProcessHandlerErrorSchedulesRetry(t *testing.T) {
+	kbatch.Reset()
+	kbatch.Register("test.fail", func(ctx *kbatch.Context) error {
+		return &kbatch.HandlerError{Class: "Boom", Message: "boom"}
+	})
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	raw, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", JobType: "test.fail", WorkerClass: "go:test.fail",
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
+	})
+
+	cfg := config.DefaultDaemon()
+	p := &Processor{Cfg: cfg, Store: st, Producer: &memProducer{}, Now: func() time.Time { return time.Unix(0, 0) }}
+	out, err := p.Process(context.Background(), raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.RetryTopic != cfg.RetryTopic("short") {
+		t.Fatalf("retry topic %q", out.RetryTopic)
+	}
+	if out.RetryPayload == nil {
+		t.Fatal("expected retry payload")
+	}
+}

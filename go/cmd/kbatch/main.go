@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/y-shashank/kafka-batch/go/pkg/daemon"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
 )
 
@@ -20,6 +21,8 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		serve(os.Args[2:])
+	case "daemon":
+		runDaemon(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -45,16 +48,31 @@ func serve(args []string) {
 	}
 }
 
+func runDaemon(args []string) {
+	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	cfg := fs.String("config", "", "daemon config YAML path")
+	manifest := fs.String("manifest", "", "handler manifest YAML path")
+	_ = fs.Parse(args)
+	if *cfg == "" {
+		fmt.Fprintln(os.Stderr, "daemon requires --config")
+		os.Exit(2)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := daemon.Run(ctx, *cfg, *manifest); err != nil {
+		fmt.Fprintf(os.Stderr, "kbatch daemon: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func usage() {
-	fmt.Fprintf(os.Stderr, `kbatch — KafkaBatch Go handler sidecar (Phase 2)
+	fmt.Fprintf(os.Stderr, `kbatch — KafkaBatch Go runtime (Phase 2 sidecar + Phase 3 daemon)
 
 Usage:
-  kbatch serve [--socket PATH]
+  kbatch serve [--socket PATH]           # Phase 2: handler sidecar only
+  kbatch daemon --config PATH [--manifest PATH]   # Phase 3: control plane
 
-Register handlers from your app with kbatch.Register("job.type", fn) and import
-that package from a small main, or use the example in go/cmd/kbatch.
-
-Environment (Ruby host):
-  KAFKA_BATCH_GO_SOCKET=/var/run/kbatch.sock
+Environment:
+  KAFKA_BROKERS, KAFKA_PREFIX, REDIS_URL, KAFKA_BATCH_HANDLER_MANIFEST
 `)
 }

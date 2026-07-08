@@ -87,7 +87,9 @@ jobs:
 
       - name: Build Go integration sidecar
         working-directory: go
-        run: go build -trimpath -o ../bin/kbatch-ittest ./cmd/kbatch-ittest
+        run: |
+          go build -trimpath -o ../bin/kbatch-ittest ./cmd/kbatch-ittest
+          go build -trimpath -o ../bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
 
       - name: Run Go tests
         working-directory: go

@@ -14,3 +14,4 @@
 # Go binaries built locally / in CI (not shipped via RubyGems)
 /bin/kbatch-ittest
 /bin/kbatch
+/bin/kbatch-daemon-ittest

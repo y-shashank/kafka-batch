@@ -321,6 +321,61 @@ KafkaBatch::Batch.enqueue_job("segment.export", "segment_id" => 42)
 
 Protocol fixtures live in `protocol/`; the Go module is under `go/` (same repo, separate artifact — not shipped via RubyGems).
 
+### Go control plane (Phase 3)
+
+For Go-only workloads you can run **`kbatch daemon`** instead of Ruby Karafka job consumers. The Ruby gem stays the **client** (`Batch.create`, `push_job`, Web UI); the daemon owns:
+
+- Job consumption + in-process Go handlers (no sidecar RPC)
+- Completion events → Redis batch ledger (same Lua scripts as Ruby)
+- Retry-tier routing + dead-letter produce
+- Callback topic produce + claim (log-only invoker by default)
+
+**1. Register handlers** (linked into your daemon binary):
+
+```go
+kbatch.Register("segment.export", func(ctx *kbatch.Context) error {
+    return exportSegment(ctx.Payload)
+})
+```
+
+**2. Daemon config** (`config/kbatch_daemon.yml` — see `go/config/daemon.example.yml`):
+
+```yaml
+brokers: ["kafka:9092"]
+consumer_group: kafka-batch
+handler_manifest: config/kafka_batch_handlers.yml
+redis_url: redis://redis:6379/0
+# jobs_topics: optional — defaults from manifest Go handler topics
+events_topic: kafka_batch.events
+callbacks_topic: kafka_batch.callbacks
+dead_letter_topic: kafka_batch.dead_letter
+retry_topic: kafka_batch.jobs.retry
+```
+
+**3. Start the daemon** (no `karafka server` job consumers needed on these pods):
+
+```bash
+kbatch daemon --config config/kbatch_daemon.yml
+```
+
+**4. Ruby host** (producer + UI only):
+
+```ruby
+config.go_executor_socket = ""   # daemon runs handlers in-process
+config.handler_manifest_path = Rails.root.join("config/kafka_batch_handlers.yml").to_s
+```
+
+`KAFKA_PREFIX` / `config.topic_prefix` must match between Ruby producers and the daemon YAML (both read `KAFKA_PREFIX` from the environment).
+
+**Integration test** (real Kafka + Redis):
+
+```bash
+cd go && go build -o ../bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
+KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_daemon_spec.rb
+```
+
+Phase 3 covers **plain topics** first. Fairness lanes, priority YAML, and the schedule poller remain on the Ruby Karafka path until Phase 3b/3c.
+
 ### Standalone jobs (no batch)
 
 ```ruby
