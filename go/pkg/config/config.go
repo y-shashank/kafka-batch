@@ -421,11 +421,15 @@ type Manifest struct {
 }
 
 type HandlerEntry struct {
-	Runtime          string `yaml:"runtime"`
-	Topic            string `yaml:"topic"`
-	ApplyTopicPrefix bool   `yaml:"apply_topic_prefix"`
-	MaxRetries       int    `yaml:"max_retries"`
-	FairnessType     string `yaml:"fairness_type"`
+	Runtime              string `yaml:"runtime"`
+	WorkerClass          string `yaml:"worker_class"`
+	Topic                string `yaml:"topic"`
+	ApplyTopicPrefix     bool   `yaml:"apply_topic_prefix"`
+	MaxRetries           int    `yaml:"max_retries"`
+	CompleteAfterRetries int    `yaml:"complete_after_retries"`
+	RetryTier            string `yaml:"retry_tier"`
+	FairnessType         string `yaml:"fairness_type"`
+	Uniq                 bool   `yaml:"uniq"`
 }
 
 func LoadManifest(path, topicPrefix string) (Manifest, error) {

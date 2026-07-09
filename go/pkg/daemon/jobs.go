@@ -2,8 +2,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -21,26 +19,6 @@ func BuildJobHandler(cfg config.Daemon, prod *kafkaclient.Client, jobProc *job.P
 		if err != nil {
 			return err
 		}
-		if out.Event != nil {
-			raw, _ := json.Marshal(out.Event)
-			key := fmt.Sprintf("%s/%d", out.Event.SrcTopic, out.Event.SrcPartition)
-			if err := prod.Produce(context.Background(), cfg.EventsTopic, key, raw); err != nil {
-				return err
-			}
-		}
-		if out.RetryPayload != nil {
-			if err := prod.Produce(context.Background(), out.RetryTopic, out.RetryKey, out.RetryPayload); err != nil {
-				return err
-			}
-		}
-		if out.DLTPayload != nil {
-			if err := prod.Produce(context.Background(), cfg.DeadLetterTopic, out.DLTKey, out.DLTPayload); err != nil {
-				return err
-			}
-		}
-		if !out.CommitOffset {
-			return fmt.Errorf("job not committed")
-		}
-		return nil
+		return applyJobOutcome(context.Background(), cfg, prod, out)
 	}
 }

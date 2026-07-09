@@ -3,12 +3,14 @@ package callback
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/y-shashank/kafka-batch/go/pkg/instrument"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
 )
@@ -19,6 +21,15 @@ type spyInvoker struct {
 
 func (s *spyInvoker) Invoke(_ context.Context, cb protocol.CallbackMessage) error {
 	s.calls = append(s.calls, cb)
+	return nil
+}
+
+type spyDLT struct {
+	calls int32
+}
+
+func (s *spyDLT) ProduceDLT(_ context.Context, _ string, _ []byte) error {
+	atomic.AddInt32(&s.calls, 1)
 	return nil
 }
 
@@ -77,5 +88,35 @@ func TestProcessSkipsWhenAlreadyDispatched(t *testing.T) {
 	}
 	if len(inv.calls) != 0 {
 		t.Fatalf("expected no invoke, got %+v", inv.calls)
+	}
+}
+
+func TestProcessMalformedCallbackJSON(t *testing.T) {
+	var failed, dlt int32
+	instrument.SetHandler(func(event string, _ map[string]interface{}, _ float64) {
+		switch event {
+		case "callback.failed":
+			atomic.AddInt32(&failed, 1)
+		case "dlt.published":
+			atomic.AddInt32(&dlt, 1)
+		}
+	})
+	defer instrument.SetHandler(nil)
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+	dltSpy := &spyDLT{}
+	p := &Processor{Store: st, Invoker: LogInvoker{}, DLT: dltSpy, NodeID: "n1"}
+
+	out, err := p.Process(context.Background(), []byte("{not json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.CommitOffset {
+		t.Fatal("expected commit")
+	}
+	if failed != 1 || dlt != 1 || dltSpy.calls != 1 {
+		t.Fatalf("failed=%d dlt_events=%d dlt_calls=%d", failed, dlt, dltSpy.calls)
 	}
 }

@@ -6,10 +6,13 @@ import (
 )
 
 // Handler receives lifecycle events from the Go control plane and worker.
-// Event names mirror Ruby ActiveSupport::Notifications (without .kafka_batch suffix):
-//   job.processed, job.retried, job.failed, job.cancelled, job.expired,
-//   batch.completed, callback.invoked, callback.failed, dlt.published,
-//   scheduled.dispatched, consumer.priority_yielded
+// Event names mirror Ruby ActiveSupport::Notifications (without .kafka_batch suffix).
+// Consumer-side: job.processed, job.retried, job.failed, job.cancelled, job.expired,
+// job.emit_retried, job.uniq_skipped, batch.completed, callback.invoked, callback.failed,
+// dlt.published, scheduled.dispatched, consumer.priority_yielded
+// Produce-side (Go client, planned): batch.created, batch.sealed, scheduled.enqueued,
+// scheduled.enqueued_bulk, scheduled.index_failed
+// Reconciler (planned): reconciler.ran
 var Handler func(event string, payload map[string]interface{}, durationMs float64)
 
 var mu sync.RWMutex

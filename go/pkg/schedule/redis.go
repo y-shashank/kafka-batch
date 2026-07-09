@@ -29,6 +29,29 @@ func (s *RedisStore) Schedule(ctx context.Context, jobID string, runAt time.Time
 	return s.client.ZAdd(ctx, pendingKey, redis.Z{Score: epoch(runAt), Member: member}).Err()
 }
 
+// ScheduleEntry is one delayed-job index row.
+type ScheduleEntry struct {
+	JobID     string
+	RunAt     time.Time
+	Partition int32
+	Offset    int64
+}
+
+// ScheduleMany bulk-writes schedule index members (Ruby schedule_many).
+func (s *RedisStore) ScheduleMany(ctx context.Context, entries []ScheduleEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	members := make([]redis.Z, len(entries))
+	for i, e := range entries {
+		members[i] = redis.Z{
+			Score:  epoch(e.RunAt),
+			Member: BuildMember(e.JobID, e.Partition, e.Offset),
+		}
+	}
+	return s.client.ZAdd(ctx, pendingKey, members...).Err()
+}
+
 func (s *RedisStore) ClaimDue(ctx context.Context, now time.Time, leaseSeconds, limit int) ([]string, error) {
 	leaseUntil := epoch(now) + float64(leaseSeconds)
 	res, err := s.client.Eval(ctx, claimDueLua,

@@ -56,13 +56,10 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 		if fin.Batch == nil {
 			continue
 		}
-		instrument.Emit("batch.completed", map[string]interface{}{
-			"batch_id":        fin.Batch.ID,
-			"outcome":         fin.Outcome,
-			"total_jobs":      fin.Batch.TotalJobs,
-			"completed_count": fin.Batch.CompletedCount,
-			"failed_count":    fin.Batch.FailedCount,
-		}, 0)
+		instrument.BatchCompleted(
+			fin.Batch.ID, fin.Outcome,
+			fin.Batch.TotalJobs, fin.Batch.CompletedCount, fin.Batch.FailedCount,
+		)
 		cb := protocol.CallbackMessage{
 			BatchID:        fin.Batch.ID,
 			Outcome:        fin.Outcome,

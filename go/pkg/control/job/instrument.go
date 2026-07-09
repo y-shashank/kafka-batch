@@ -8,42 +8,27 @@ import (
 )
 
 func emitJobProcessed(job protocol.JobMessage, durationMs float64) {
-	instrument.Emit("job.processed", instrument.JobPayload(job.JobID, deref(job.BatchID), job.WorkerClass, nil), durationMs)
+	instrument.JobProcessed(job.JobID, deref(job.BatchID), job.WorkerClass, durationMs)
 }
 
 func emitJobCancelled(job protocol.JobMessage) {
-	instrument.Emit("job.cancelled", instrument.JobPayload(job.JobID, deref(job.BatchID), job.WorkerClass, nil), 0)
+	instrument.JobCancelled(job.JobID, deref(job.BatchID), job.WorkerClass)
 }
 
 func emitJobExpired(job protocol.JobMessage, validTill string) {
-	instrument.Emit("job.expired", instrument.JobPayload(job.JobID, deref(job.BatchID), job.WorkerClass, map[string]interface{}{
-		"valid_till": validTill,
-	}), 0)
+	instrument.JobExpired(job.JobID, deref(job.BatchID), job.WorkerClass, validTill)
 }
 
 func emitJobRetried(job protocol.JobMessage, nextAttempt int, retryTopic string) {
-	instrument.Emit("job.retried", instrument.JobPayload(job.JobID, deref(job.BatchID), job.WorkerClass, map[string]interface{}{
-		"attempt":      job.Attempt,
-		"next_attempt": nextAttempt,
-		"retry_topic":  retryTopic,
-	}), 0)
+	instrument.JobRetried(job.JobID, deref(job.BatchID), job.WorkerClass, job.Attempt, nextAttempt, retryTopic)
 }
 
 func emitJobFailed(job protocol.JobMessage, attempt int, errClass, errMsg string) {
-	instrument.Emit("job.failed", instrument.JobPayload(job.JobID, deref(job.BatchID), job.WorkerClass, map[string]interface{}{
-		"attempt":       attempt,
-		"error_class":   errClass,
-		"error_message": errMsg,
-	}), 0)
+	instrument.JobFailed(job.JobID, deref(job.BatchID), job.WorkerClass, attempt, errClass, errMsg)
 }
 
 func emitDLTPublished(jobID, batchID, dltType, sourceTopic string) {
-	instrument.Emit("dlt.published", map[string]interface{}{
-		"job_id":       jobID,
-		"batch_id":     batchID,
-		"dlt_type":     dltType,
-		"source_topic": sourceTopic,
-	}, 0)
+	instrument.DLTPublished(jobID, batchID, dltType, sourceTopic)
 }
 
 func dltMeta(raw []byte) (jobID, batchID, dltType string) {

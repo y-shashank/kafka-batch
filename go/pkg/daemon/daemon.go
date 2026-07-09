@@ -170,28 +170,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 			if err != nil {
 				return err
 			}
-			if out.Event != nil {
-				raw, _ := json.Marshal(out.Event)
-				key := fmt.Sprintf("%s/%d", out.Event.SrcTopic, out.Event.SrcPartition)
-				if err := prod.Produce(ctx, cfg.EventsTopic, key, raw); err != nil {
-					return err
-				}
-			}
-			if out.ProduceBody != nil {
-				if err := prod.Produce(ctx, out.ProduceTopic, out.ProduceKey, out.ProduceBody); err != nil {
-					return err
-				}
-			}
-			if out.DLTPayload != nil {
-				if err := prod.Produce(ctx, cfg.DeadLetterTopic, out.DLTKey, out.DLTPayload); err != nil {
-					return err
-				}
-			}
-			if out.Pause {
-				time.Sleep(out.PauseFor)
-				return fmt.Errorf("retry paused")
-			}
-			return nil
+			return applyRetryOutcome(ctx, cfg, prod, out, src)
 		}, errCh, pauseCtl)
 	}
 
@@ -439,15 +418,10 @@ func RunPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config
 				if len(spec.HigherTopics) > 0 {
 					p0 = spec.HigherTopics[0]
 				}
-				instrument.Emit("consumer.priority_yielded", map[string]interface{}{
-					"consumer_class": "kbatch.priority",
-					"p0_topic":       p0,
-					"consumer_group": spec.ConsumerGroup,
-					"pause_ms":       yieldSleep.Milliseconds(),
-					"mode":           string(spec.Mode),
-					"rank":           spec.Rank,
-					"higher_topics":  spec.HigherTopics,
-				}, 0)
+				instrument.ConsumerPriorityYielded(
+					"kbatch.priority", p0, spec.ConsumerGroup,
+					yieldSleep.Milliseconds(), string(spec.Mode), spec.Rank, spec.HigherTopics,
+				)
 				time.Sleep(yieldSleep)
 				return
 			}

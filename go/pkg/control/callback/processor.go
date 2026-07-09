@@ -45,6 +45,20 @@ func (p *Processor) Process(ctx context.Context, raw []byte) (Outcome, error) {
 	out := Outcome{CommitOffset: true}
 	var cb protocol.CallbackMessage
 	if err := json.Unmarshal(raw, &cb); err != nil {
+		log.Printf("[kbatch-daemon] malformed callback JSON: %v", err)
+		instrument.CallbackFailed("", "", "", "json.SyntaxError", err.Error())
+		if p.DLT != nil {
+			dlt := map[string]interface{}{
+				"dlt_type":        "malformed_callback",
+				"dlt_raw_payload": string(raw),
+				"dlt_error_class": "json.SyntaxError",
+				"dlt_error_message": err.Error(),
+			}
+			rawDLT, _ := json.Marshal(dlt)
+			key := "malformed_callback"
+			_ = p.DLT.ProduceDLT(ctx, key, rawDLT)
+			instrument.DLTPublished("", "", "malformed_callback", "callbacks")
+		}
 		return out, nil
 	}
 	if cb.BatchID == "" {
@@ -60,41 +74,42 @@ func (p *Processor) Process(ctx context.Context, raw []byte) (Outcome, error) {
 	if p.Invoker != nil {
 		if err := p.Invoker.Invoke(ctx, cb); err != nil {
 			log.Printf("[kbatch-daemon] callback invoke batch_id=%s: %v", cb.BatchID, err)
-			instrument.Emit("callback.failed", map[string]interface{}{
-				"batch_id":        cb.BatchID,
-				"callback_class":  cb.OnSuccess,
-				"callback_method": "on_success",
-				"error_message":   err.Error(),
-			}, 0)
+			method := callbackMethod(cb)
+			class := callbackClass(cb, method)
+			instrument.CallbackFailed(cb.BatchID, class, method, err.Error(), err.Error())
 			if p.DLT != nil {
 				dlt := map[string]interface{}{
-					"batch_id":           cb.BatchID,
-					"dlt_type":           "callback_error",
-					"dlt_error_message":  err.Error(),
-					"on_success":         cb.OnSuccess,
-					"on_complete":        cb.OnComplete,
-					"outcome":            cb.Outcome,
+					"batch_id":          cb.BatchID,
+					"dlt_type":          "callback_error",
+					"dlt_error_message": err.Error(),
+					"on_success":        cb.OnSuccess,
+					"on_complete":       cb.OnComplete,
+					"outcome":           cb.Outcome,
 				}
 				rawDLT, _ := json.Marshal(dlt)
 				_ = p.DLT.ProduceDLT(ctx, cb.BatchID, rawDLT)
-				instrument.Emit("dlt.published", map[string]interface{}{
-					"batch_id": cb.BatchID, "dlt_type": "callback_error",
-				}, 0)
+				instrument.DLTPublished("", cb.BatchID, "callback_error", "callbacks")
 			}
 		} else {
-			method := "on_complete"
-			class := cb.OnComplete
-			if cb.Outcome == "success" && cb.OnSuccess != "" {
-				method = "on_success"
-				class = cb.OnSuccess
-			}
-			instrument.Emit("callback.invoked", map[string]interface{}{
-				"batch_id":        cb.BatchID,
-				"callback_class":  class,
-				"callback_method": method,
-			}, 0)
+			method := callbackMethod(cb)
+			class := callbackClass(cb, method)
+			instrument.CallbackInvoked(cb.BatchID, class, method)
 		}
 	}
 	_, _ = p.Store.ClaimCallback(ctx, cb.BatchID, p.NodeID)
 	return out, nil
+}
+
+func callbackMethod(cb protocol.CallbackMessage) string {
+	if cb.Outcome == "success" && cb.OnSuccess != "" {
+		return "on_success"
+	}
+	return "on_complete"
+}
+
+func callbackClass(cb protocol.CallbackMessage, method string) string {
+	if method == "on_success" {
+		return cb.OnSuccess
+	}
+	return cb.OnComplete
 }

@@ -131,6 +131,8 @@ func (p *Poller) produceDue(ctx context.Context, raw []byte, jobID string) bool 
 		if batchID, _ := data["batch_id"].(string); batchID != "" && p.Cancelled != nil {
 			cancelled, err := p.Cancelled(ctx, batchID)
 			if err == nil && cancelled {
+				workerClass, _ := data["worker_class"].(string)
+				instrument.JobCancelled(jobID, batchID, workerClass)
 				return true
 			}
 		}
@@ -167,12 +169,7 @@ func (p *Poller) produceDue(ctx context.Context, raw []byte, jobID string) bool 
 			workerClass = jt
 		}
 	}
-	instrument.Emit("scheduled.dispatched", map[string]interface{}{
-		"job_id":       jobID,
-		"batch_id":     batchID,
-		"worker_class": workerClass,
-		"topic":        route.Topic,
-	}, 0)
+	instrument.ScheduledDispatched(jobID, batchID, workerClass, route.Topic)
 	return true
 }
 
