@@ -7,6 +7,8 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
     KafkaBatch.config.fair_time_ready_ruby_topic = ""
     allow(KafkaBatch).to receive(:scheduler).and_return(scheduler)
     allow(scheduler).to receive(:confirm_forward)
+    allow(scheduler).to receive(:reclaim_expired_leases!).and_return(0)
+    allow(scheduler).to receive(:list_stale_forwards).and_return([])
   end
 
   after { described_class.reset! }

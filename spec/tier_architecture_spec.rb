@@ -136,9 +136,20 @@ RSpec.describe "Three-tier architecture (Ruby)" do
     it "starts only when explicitly enabled (typical scheduler role)" do
       KafkaBatch.configure { |c| c.schedule_poller_enabled = true }
       KafkaBatch::SchedulePoller.ensure_running!
+      wait_for { KafkaBatch::SchedulePoller.running? }
       expect(KafkaBatch::SchedulePoller.running?).to be(true)
     ensure
       KafkaBatch::SchedulePoller.stop!
+    end
+  end
+
+  def wait_for(timeout: 2.0, interval: 0.01)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    loop do
+      return if yield
+      raise "condition not met within #{timeout}s" if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      sleep interval
     end
   end
 end
