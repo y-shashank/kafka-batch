@@ -1,0 +1,9 @@
+handlers:
+  segment.export:
+    runtime: go
+    topic: segment.exports
+    max_retries: 25
+  priority.fast:
+    runtime: go
+    topic: kafka_batch.jobs.p0
+    max_retries: 3

@@ -443,6 +443,9 @@ module KafkaBatch
     # Optional YAML listing handlers (runtime/topic/retries). Loaded at boot
     # when set. Also via ENV KAFKA_BATCH_HANDLER_MANIFEST.
     attr_accessor :handler_manifest_path
+    # Extra plain job topics for kafka-batch-go worker (daemon jobs_topics YAML).
+    # Used by /lag to list the go-worker-jobs consumer group when manifest is absent.
+    attr_accessor :jobs_topics   # Array<String> – default []
 
     # ── Daemon mode ────────────────────────────────────────────────────────────
     # When true, Karafka consumers are skipped in this process — use on API/client
@@ -556,6 +559,7 @@ module KafkaBatch
       @web_authenticator        = nil
       @daemon_mode              = truthy_env?("KAFKA_BATCH_DAEMON_MODE")
       @handler_manifest_path    = ENV["KAFKA_BATCH_HANDLER_MANIFEST"].to_s.strip
+      @jobs_topics              = []
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
 

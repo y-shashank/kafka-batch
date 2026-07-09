@@ -51,6 +51,34 @@ module KafkaBatch
         definitions.values.map(&:kafka_topic).uniq
       end
 
+      # Plain (non-fair) topics for runtime :go handlers — kbatch worker -go-worker-jobs group.
+      def go_plain_topics
+        definitions.values
+                   .select { |d| d.runtime == :go && !d.fairness? }
+                   .map(&:kafka_topic)
+                   .compact
+                   .uniq
+      end
+
+      # Priority YAML topics that have at least one runtime :go handler on that topic.
+      def go_priority_topics_by_group(registry)
+        return {} unless registry
+
+        out = {}
+        registry.configs.each do |prio|
+          go_topics = prio.topics.select do |topic|
+            definitions.values.any? do |d|
+              d.runtime == :go && !d.fairness? && d.kafka_topic == topic
+            end
+          end
+          next if go_topics.empty?
+
+          group = KafkaBatch.go_worker_priority_consumer_group(prio.consumer_group_suffix)
+          out[group] = go_topics
+        end
+        out
+      end
+
       def reset!
         @definitions = {}
         @loaded      = false

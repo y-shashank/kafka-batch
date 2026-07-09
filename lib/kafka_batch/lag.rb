@@ -127,6 +127,9 @@ module KafkaBatch
     def gem_groups_with_topics
       cfg    = KafkaBatch.config
       prefix = cfg.consumer_group   # e.g. "kafka-batch"
+      registry = KafkaBatch::Priority::Registry.load(
+        cfg.resolved_priority_config_paths, cfg: cfg
+      )
 
       own_routes =
         if defined?(Karafka::App)
@@ -141,11 +144,50 @@ module KafkaBatch
 
       if own_routes.any?
         # Route-based: gem-owned consumer groups found in this process's routes.
-        own_routes.each_with_object({}) { |r, h| h[r.id] = r.topics.map(&:name) }
+        groups = own_routes.each_with_object({}) { |r, h| h[r.id] = r.topics.map(&:name) }
+        merge_go_worker_groups!(groups, cfg, prefix, registry)
+        groups
       else
         # Config-based fallback: no gem routes drawn here (UI-only service or
         # process where karafka.rb runs but doesn't call draw_routes).
         config_based_groups(cfg, prefix)
+      end
+    end
+
+    # @api private
+    # Adds kafka-batch-go execution groups so the /lag UI can pause/resume them.
+    def merge_go_worker_groups!(groups, cfg, prefix, registry)
+      go_jobs = go_worker_plain_topics(cfg)
+      groups[KafkaBatch.go_worker_jobs_consumer_group] = go_jobs if go_jobs.any?
+
+      go_priority_groups(cfg, registry).each do |group, topics|
+        groups[group] = topics if topics.any?
+      end
+    end
+
+    # @api private
+    def go_worker_plain_topics(cfg)
+      topics = []
+      if KafkaBatch::HandlerManifest.loaded?
+        topics.concat(KafkaBatch::HandlerManifest.go_plain_topics)
+      end
+      topics.concat(Array(cfg.jobs_topics)) if cfg.respond_to?(:jobs_topics)
+      topics.map(&:to_s).reject(&:empty?).uniq
+    end
+
+    # @api private
+    def go_priority_groups(cfg, registry)
+      registry ||= KafkaBatch::Priority::Registry.load(
+        cfg.resolved_priority_config_paths, cfg: cfg
+      )
+      if KafkaBatch::HandlerManifest.loaded?
+        return KafkaBatch::HandlerManifest.go_priority_topics_by_group(registry)
+      end
+
+      # No manifest — assume all priority YAML topics may be consumed by Go worker.
+      registry.configs.each_with_object({}) do |prio, h|
+        group = KafkaBatch.go_worker_priority_consumer_group(prio.consumer_group_suffix)
+        h[group] = prio.topics
       end
     end
 
@@ -157,7 +199,7 @@ module KafkaBatch
       groups["#{prefix}-control"] =
         [cfg.events_topic, cfg.callbacks_topic].compact + Array(cfg.retry_topics)
 
-      # Priority groups — from YAML config when paths are set.
+      # Priority groups — Ruby Karafka execution.
       registry = KafkaBatch::Priority::Registry.load(
         cfg.resolved_priority_config_paths, cfg: cfg
       )
@@ -173,7 +215,7 @@ module KafkaBatch
           ruby_ready = cfg.fairness_ready_topic(t, :ruby)
           go_ready   = cfg.fairness_ready_topic(t, :go)
           groups["#{prefix}-jobs-fair-#{t}"] = [ruby_ready] if ruby_ready && !ruby_ready.to_s.empty?
-          go_group = "#{prefix}-go-worker-fair-ready-#{t}"
+          go_group = KafkaBatch.go_worker_fair_ready_consumer_group(t)
           groups[go_group] = [go_ready] if go_ready && !go_ready.to_s.empty?
         else
           ready = cfg.fairness_ready_topic(t)
@@ -181,15 +223,13 @@ module KafkaBatch
         end
       end
 
-      # Plain jobs group — the default topic PLUS any custom plain-worker topics.
-      # draw_routes was never called in this process, so recover the customs from
-      # (a) the worker registry when the full backend happens to be loaded, and
-      # (b) config.extra_job_topics (the reliable path for a pure UI-only service
-      # that never loads worker classes).
+      # Plain jobs group — Ruby Karafka execution.
       reserved = registry.reserved_topics
       groups["#{prefix}-jobs"] =
         ([cfg.jobs_topic] + registry_job_topics(reserved) + Array(cfg.extra_job_topics))
         .compact.uniq
+
+      merge_go_worker_groups!(groups, cfg, prefix, registry)
 
       groups.reject { |_, topics| topics.empty? }
     end

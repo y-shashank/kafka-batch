@@ -98,6 +98,22 @@ RSpec.describe KafkaBatch::Lag do
         expect(result["kb-jobs"]).to eq(%w[kafka_batch.jobs orders.process])
         expect(result["kb-jobs-fast"]).to eq(%w[kafka_batch.jobs.p0 kafka_batch.jobs.p1])
       end
+
+      it "includes go-worker execution groups for lag pause/resume" do
+        KafkaBatch.config.handler_manifest_path = File.expand_path(
+          "fixtures/handlers/go_ruby.yml", __dir__
+        )
+        KafkaBatch::HandlerManifest.load!(KafkaBatch.config.handler_manifest_path)
+        KafkaBatch.config.priority_config_paths = [
+          File.expand_path("fixtures/priority/fast.yml", __dir__)
+        ]
+        KafkaBatch.config.jobs_topics = %w[segment.exports]
+        allow(KafkaBatch).to receive(:workers).and_return([])
+
+        result = described_class.gem_groups_with_topics
+        expect(result["kb-go-worker-jobs"]).to include("segment.exports")
+        expect(result["kb-go-worker-jobs-fast"]).to eq(%w[kafka_batch.jobs.p0])
+      end
     end
   end
 

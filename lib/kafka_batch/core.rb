@@ -84,6 +84,19 @@ module KafkaBatch
       "#{config.consumer_group}-jobs"
     end
 
+    # Go execution tier (kafka-batch-go kbatch worker) — mirrors pkg/config/groups.go.
+    def go_worker_jobs_consumer_group
+      "#{config.consumer_group}-go-worker-jobs"
+    end
+
+    def go_worker_priority_consumer_group(suffix)
+      "#{config.consumer_group}-go-worker-#{suffix}"
+    end
+
+    def go_worker_fair_ready_consumer_group(type)
+      "#{config.consumer_group}-go-worker-fair-ready-#{type}"
+    end
+
     # ── Node identity ──────────────────────────────────────────────────────
 
     # Identifier for THIS process/pod. Prefers the K8s pod name (ENV["HOSTNAME"])
