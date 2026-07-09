@@ -51,10 +51,10 @@ defer c.Close()
 _, _ = c.EnqueueJob(ctx, "my.handler", map[string]interface{}{"id": 1}, client.PushOptions{})
 
 // Batch (block form)
-batch, _ := c.CreateBatch(ctx, client.BatchOptions{OnComplete: "MyCallback"}, func(b *client.Batch) error {
-    _, err := b.PushJob(ctx, "my.handler", map[string]interface{}{"id": 1}, client.PushOptions{})
-// Batch bulk push
-_, _ = b.PushManyJobs(ctx, "my.handler", []map[string]interface{}{{"id": 1}, {"id": 2}}, client.PushOptions{})
+_, _ = c.CreateBatch(ctx, client.BatchOptions{OnComplete: "MyCallback"}, func(b *client.Batch) error {
+    _, err := b.PushManyJobs(ctx, "my.handler", []map[string]interface{}{{"id": 1}, {"id": 2}}, client.PushOptions{})
+    return err
+})
 ```
 
 Wire-compatible with Ruby: same Redis batch keys, job JSON envelope, schedule index members, and uniq fingerprints.
