@@ -18,6 +18,7 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
 	"github.com/y-shashank/kafka-batch/go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
+	"github.com/y-shashank/kafka-batch/go/pkg/metrics"
 	"github.com/y-shashank/kafka-batch/go/pkg/priority"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
 )
@@ -46,6 +47,10 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	if !manifest.HasGoHandlers() {
 		return fmt.Errorf("no runtime:go handlers in manifest — kbatch worker has nothing to execute")
 	}
+	if err := metrics.Install(metrics.FromDaemon(cfg)); err != nil {
+		return fmt.Errorf("metrics: %w", err)
+	}
+	defer metrics.Reset()
 
 	jobTopics := manifest.JobTopicsGo(defaultTopic)
 	for _, t := range cfg.JobsTopics {

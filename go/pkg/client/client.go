@@ -3,7 +3,6 @@ package client
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -25,6 +24,7 @@ type Client struct {
 	sched    *schedule.RedisStore
 	prod     *kafkaclient.Client
 	uniq     *uniq.Locker
+	rdb      *redis.Client
 }
 
 // New connects to Kafka and Redis and loads the handler manifest.
@@ -44,24 +44,40 @@ func New(cfg Config) (*Client, error) {
 		return nil, err
 	}
 	rdb := redis.NewClient(rOpts)
-	prod, err := kafkaclient.New(cfg.Brokers)
-	if err != nil {
-		return nil, err
-	}
-	return &Client{
+	c := &Client{
 		cfg:      cfg,
 		manifest: manifest,
 		store:    store.NewRedisStore(rdb, cfg.BatchTTL),
 		sched:    schedule.NewRedisStore(rdb, 500),
-		prod:     prod,
 		uniq:     uniq.NewLocker(rdb, cfg.UniqLockTTL),
-	}, nil
+		rdb:      rdb,
+	}
+	if err := c.validateManifest(); err != nil {
+		_ = rdb.Close()
+		return nil, err
+	}
+	if err := pingRedis(context.Background(), rdb); err != nil {
+		_ = rdb.Close()
+		return nil, err
+	}
+	prod, err := kafkaclient.New(cfg.Brokers)
+	if err != nil {
+		_ = rdb.Close()
+		return nil, err
+	}
+	c.prod = prod
+	return c, nil
 }
 
-// Close releases Kafka connections.
+// Close releases Redis and Kafka connections.
 func (c *Client) Close() {
 	if c.prod != nil {
 		c.prod.Close()
+		c.prod = nil
+	}
+	if c.rdb != nil {
+		_ = c.rdb.Close()
+		c.rdb = nil
 	}
 }
 
@@ -83,7 +99,7 @@ func (c *Client) CreateBatch(ctx context.Context, opts BatchOptions, populate fu
 		return nil, err
 	}
 	if !created {
-		return nil, fmt.Errorf("batch %s already exists", id)
+		return nil, BatchExistsError{BatchID: id}
 	}
 	instrument.BatchCreated(id, opts.Description, opts.TenantID, opts.OnSuccess, opts.OnComplete)
 
@@ -114,10 +130,14 @@ func (c *Client) OpenBatch(ctx context.Context, id string) (*Batch, error) {
 	if row == nil {
 		return nil, BatchNotFoundError{BatchID: id}
 	}
+	meta := map[string]interface{}{}
+	if row.Meta != "" {
+		_ = json.Unmarshal([]byte(row.Meta), &meta)
+	}
 	return &Batch{
 		client: c, id: id,
 		onSuccess: row.OnSuccess, onComplete: row.OnComplete,
-		tenantID: "",
+		meta: meta, description: row.Description, tenantID: row.TenantID,
 	}, nil
 }
 
@@ -129,11 +149,14 @@ func (c *Client) EnqueueJob(ctx context.Context, jobType string, payload map[str
 	}
 	jobID := opts.jobID()
 	if skipped, err := c.claimUniq(ctx, entry, jobType, payload, jobID, ""); skipped || err != nil {
+		if skipped {
+			return "", ErrJobSkipped
+		}
 		return "", err
 	}
 	msg, err := c.buildMessage(entry, jobType, payload, jobID, nil, opts, nil)
 	if err != nil {
-		c.releaseUniq(entry, jobType, payload, jobID, msg.UniqFP)
+		c.releaseUniq(entry, jobType, payload, jobID, "")
 		return "", err
 	}
 	route := c.routeFor(entry, jobID, opts.tenantID(""), nil)
@@ -152,11 +175,14 @@ func (c *Client) EnqueueJobAt(ctx context.Context, runAt interface{}, jobType st
 	}
 	jobID := opts.jobID()
 	if skipped, err := c.claimUniq(ctx, entry, jobType, payload, jobID, ""); skipped || err != nil {
+		if skipped {
+			return "", ErrJobSkipped
+		}
 		return "", err
 	}
 	msg, err := c.buildMessage(entry, jobType, payload, jobID, nil, opts, nil)
 	if err != nil {
-		c.releaseUniq(entry, jobType, payload, jobID, msg.UniqFP)
+		c.releaseUniq(entry, jobType, payload, jobID, "")
 		return "", err
 	}
 	if err := c.scheduleMessage(ctx, msg, clampRunAt(runAt, c.cfg.MaxScheduleHorizon), ""); err != nil {

@@ -64,6 +64,9 @@ type Daemon struct {
 	FairnessLeaseTTL          float64
 	FairnessDefaultWeight     float64
 	FairnessWeightedConcurrency bool
+	MetricsEnabled              bool
+	MetricsPrefix               string
+	MetricsStatsDAddr           string
 }
 
 func DefaultDaemon() Daemon {
@@ -108,6 +111,7 @@ func DefaultDaemon() Daemon {
 		FairnessLeaseTTL:          1800,
 		FairnessDefaultWeight:     1.0,
 		FairnessWeightedConcurrency: true,
+		MetricsPrefix:               "kafka_batch",
 	}
 }
 
@@ -167,6 +171,9 @@ func LoadDaemon(path string) (Daemon, error) {
 		FairnessLeaseTTL          float64    `yaml:"fairness_lease_ttl"`
 		FairnessDefaultWeight     float64    `yaml:"fairness_default_weight"`
 		FairnessWeightedConcurrency bool     `yaml:"fairness_weighted_concurrency"`
+		MetricsEnabled              bool     `yaml:"metrics_enabled"`
+		MetricsPrefix               string   `yaml:"metrics_prefix"`
+		MetricsStatsDAddr           string   `yaml:"metrics_statsd_addr"`
 	}
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return cfg, err
@@ -306,6 +313,15 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.FairnessWeightedConcurrency {
 		cfg.FairnessWeightedConcurrency = true
 	}
+	if doc.MetricsEnabled {
+		cfg.MetricsEnabled = true
+	}
+	if doc.MetricsPrefix != "" {
+		cfg.MetricsPrefix = doc.MetricsPrefix
+	}
+	if doc.MetricsStatsDAddr != "" {
+		cfg.MetricsStatsDAddr = doc.MetricsStatsDAddr
+	}
 	applyEnv(&cfg)
 	cfg.prefixTopics()
 	return cfg, nil
@@ -342,6 +358,15 @@ func applyEnv(cfg *Daemon) {
 				cfg.PriorityConfigPaths = append(cfg.PriorityConfigPaths, p)
 			}
 		}
+	}
+	if v := os.Getenv("KAFKA_BATCH_METRICS_ENABLED"); v == "1" || strings.EqualFold(v, "true") {
+		cfg.MetricsEnabled = true
+	}
+	if v := os.Getenv("KAFKA_BATCH_METRICS_PREFIX"); v != "" {
+		cfg.MetricsPrefix = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("KAFKA_BATCH_METRICS_STATSD_ADDR"); v != "" {
+		cfg.MetricsStatsDAddr = strings.TrimSpace(v)
 	}
 	cfg.prefixTopics()
 }

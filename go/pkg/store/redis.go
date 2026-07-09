@@ -27,6 +27,8 @@ type Batch struct {
 	OnSuccess       string
 	OnComplete      string
 	Meta            string
+	Description     string
+	TenantID        string
 	FinishedAt      string
 	CallbackClaimed bool
 }
@@ -118,7 +120,11 @@ func (s *RedisStore) FindBatch(ctx context.Context, id string) (*Batch, error) {
 	if len(h) == 0 {
 		return nil, nil
 	}
-	b := &Batch{ID: h["id"], Status: h["status"], OnSuccess: h["on_success"], OnComplete: h["on_complete"], Meta: h["meta"], FinishedAt: h["finished_at"]}
+	b := &Batch{
+		ID: h["id"], Status: h["status"], OnSuccess: h["on_success"], OnComplete: h["on_complete"],
+		Meta: h["meta"], Description: h["description"], TenantID: h["tenant_id"],
+		FinishedAt: h["finished_at"],
+	}
 	b.TotalJobs, _ = strconv.ParseInt(h["total_jobs"], 10, 64)
 	b.CompletedCount, _ = strconv.ParseInt(h["completed_count"], 10, 64)
 	b.FailedCount, _ = strconv.ParseInt(h["failed_count"], 10, 64)

@@ -25,6 +25,7 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/jobexpiry"
 	"github.com/y-shashank/kafka-batch/go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
+	"github.com/y-shashank/kafka-batch/go/pkg/metrics"
 	"github.com/y-shashank/kafka-batch/go/pkg/priority"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/schedule"
@@ -58,6 +59,10 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	if manifest.HasGoHandlers() {
 		log.Printf("kbatch daemon: runtime:go handlers are executed by kbatch worker (control plane does not run Go jobs)")
 	}
+	if err := metrics.Install(metrics.FromDaemon(cfg)); err != nil {
+		return fmt.Errorf("metrics: %w", err)
+	}
+	defer metrics.Reset()
 
 	jobTopics := manifest.JobTopicsForRuntime(config.RuntimeRuby, defaultTopic)
 	if len(cfg.JobsTopics) > 0 {

@@ -2,7 +2,7 @@ package client
 
 import (
 	"context"
-	"time"
+	"fmt"
 
 	"github.com/google/uuid"
 
@@ -64,6 +64,9 @@ func (b *Batch) PushJob(ctx context.Context, jobType string, payload map[string]
 	}
 	jobID := opts.jobID()
 	if skipped, err := b.client.claimUniq(ctx, entry, jobType, payload, jobID, b.id); skipped || err != nil {
+		if skipped {
+			return "", ErrJobSkipped
+		}
 		return "", err
 	}
 	seq, err := b.reserve(ctx, 1)
@@ -73,7 +76,7 @@ func (b *Batch) PushJob(ctx context.Context, jobType string, payload map[string]
 	}
 	msg, err := b.client.buildMessage(entry, jobType, payload, jobID, &b.id, opts, &seq)
 	if err != nil {
-		b.client.releaseUniq(entry, jobType, payload, jobID, msg.UniqFP)
+		b.client.releaseUniq(entry, jobType, payload, jobID, "")
 		_, _ = b.client.store.AddJobs(ctx, b.id, -1)
 		return "", err
 	}
@@ -94,6 +97,9 @@ func (b *Batch) PushJobAt(ctx context.Context, runAt interface{}, jobType string
 	}
 	jobID := opts.jobID()
 	if skipped, err := b.client.claimUniq(ctx, entry, jobType, payload, jobID, b.id); skipped || err != nil {
+		if skipped {
+			return "", ErrJobSkipped
+		}
 		return "", err
 	}
 	seq, err := b.reserve(ctx, 1)
@@ -103,7 +109,7 @@ func (b *Batch) PushJobAt(ctx context.Context, runAt interface{}, jobType string
 	}
 	msg, err := b.client.buildMessage(entry, jobType, payload, jobID, &b.id, opts, &seq)
 	if err != nil {
-		b.client.releaseUniq(entry, jobType, payload, jobID, msg.UniqFP)
+		b.client.releaseUniq(entry, jobType, payload, jobID, "")
 		_, _ = b.client.store.AddJobs(ctx, b.id, -1)
 		return "", err
 	}
@@ -126,7 +132,9 @@ func (b *Batch) Seal(ctx context.Context) (*SealResult, error) {
 		return nil, BatchNotFoundError{BatchID: b.id}
 	case "done":
 		if result.Batch != nil {
-			_ = b.client.produceCallback(ctx, result.Batch, result.Outcome)
+			if err := b.client.produceCallback(ctx, result.Batch, result.Outcome); err != nil {
+				return &SealResult{Status: result.Status, Outcome: result.Outcome}, fmt.Errorf("callback produce: %w", err)
+			}
 		}
 	}
 	row, _ := b.client.store.FindBatch(ctx, b.id)
@@ -165,27 +173,4 @@ func (b *Batch) reserve(ctx context.Context, count int64) (int64, error) {
 	b.seqCursor = res.SeqStart
 	b.seqEnd = res.SeqEnd
 	return 0, nil
-}
-
-func clampRunAt(v interface{}, horizon time.Duration) time.Time {
-	now := time.Now().UTC()
-	max := now.Add(horizon)
-	var t time.Time
-	switch x := v.(type) {
-	case time.Time:
-		t = x.UTC()
-	case *time.Time:
-		if x != nil {
-			t = x.UTC()
-		}
-	default:
-		t = now
-	}
-	if t.After(max) {
-		return max
-	}
-	if t.Before(now) {
-		return now
-	}
-	return t
 }

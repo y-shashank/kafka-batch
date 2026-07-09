@@ -15,6 +15,7 @@ type Client struct {
 func New(brokers []string, opts ...kgo.Opt) (*Client, error) {
 	base := []kgo.Opt{
 		kgo.SeedBrokers(brokers...),
+		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.AllowAutoTopicCreation(),
 	}
 	inner, err := kgo.NewClient(append(base, opts...)...)

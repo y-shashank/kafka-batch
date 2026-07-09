@@ -1,6 +1,9 @@
 package client
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // BatchClosedError is raised when pushing into a completed or cancelled batch.
 type BatchClosedError struct {
@@ -20,6 +23,18 @@ type BatchNotFoundError struct {
 func (e BatchNotFoundError) Error() string {
 	return fmt.Sprintf("batch %s not found", e.BatchID)
 }
+
+// BatchExistsError is raised when creating a batch with an id that already exists.
+type BatchExistsError struct {
+	BatchID string
+}
+
+func (e BatchExistsError) Error() string {
+	return fmt.Sprintf("batch %s already exists", e.BatchID)
+}
+
+// ErrJobSkipped indicates a uniq-skipped enqueue (empty job id, nil error).
+var ErrJobSkipped = errors.New("job skipped (uniq duplicate)")
 
 // DuplicateJobError is raised when uniq_on_duplicate is raise.
 type DuplicateJobError struct {
