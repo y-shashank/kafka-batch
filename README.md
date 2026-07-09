@@ -564,6 +564,7 @@ All options live on `KafkaBatch.config`. The install generator ships enterprise-
 | `cancellation_cache_ttl` | `120` | seconds |
 | `consumption_control_refresh_interval` | `30` | How often consumers re-read pause state from Redis/MySQL |
 | `priority_config_paths` | `[]` | Paths to priority YAML files |
+| `handler_manifest_path` | `""` | YAML for Go handlers (and optional Ruby routing) — **required for Go jobs** |
 | `fairness_weighted_concurrency` | `true` | Set `false` for equal in-flight cap per tenant (weights → order only) |
 | `fairness_global_concurrency` | `50` | Per-lane in-flight window (install template: `1000`) |
 | `fairness_lease_ttl` | `1800` | Seconds; install template: `7200` |
