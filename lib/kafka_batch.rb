@@ -151,7 +151,7 @@ module KafkaBatch
       if config.daemon_mode?
         KafkaBatch.logger.warn(
           "[KafkaBatch] daemon_mode enabled — skipping Karafka consumers " \
-          "(kbatch daemon owns job/event/retry/callback consumption)"
+          "(client-only process; run control/execution in separate Karafka pods)"
         )
         return
       end

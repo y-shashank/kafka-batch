@@ -445,8 +445,8 @@ module KafkaBatch
     attr_accessor :handler_manifest_path
 
     # ── Daemon mode ────────────────────────────────────────────────────────────
-    # When true, Karafka consumers are skipped in this process — run a dedicated
-    # control plane (kbatch daemon or Karafka control pods) and separate execution.
+    # When true, Karafka consumers are skipped in this process — use on API/client
+    # pods. Run control and execution in dedicated Karafka deployments.
     attr_accessor :daemon_mode                 # Boolean – default false
 
     # ── Passthrough rdkafka config ───────────────────────────────────────────

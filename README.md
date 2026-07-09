@@ -5,7 +5,7 @@
 
 **Sidekiq Pro Batches on Kafka.** Same `on_success` / `on_complete` callback model, per-job retries, and batch completion counting — with Kafka as the durable job transport and Redis for coordination.
 
-Built on [Karafka](https://karafka.io) (WaterDrop + consumers). **Go runtime:** [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go). Go runtime: [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go).
+Built on [Karafka](https://karafka.io) (WaterDrop + consumers). **Go runtime:** [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go).
 
 ---
 
@@ -18,6 +18,7 @@ Built on [Karafka](https://karafka.io) (WaterDrop + consumers). **Go runtime:** 
 - [Batches & callbacks](#batches--callbacks)
 - [Configuration](#configuration)
 - [Three-tier architecture](#three-tier-architecture)
+- [Deployment](#deployment)
 - [Priority queues](#priority-queues)
 - [Multi-tenant fairness](#multi-tenant-fairness)
 - [Delayed jobs](#delayed-jobs)
@@ -174,7 +175,7 @@ end
 ```
 
 ```bash
-bundle exec karafka server   # dev: all consumer groups
+bundle exec karafka server   # dev: all tiers — see [Deployment](#deployment)
 ```
 
 ### 6. Mount the dashboard (optional)
@@ -350,33 +351,7 @@ handlers:
     topic: kafka_batch.jobs
 ```
 
-### API / client pods (produce only)
-
-```ruby
-config.daemon_mode = true   # skips all Karafka consumers in this process
-```
-
-Use dedicated Karafka deployments for tier 2 (control) and tier 3 (jobs).
-
-### Development (local, Ruby-only)
-
-```bash
-export KAFKA_PREFIX=dev
-export REDIS_URL=redis://localhost:6379/0
-bundle exec karafka server
-```
-
-Split across terminals with `KB_ROLE` or `--include-consumer-groups` when you want control and execution as separate processes.
-
-### Production (Kubernetes, Ruby stack)
-
-| Deployment | Tier | Command | Kafka consumers |
-|------------|------|---------|-----------------|
-| `kafka-batch-api` | 1 | Puma + gem | **none** (`daemon_mode: true`) |
-| `kafka-batch-control` | 2 | `karafka server` (control groups) | ingest, events, retry, callbacks, schedule |
-| `kafka-batch-worker` | 3 | `karafka server` (job groups) | ruby plain, priority, `fair_*_ready.ruby` |
-
-**Go stack:** see [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go).
+See **[Deployment](#deployment)** for how to run all three tiers together, standalone on one host, or split into separate processes.
 
 ---
 
@@ -474,43 +449,202 @@ Also read from environment:
 
 ---
 
-## Karafka routing & deployment
+## Deployment
 
-`KafkaBatch.draw_routes` registers consumer groups:
+KafkaBatch registers **every** consumer group in `draw_routes`, but each process runs only the groups you include. Tiers talk through **Kafka + Redis** only — no sockets or shared memory between pods.
 
-| Group suffix | Topics | Consumer |
-|---|---|---|
-| `-control` | events, callbacks, retry tiers | Event, Callback, Retry |
-| `-dispatch-<lane>` | fair ingest | `Fairness::Dispatcher` |
-| `-jobs-fair-<lane>` | fair ready | `JobConsumer` |
-| `-<priority-suffix>` | from priority YAML | `PriorityJobConsumer` (ranked) |
-| `-jobs` | plain worker topics | `JobConsumer` |
+Throughout this section, **`CG`** means `KafkaBatch.config.consumer_group` (default `kafka-batch`; with `topic_prefix = "myapp"` → `myapp.kafka-batch`).
 
-Karafka runs only the groups you include. In production, use **one Deployment per role**:
+### Consumer groups
 
-```bash
-# Examples (replace kafka-batch with your config.consumer_group)
-bundle exec karafka server --include-consumer-groups kafka-batch-control
-bundle exec karafka server --include-consumer-groups kafka-batch-jobs
-bundle exec karafka server --include-consumer-groups kafka-batch-jobs-fast   # from priority YAML suffix
-bundle exec karafka server --include-consumer-groups kafka-batch-dispatch-time,kafka-batch-jobs-fair-time
-```
-
-### `KB_ROLE` wrapper
-
-Map roles to consumer groups in `bin/kb-server` (see install docs). Typical production split:
-
-| `KB_ROLE` | Consumer groups | Poller | Scale |
+| Group | Tier | Topics | Consumer |
 |---|---|---|---|
-| `control` | `-control` | off | few pods |
-| `scheduler` | `-control` (light) | **on** | 2–3 fixed pods |
-| `jobs` | `-jobs` | off | autoscale on lag |
-| `fair-time` | `-dispatch-time`, `-jobs-fair-time` | off | autoscale on lag |
-| `jobs-fast` | `-jobs-fast` (your YAML suffix) | off | autoscale on lag |
-| `all` | everything | on | dev only |
+| `{CG}-control` | 2 — Control | events, callbacks, retry tiers | Event, Callback, Retry |
+| `{CG}-dispatch-<lane>` | 2 — Control | fair ingest (`time`, `throughput`) | `Fairness::Dispatcher` |
+| `{CG}-jobs-fair-<lane>` | 3 — Execution | fair ready (ruby) | `JobConsumer` |
+| `{CG}-<priority-suffix>` | 3 — Execution | from priority YAML | `PriorityJobConsumer` |
+| `{CG}-jobs` | 3 — Execution | plain worker topics | `JobConsumer` |
+
+List every group your install registers:
 
 ```ruby
-# initializer — wire poller to role
+KafkaBatch.consumer_groups
+# => ["myapp.kafka-batch-control", "myapp.kafka-batch-dispatch-time", ...]
+```
+
+### Choose a layout
+
+| Layout | When | Processes |
+|---|---|---|
+| **All tiers together** | Local dev, smoke tests | Rails (client) + Karafka (control + execution) |
+| **Standalone** | Small production, single host | One Karafka (all groups) + optional Rails API |
+| **Split** | Production scale | Separate deployments per tier |
+
+---
+
+### Development — all 3 tiers on one machine
+
+Run the **client** (enqueue + dashboard) and **Karafka** (control + execution) side by side. This is the fastest way to iterate locally.
+
+**Prerequisites**
+
+```bash
+export KAFKA_PREFIX=dev
+export REDIS_URL=redis://localhost:6379/0
+export KAFKA_BROKERS=localhost:9092
+bundle exec rake kafka_batch:create_topics
+```
+
+**Terminal 1 — Tier 2 + 3 (all Karafka consumer groups)**
+
+```bash
+KB_ROLE=all bundle exec karafka server
+```
+
+`KB_ROLE=all` turns on the schedule poller (generated initializer default). Omitting `--include-consumer-groups` runs **every** group `draw_routes` registers.
+
+**Terminal 2 — Tier 1 (Rails client)**
+
+```bash
+bundle exec rails server
+```
+
+Enqueue from controllers or console:
+
+```ruby
+KafkaBatch::Batch.enqueue(MyWorker, { "id" => 1 })
+```
+
+**Optional — dashboard**
+
+```ruby
+# config/routes.rb
+mount KafkaBatch::Web => "/kafka_batch"
+```
+
+**Minimal dev (Karafka only)** — skip Rails if you enqueue from `rails console` or a script while Karafka runs in another terminal:
+
+```bash
+KB_ROLE=all bundle exec karafka server
+```
+
+---
+
+### Standalone — one deployment, all tiers running
+
+Use when a **single host** or **one Kubernetes Deployment** should own the full pipeline: produce jobs, run control logic, and execute workers.
+
+| Component | Tier | What to run |
+|---|---|---|
+| Karafka | 2 + 3 | All consumer groups (no filter) |
+| Rails / Puma | 1 | HTTP API + `Batch.create` / `enqueue` |
+| Dashboard | — | `mount KafkaBatch::Web` (optional) |
+
+**Karafka (control + execution + schedule poller)**
+
+```bash
+KB_ROLE=all bundle exec karafka server
+```
+
+**Rails API (client — produces jobs, does not consume)**
+
+Keep `daemon_mode` **false** if Karafka is a separate process (normal). The API only needs `require "kafka_batch"` and a configured producer:
+
+```bash
+bundle exec puma
+```
+
+If Rails and Karafka accidentally share one process, set `config.daemon_mode = true` on the web tier so Puma never registers consumers — Karafka still runs them in its own process.
+
+**All-in-one on a single VM (no separate API)** — Karafka alone is enough; enqueue from console, cron, or an external producer.
+
+---
+
+### Split deployment — run one tier per process
+
+Use in production to scale execution independently, keep API pods consumer-free, and isolate control-plane load.
+
+#### Tier 1 — Client only
+
+**Purpose:** HTTP API, batch creation, optional dashboard. **No Kafka consumers.**
+
+```ruby
+# config/initializers/kafka_batch.rb
+config.daemon_mode = true
+```
+
+Or via environment:
+
+```bash
+KAFKA_BATCH_DAEMON_MODE=1 bundle exec puma
+```
+
+- Do **not** run `karafka server` in this deployment.
+- Gemfile can use `require: "kafka_batch/ui"` for dashboard-only services that never enqueue.
+- Full enqueue API needs `require "kafka_batch"` (loads `Batch` + `Producer`).
+
+#### Tier 2 — Control only
+
+**Purpose:** batch lifecycle (events, retry, callbacks), fair ingest → WFQ forwarder, delayed-job poller. Does **not** run `#perform`.
+
+```bash
+CG=myapp.kafka-batch   # must match KafkaBatch.config.consumer_group
+
+bundle exec karafka server \
+  --include-consumer-groups "${CG}-control,${CG}-dispatch-time,${CG}-dispatch-throughput"
+```
+
+**Schedule poller** — enable on 2–3 dedicated pods (not on every execution replica):
+
+```bash
+KB_ROLE=scheduler bundle exec karafka server \
+  --include-consumer-groups "${CG}-control"
+```
+
+Or combine control + scheduler on the same groups with `KB_ROLE=control,scheduler`.
+
+#### Tier 3 — Execution only
+
+**Purpose:** consume job topics, run `#perform`, publish completion events. Requires **at least one control pod** somewhere for retries, callbacks, and fair ingest.
+
+```bash
+bundle exec karafka server \
+  --include-consumer-groups "${CG}-jobs,${CG}-jobs-fair-time,${CG}-jobs-fair-throughput"
+```
+
+Add priority groups from your YAML (example suffix `jobs-fast`):
+
+```bash
+bundle exec karafka server \
+  --include-consumer-groups "${CG}-jobs,${CG}-jobs-fast,${CG}-jobs-fair-time"
+```
+
+Keep the schedule poller **off** on execution swarms:
+
+```ruby
+config.schedule_poller_enabled = false
+```
+
+```bash
+KB_ROLE=jobs bundle exec karafka server --include-consumer-groups "${CG}-jobs"
+```
+
+#### Tier cheat sheet
+
+| Tier | Process | `daemon_mode` | Karafka `--include-consumer-groups` | Schedule poller |
+|---|---|---|---|---|
+| 1 — Client | Puma / API | `true` | *(none — no Karafka)* | off |
+| 2 — Control | Karafka | `false` | `{CG}-control`, `{CG}-dispatch-*` | on scheduler pods |
+| 3 — Execution | Karafka | `false` | `{CG}-jobs`, `{CG}-jobs-fair-*`, priority | off |
+| All (dev / standalone) | Karafka | `false` | *(omit flag — all groups)* | on (`KB_ROLE=all`) |
+
+---
+
+### `KB_ROLE` and schedule poller
+
+The install generator maps `KB_ROLE` → `schedule_poller_enabled` (see `config/initializers/kafka_batch.rb`):
+
+```ruby
 roles = ENV.fetch("KB_ROLE", "all").split(",").map(&:strip)
 config.schedule_poller_enabled =
   case ENV["KB_SCHEDULE_POLLER"]
@@ -519,6 +653,30 @@ config.schedule_poller_enabled =
   else (roles & %w[all scheduler]).any?
   end
 ```
+
+| `KB_ROLE` | Karafka groups (typical) | Poller | Scale |
+|---|---|---|---|
+| `all` | everything | **on** | dev / standalone only |
+| `control` | `{CG}-control`, `{CG}-dispatch-*` | off | few pods |
+| `scheduler` | `{CG}-control` (light) | **on** | 2–3 fixed pods |
+| `jobs` | `{CG}-jobs` | off | autoscale on lag |
+| `fair-time` | `{CG}-dispatch-time`, `{CG}-jobs-fair-time` | off | autoscale on lag |
+| `jobs-fast` | `{CG}-jobs-fast` (your YAML suffix) | off | autoscale on lag |
+
+`KB_ROLE` does **not** filter Karafka groups by itself — it only gates the schedule poller. Use `--include-consumer-groups` (or run without it for all groups) to select which consumers a process runs.
+
+---
+
+### Production Kubernetes (split)
+
+| Deployment | Tier | Replicas | Entrypoint |
+|---|---|---|---|
+| `kafka-batch-api` | 1 | N | `KAFKA_BATCH_DAEMON_MODE=1 bundle exec puma` |
+| `kafka-batch-control` | 2 | 2–5 | `karafka server --include-consumer-groups ${CG}-control,${CG}-dispatch-time,...` |
+| `kafka-batch-scheduler` | 2 | 2–3 | `KB_ROLE=scheduler karafka server --include-consumer-groups ${CG}-control` |
+| `kafka-batch-worker` | 3 | autoscale | `karafka server --include-consumer-groups ${CG}-jobs,${CG}-jobs-fair-time,...` |
+
+**Go handlers:** tier 2/3 for `runtime: go` jobs live in [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go) (`kbatch daemon` / `kbatch worker`). Ruby and Go tiers still share Kafka topics and Redis — deploy them as separate pods.
 
 ---
 
@@ -750,7 +908,7 @@ Autoscale execution Deployments on **consumer lag** (KEDA / HPA). Partitions are
 3. `fairness_lease_ttl` > longest job runtime
 4. `schedule_poller_enabled` only on 2–3 scheduler pods
 5. `track_running_jobs = false` at 50M+ jobs/day if `/live` per-job detail isn't needed
-6. Split `KB_ROLE=control` from execution swarms
+6. Split control from execution — see [Deployment](#split-deployment--run-one-tier-per-process)
 7. Cap batch size or shard mega-batches in application code
 
 ---
