@@ -439,23 +439,15 @@ module KafkaBatch
     attr_accessor :metrics_proc      # alias hook for :proc adapter
     attr_accessor :metrics_prefix    # metric name prefix; default "kafka_batch"
 
-    # ── Go execution sidecar (Phase 2, deprecated) ─────────────────────────────
-    # Unix socket for legacy `kbatch serve` sidecar used with Karafka + executor :go.
-    # Do NOT use with daemon_mode — run `kbatch worker` for Go handlers instead.
-    attr_accessor :go_executor_socket          # String – e.g. /var/run/kbatch.sock
-    attr_accessor :go_executor_timeout         # Float – read timeout seconds; default 300
-    attr_accessor :go_executor_open_timeout    # Float – connect timeout seconds; default 1
-    # Optional YAML listing Go-only handlers (runtime/topic/retries). Loaded at boot
+    # ── Handler manifest (Go + Ruby routing) ─────────────────────────────────
+    # Optional YAML listing handlers (runtime/topic/retries). Loaded at boot
     # when set. Also via ENV KAFKA_BATCH_HANDLER_MANIFEST.
     attr_accessor :handler_manifest_path
 
-    # ── Go daemon mode (Phase 4) ─────────────────────────────────────────────
-    # When true, Karafka job/control consumers are skipped — kbatch daemon owns
-    # consumption. API pods set this; worker pods run WorkerServer instead.
+    # ── Daemon mode ────────────────────────────────────────────────────────────
+    # When true, Karafka consumers are skipped in this process — run a dedicated
+    # control plane (kbatch daemon or Karafka control pods) and separate execution.
     attr_accessor :daemon_mode                 # Boolean – default false
-    # Unix socket for Ruby Worker#perform when daemon dispatches runtime:ruby jobs.
-    attr_accessor :ruby_worker_socket           # String – e.g. /var/run/kbatch-ruby.sock
-    attr_accessor :ruby_worker_timeout         # Float – default 300
 
     # ── Passthrough rdkafka config ───────────────────────────────────────────
     attr_accessor :producer_config  # Hash – merged on top of producer defaults
@@ -562,12 +554,7 @@ module KafkaBatch
       @validate_topics_on_boot  = false
       @extra_job_topics         = []
       @web_authenticator        = nil
-      @go_executor_socket       = ENV["KAFKA_BATCH_GO_SOCKET"].to_s.strip
-      @go_executor_timeout      = 300.0
-      @go_executor_open_timeout = 1.0
       @daemon_mode              = truthy_env?("KAFKA_BATCH_DAEMON_MODE")
-      @ruby_worker_socket       = ENV["KAFKA_BATCH_WORKER_SOCKET"].to_s.strip
-      @ruby_worker_timeout      = 300.0
       @handler_manifest_path    = ENV["KAFKA_BATCH_HANDLER_MANIFEST"].to_s.strip
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
@@ -606,7 +593,6 @@ module KafkaBatch
     end
 
     def validate!
-      warn_deprecated_go_sidecar!
       raise ConfigurationError, "store must be :mysql or :redis" unless %i[mysql redis].include?(@store)
       unless %i[mysql redis].include?(@schedule_store)
         raise ConfigurationError, "schedule_store must be :mysql or :redis"
@@ -692,15 +678,6 @@ module KafkaBatch
 
     def daemon_mode?
       @daemon_mode == true
-    end
-
-    def warn_deprecated_go_sidecar!
-      return unless daemon_mode?
-      return if @go_executor_socket.to_s.strip.empty?
-
-      logger&.warn(
-        "[KafkaBatch] go_executor_socket is ignored in daemon_mode — Go handlers run in kbatch worker, not kbatch serve sidecar"
-      )
     end
 
     private

@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module KafkaBatch
-# Maps stable job_type identifiers to execution handlers (:ruby in-process; :go via legacy sidecar or manifest + kbatch worker).
+# Maps stable job_type identifiers to execution handlers (:ruby in-process via Karafka).
   class HandlerRegistry
     class UnknownHandler < Error; end
 
@@ -23,22 +23,14 @@ module KafkaBatch
 
         runtime = worker_class.executor
         if runtime == :go
-          return register_go(worker_class)
+          raise ArgumentError,
+                "executor :go is removed — declare runtime: go in the handler manifest and run kbatch worker"
         end
         unless runtime == :ruby
           raise ArgumentError, "unsupported executor #{runtime.inspect} for #{worker_class}"
         end
 
         register_definition(HandlerDefinition.from_worker(worker_class))
-      end
-
-      def register_go(worker_class = nil, definition: nil)
-        definition ||= HandlerDefinition.from_worker(worker_class)
-        unless definition.runtime == :go
-          raise ArgumentError, "register_go requires runtime :go (got #{definition.runtime.inspect})"
-        end
-
-        register_definition(definition, executor: Executors::Go.new)
       end
 
       def register_definition(definition, executor: nil)
@@ -52,7 +44,7 @@ module KafkaBatch
             raise ArgumentError, "ruby handler missing worker_class for #{job_type}" unless worker_class
             executor || Executors::Ruby.new(worker_class)
           when :go
-            executor || Executors::Go.new
+            nil
           else
             raise ArgumentError, "unsupported runtime #{runtime.inspect} for #{job_type}"
           end

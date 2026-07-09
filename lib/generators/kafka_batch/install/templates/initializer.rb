@@ -130,8 +130,7 @@ KafkaBatch.configure do |config|
   # Lower = pause/resume takes effect faster; higher = fewer Redis reads.
   # config.consumption_control_refresh_interval = 30
 
-  # ── Go execution sidecar (Phase 2, optional) ───────────────────────────────
-  # config.go_executor_socket = "/var/run/kbatch.sock"
+  # ── Handler manifest (runtime routing for Go + Ruby) ───────────────────────
   # config.handler_manifest_path = Rails.root.join("config/kafka_batch_handlers.yml").to_s
 
   # ── Producer safety ───────────────────────────────────────────────────────────

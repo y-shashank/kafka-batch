@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: write  # the badge job force-pushes coverage.json to the `badges` branch
+  contents: write
 
 jobs:
   test:
@@ -31,18 +31,13 @@ jobs:
           --health-retries 5
 
     env:
-      COVERAGE: "1"  # enable SimpleCov in spec_helper
+      COVERAGE: "1"
       KAFKA_BATCH_TEST_REDIS_URL: redis://localhost:6379/15
-      KAFKA_BATCH_INTEGRATION: "1"          # run spec/integration against the broker below
+      KAFKA_BATCH_INTEGRATION: "1"
       KAFKA_BATCH_TEST_BROKERS: localhost:9092
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
 
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
@@ -50,11 +45,6 @@ jobs:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
 
-      # Start a single-node Kafka (KRaft) via docker run rather than a service
-      # container, so a pull/start hiccup can never fail the whole job at
-      # "Initialize containers" — if Kafka doesn't come up, the integration specs
-      # simply skip (they probe broker reachability first). Uses the official
-      # Apache image (the old bitnami/kafka public tags were deprecated in 2025).
       - name: Start Kafka (KRaft)
         run: |
           docker run -d --name kafka -p 9092:9092 \
@@ -76,24 +66,13 @@ jobs:
 
       - name: Wait for Kafka
         run: |
-          echo "Waiting for Kafka on localhost:9092…"
           for i in $(seq 1 60); do
             if (exec 3<>/dev/tcp/localhost/9092) 2>/dev/null; then
-              echo "Kafka is accepting connections."; exec 3>&- 3<&-; exit 0
+              exec 3>&- 3<&-; exit 0
             fi
             sleep 2
           done
           echo "Kafka did not become ready in time — integration specs will skip." >&2
-
-      - name: Build Go integration sidecar
-        working-directory: go
-        run: |
-          go build -trimpath -o ../bin/kbatch-ittest ./cmd/kbatch-ittest
-          go build -trimpath -o ../bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
-
-      - name: Run Go tests
-        working-directory: go
-        run: go test ./...
 
       - name: Run tests
         run: bundle exec rspec
@@ -103,10 +82,7 @@ jobs:
         run: |
           pct=$(ruby -rjson -e 'r=JSON.parse(File.read("coverage/.last_run.json"))["result"]; puts ((r["line"]||r["covered_percent"]).to_f.round(1))')
           echo "pct=$pct" >> "$GITHUB_OUTPUT"
-          echo "Line coverage: ${pct}%"
 
-      # Publish a shields.io endpoint badge to an orphan `badges` branch.
-      # Runs once (single Ruby) and only on pushes to main, never on PRs/forks.
       - name: Publish coverage badge
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.ruby == '3.3'
         env:

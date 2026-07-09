@@ -156,6 +156,11 @@ module KafkaBatch
         worker_class = handler.worker_class
         worker_name  = handler.worker_class_name
 
+        if handler.runtime == :go
+          raise KafkaBatch::HandlerRegistry::UnknownHandler,
+                "job_type #{handler.job_type} has runtime :go — use kafka-batch-go (kbatch worker)"
+        end
+
         attempt        = data["attempt"].to_i
         max_retries    = data.fetch("max_retries", KafkaBatch.config.max_retries).to_i
         complete_after = data.fetch("complete_after_retries", KafkaBatch.config.complete_after_retries).to_i

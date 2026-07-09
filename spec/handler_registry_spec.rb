@@ -23,21 +23,29 @@ RSpec.describe KafkaBatch::HandlerRegistry do
       expect(handler.definition.job_type).to eq("custom.job")
     end
 
-    it "registers executor :go workers with GoExecutor" do
-      klass = Class.new do
-        def self.name
-          "SegmentExportWorker"
-        end
-
-        include KafkaBatch::Worker
-        job_type "segment.export"
-        executor :go
-        kafka_topic "segment.exports"
-      end
-
-      handler = described_class.resolve!({ "job_type" => "segment.export" })
+    it "registers manifest go handlers without a Ruby executor" do
+      definition = KafkaBatch::HandlerDefinition.new(
+        job_type: "segment.export",
+        runtime: :go,
+        topic: "segment.exports"
+      )
+      handler = described_class.register_definition(definition)
       expect(handler.runtime).to eq(:go)
-      expect(handler.executor).to be_a(KafkaBatch::Executors::Go)
+      expect(handler.executor).to be_nil
+    end
+
+    it "rejects executor :go on Worker classes" do
+      expect {
+        Class.new do
+          def self.name
+            "SegmentExportWorker"
+          end
+
+          include KafkaBatch::Worker
+          job_type "segment.export"
+          executor :go
+        end
+      }.to raise_error(ArgumentError, /executor :go is removed/)
     end
 
     it "raises when the same job_type is registered to two classes" do
