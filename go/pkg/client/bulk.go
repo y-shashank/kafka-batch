@@ -81,7 +81,7 @@ func (c *Client) scheduleMessages(ctx context.Context, messages []protocol.JobMe
 		if err != nil {
 			delivered := len(dels)
 			if delivered > 0 {
-				entries := scheduleEntriesFrom(chunk[:delivered], dels, runAt)
+				entries := scheduleEntriesFrom(chunk[:delivered], dels, runAt, batchID)
 				if werr := c.writeScheduleIndex(ctx, entries, batchID, chunk[0].JobID, delivered); werr != nil {
 					return werr
 				}
@@ -93,7 +93,7 @@ func (c *Client) scheduleMessages(ctx context.Context, messages []protocol.JobMe
 			}
 		}
 
-		entries := scheduleEntriesFrom(chunk, dels, runAt)
+		entries := scheduleEntriesFrom(chunk, dels, runAt, batchID)
 		if err := c.writeScheduleIndex(ctx, entries, batchID, chunk[0].JobID, len(entries)); err != nil {
 			return err
 		}
@@ -109,11 +109,11 @@ func (c *Client) scheduleMessages(ctx context.Context, messages []protocol.JobMe
 	return nil
 }
 
-func scheduleEntriesFrom(msgs []protocol.JobMessage, dels []kafkaclient.Delivery, runAt time.Time) []schedule.ScheduleEntry {
+func scheduleEntriesFrom(msgs []protocol.JobMessage, dels []kafkaclient.Delivery, runAt time.Time, batchID string) []schedule.ScheduleEntry {
 	out := make([]schedule.ScheduleEntry, len(msgs))
 	for i, msg := range msgs {
 		out[i] = schedule.ScheduleEntry{
-			JobID: msg.JobID, RunAt: runAt,
+			JobID: msg.JobID, RunAt: runAt, BatchID: batchID,
 			Partition: dels[i].Partition, Offset: dels[i].Offset,
 		}
 	}

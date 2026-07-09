@@ -22,11 +22,14 @@ type Client struct {
 	cfg      Config
 	manifest config.Manifest
 	store    *store.RedisStore
-	sched    *schedule.RedisStore
+	sched    scheduleIndex
+	mysqlSched *schedule.MysqlStore
+	redisSched *schedule.RedisStore
 	prod     *kafkaclient.Client
 	uniq     *uniq.Locker
 	rdb      *redis.Client
 	tenants  *fairness.TenantPartitions
+	workerByClass map[string]workerBinding
 }
 
 // New connects to Kafka and Redis and loads the handler manifest.
@@ -46,14 +49,26 @@ func New(cfg Config) (*Client, error) {
 		return nil, err
 	}
 	rdb := redis.NewClient(rOpts)
+	redisSched := schedule.NewRedisStore(rdb, 500)
+	schedIdx, mysqlSched, err := openScheduleIndex(cfg)
+	if err != nil {
+		_ = rdb.Close()
+		return nil, err
+	}
+	if schedIdx == nil {
+		schedIdx = redisScheduleIndex{inner: redisSched}
+	}
 	c := &Client{
 		cfg:      cfg,
 		manifest: manifest,
 		store:    store.NewRedisStore(rdb, cfg.BatchTTL),
-		sched:    schedule.NewRedisStore(rdb, 500),
+		sched:    schedIdx,
+		mysqlSched: mysqlSched,
+		redisSched: redisSched,
 		uniq:     uniq.NewLocker(rdb, cfg.UniqLockTTL),
 		rdb:      rdb,
 	}
+	c.buildWorkerIndex()
 	if err := c.validateManifest(); err != nil {
 		_ = rdb.Close()
 		return nil, err
@@ -100,6 +115,10 @@ func (c *Client) Close() {
 	if c.rdb != nil {
 		_ = c.rdb.Close()
 		c.rdb = nil
+	}
+	if c.mysqlSched != nil {
+		_ = c.mysqlSched.Close()
+		c.mysqlSched = nil
 	}
 }
 

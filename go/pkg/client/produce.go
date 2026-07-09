@@ -34,10 +34,9 @@ func (c *Client) writeScheduleIndex(ctx context.Context, entries []schedule.Sche
 	for attempt := 1; attempt <= retries; attempt++ {
 		var err error
 		if len(entries) == 1 {
-			e := entries[0]
-			err = c.sched.Schedule(ctx, e.JobID, e.RunAt, e.Partition, e.Offset)
+			err = c.sched.scheduleOne(ctx, entries[0])
 		} else {
-			err = c.sched.ScheduleMany(ctx, entries)
+			err = c.sched.scheduleMany(ctx, entries)
 		}
 		if err == nil {
 			return nil

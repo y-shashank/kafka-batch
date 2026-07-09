@@ -37,19 +37,58 @@ func (s *MysqlStore) Close() error {
 	return nil
 }
 
-func (s *MysqlStore) Schedule(ctx context.Context, jobID string, runAt time.Time, partition int32, offset int64) error {
+func (s *MysqlStore) Schedule(ctx context.Context, jobID string, runAt time.Time, partition int32, offset int64, batchID string) error {
+	var bid interface{}
+	if batchID != "" {
+		bid = batchID
+	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO kafka_batch_scheduled_jobs
   (job_id, run_at, partition_id, kafka_offset, batch_id, lease_until, created_at)
-VALUES (?, ?, ?, ?, NULL, NULL, ?)
+VALUES (?, ?, ?, ?, ?, NULL, ?)
 ON DUPLICATE KEY UPDATE
   run_at = VALUES(run_at),
   partition_id = VALUES(partition_id),
   kafka_offset = VALUES(kafka_offset),
+  batch_id = VALUES(batch_id),
   lease_until = NULL`,
-		jobID, runAt.UTC(), partition, offset, time.Now().UTC(),
+		jobID, runAt.UTC(), partition, offset, bid, time.Now().UTC(),
 	)
 	return err
+}
+
+// ScheduleMany bulk-inserts delayed-job rows (Ruby schedule_many).
+func (s *MysqlStore) ScheduleMany(ctx context.Context, entries []ScheduleEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UTC()
+	stmt := `
+INSERT INTO kafka_batch_scheduled_jobs
+  (job_id, run_at, partition_id, kafka_offset, batch_id, lease_until, created_at)
+VALUES (?, ?, ?, ?, ?, NULL, ?)
+ON DUPLICATE KEY UPDATE
+  run_at = VALUES(run_at),
+  partition_id = VALUES(partition_id),
+  kafka_offset = VALUES(kafka_offset),
+  batch_id = VALUES(batch_id),
+  lease_until = NULL`
+	for _, e := range entries {
+		var bid interface{}
+		if e.BatchID != "" {
+			bid = e.BatchID
+		}
+		if _, err := tx.ExecContext(ctx, stmt, e.JobID, e.RunAt.UTC(), e.Partition, e.Offset, bid, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *MysqlStore) ClaimDue(ctx context.Context, now time.Time, leaseSeconds, limit int) ([]string, error) {

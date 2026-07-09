@@ -33,6 +33,15 @@ func (e BatchExistsError) Error() string {
 	return fmt.Sprintf("batch %s already exists", e.BatchID)
 }
 
+// UnknownWorkerClassError is raised when a worker class is not in the manifest or Workers map.
+type UnknownWorkerClassError struct {
+	WorkerClass string
+}
+
+func (e UnknownWorkerClassError) Error() string {
+	return fmt.Sprintf("unknown worker class %q", e.WorkerClass)
+}
+
 // ErrJobSkipped indicates a uniq-skipped enqueue (empty job id, nil error).
 var ErrJobSkipped = errors.New("job skipped (uniq duplicate)")
 

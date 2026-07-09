@@ -35,6 +35,7 @@ type ScheduleEntry struct {
 	RunAt     time.Time
 	Partition int32
 	Offset    int64
+	BatchID   string // optional; used by MySQL index
 }
 
 // ScheduleMany bulk-writes schedule index members (Ruby schedule_many).

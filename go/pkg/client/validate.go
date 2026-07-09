@@ -10,7 +10,7 @@ import (
 )
 
 func (c *Client) validateManifest() error {
-	if len(c.manifest.Handlers) == 0 && c.cfg.ManifestPath != "" {
+	if len(c.manifest.Handlers) == 0 && len(c.cfg.Workers) == 0 && c.cfg.ManifestPath != "" {
 		return ConfigurationError{Message: "handler manifest has no handlers"}
 	}
 	defaultTopic := c.cfg.defaultJobsTopic()

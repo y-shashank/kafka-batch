@@ -30,12 +30,31 @@ type Config struct {
 	ProduceChunkSize          int
 	AllIndexMaxSize           int
 
+	// ScheduleStore is "redis" (default) or "mysql".
+	ScheduleStore    string
+	ScheduleMySQLDSN string
+
 	FairnessTimeIngest       string
 	FairnessThroughputIngest string
 	// Static tenant_id → ingest partition (Ruby fairness_tenant_partitions).
 	FairnessTenantPartitions map[string]int32
 	FairnessDynamicTenantPartitions bool
 	FairnessTenantPartitionCacheTTL time.Duration
+
+	// Workers maps Ruby worker class names to routing when not found via manifest worker_class.
+	Workers map[string]WorkerClassConfig
+}
+
+// WorkerClassConfig describes a Ruby Worker#perform handler for produce routing.
+type WorkerClassConfig struct {
+	JobType              string
+	Topic                string
+	ApplyTopicPrefix     bool
+	MaxRetries           int
+	CompleteAfterRetries int
+	RetryTier            string
+	FairnessType         string
+	Uniq                 bool
 }
 
 // DefaultConfig returns sensible local defaults.
