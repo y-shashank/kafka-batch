@@ -139,7 +139,7 @@ module KafkaBatch
 
           payload = mark_slot!(job[:payload], job[:tenant_id], job[:slot_id])
           KafkaBatch::Producer.produce_sync(
-            topic:   KafkaBatch.config.fairness_ready_topic(@type),
+            topic:   ready_topic_for(data),
             payload: payload,
             key:     job_key(payload)
           )
@@ -152,6 +152,16 @@ module KafkaBatch
       end
 
       private
+
+      def ready_topic_for(data)
+        cfg = KafkaBatch.config
+        if cfg.runtime_split_fair_ready?(@type)
+          runtime = KafkaBatch::HandlerRegistry.runtime_for_payload(data)
+          cfg.fairness_ready_topic(@type, runtime)
+        else
+          cfg.fairness_ready_topic(@type)
+        end
+      end
 
       # Run a full lease-reclaim sweep at most once per RECLAIM_INTERVAL, so leases
       # leaked by a now-idle tenant don't linger in the global in-flight total.
@@ -181,9 +191,10 @@ module KafkaBatch
       end
 
       def reclaim_stale_forward!(sched, entry)
+        data = Oj.load(entry[:payload])
         payload = mark_slot!(entry[:payload], entry[:tenant_id], entry[:slot_id])
         KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.fairness_ready_topic(@type),
+          topic:   ready_topic_for(data),
           payload: payload,
           key:     job_key(payload)
         )

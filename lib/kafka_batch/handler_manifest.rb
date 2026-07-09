@@ -3,7 +3,8 @@
 require "yaml"
 
 module KafkaBatch
-  # Loads handler definitions from YAML and registers Go handlers in HandlerRegistry.
+  # Loads handler definitions from YAML and registers them in HandlerRegistry
+  # (routing for ruby and go runtimes; go execution is in kafka-batch-go).
   #
   # Example config/kafka_batch_handlers.yml:
   #

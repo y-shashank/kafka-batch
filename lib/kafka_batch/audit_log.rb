@@ -61,6 +61,27 @@ module KafkaBatch
         KafkaBatch.config.audit_enabled
       end
 
+      # Public helper for instrumentation and tests.
+      def action_name_for(path)
+        web_action_name(path)
+      end
+
+      def resolve_actor(env)
+        custom = KafkaBatch.config.audit_actor
+        case custom
+        when Proc
+          custom.call(env)
+        when String
+          custom
+        else
+          first_present(
+            env["HTTP_X_KAFKA_BATCH_ACTOR"],
+            env["HTTP_X_FORWARDED_USER"],
+            env["REMOTE_USER"]
+          )
+        end
+      end
+
       # Newest-first page of audit rows for the dashboard. Fetches +limit + 1+ so
       # the caller can tell whether a next page exists. Each row is a plain Hash
       # with a parsed +metadata+. Returns [] when auditing is off or the table is
@@ -109,22 +130,6 @@ module KafkaBatch
 
       def connection_config
         KafkaBatch.config.audit_database_connection
-      end
-
-      def resolve_actor(env)
-        custom = KafkaBatch.config.audit_actor
-        case custom
-        when Proc
-          custom.call(env)
-        when String
-          custom
-        else
-          first_present(
-            env["HTTP_X_KAFKA_BATCH_ACTOR"],
-            env["HTTP_X_FORWARDED_USER"],
-            env["REMOTE_USER"]
-          )
-        end
       end
 
       def first_present(*values)

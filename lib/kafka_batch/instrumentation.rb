@@ -274,6 +274,17 @@ module KafkaBatch
         })
       end
 
+      # Fired when KafkaBatch::Web handles a mutating POST (mirrors audit log action).
+      def web_action(action:, path:, status:, actor: nil, error: nil)
+        instrument("web.action", {
+          action: action.to_s,
+          path:   path.to_s,
+          status: status.to_s,
+          actor:  actor,
+          error:  error
+        }.compact)
+      end
+
       private
 
       def instrument(event, payload = {})

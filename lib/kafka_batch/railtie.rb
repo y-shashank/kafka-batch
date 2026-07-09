@@ -87,11 +87,6 @@ module KafkaBatch
           KafkaBatch::Reconciler.run
         end
 
-        desc "Run the Ruby worker server (Phase 4). Env: KAFKA_BATCH_WORKER_SOCKET=/path/to.sock"
-        task worker_server: :environment do
-          KafkaBatch::WorkerServer.run!
-        end
-
         desc "Create all KafkaBatch Kafka topics (idempotent). " \
              "Env: PARTITIONS=N forces every topic to N partitions; " \
              "REPLICATION_FACTOR=N (default config.topics_replication_factor, currently 3); " \

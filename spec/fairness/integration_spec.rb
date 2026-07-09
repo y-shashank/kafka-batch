@@ -21,8 +21,12 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
 
     KafkaBatch.config.fair_time_ingest_topic           = "test.time.ingest"
     KafkaBatch.config.fair_time_ready_topic            = "test.time.ready"
+    KafkaBatch.config.fair_time_ready_go_topic         = ""
+    KafkaBatch.config.fair_time_ready_ruby_topic       = ""
     KafkaBatch.config.fair_throughput_ingest_topic     = "test.tp.ingest"
     KafkaBatch.config.fair_throughput_ready_topic      = "test.tp.ready"
+    KafkaBatch.config.fair_throughput_ready_go_topic   = ""
+    KafkaBatch.config.fair_throughput_ready_ruby_topic = ""
     KafkaBatch.config.fairness_global_concurrency      = 4
     KafkaBatch.config.fairness_max_inflight_per_tenant = 0    # rely on the dynamic fair share
     KafkaBatch.config.fairness_ready_window            = 100

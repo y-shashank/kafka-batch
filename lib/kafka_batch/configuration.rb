@@ -38,9 +38,13 @@ module KafkaBatch
       # (:time | :throughput). Each lane has its own ingest → ready topics,
       # scheduler, and tenant weights, so both run side by side.
       fair_time_ingest_topic:       "kafka_batch.fair_time_ingest",       # time-fairness intake
-      fair_time_ready_topic:        "kafka_batch.fair_time_ready",        # time-fairness execution queue
+      fair_time_ready_topic:        "kafka_batch.fair_time_ready",        # legacy single ready (pre-v1.1)
+      fair_time_ready_go_topic:     "kafka_batch.fair_time_ready.go",     # time-fairness go execution queue
+      fair_time_ready_ruby_topic:   "kafka_batch.fair_time_ready.ruby",   # time-fairness ruby execution queue
       fair_throughput_ingest_topic: "kafka_batch.fair_throughput_ingest", # throughput-fairness intake
-      fair_throughput_ready_topic:  "kafka_batch.fair_throughput_ready"  # throughput-fairness execution queue
+      fair_throughput_ready_topic:  "kafka_batch.fair_throughput_ready",  # legacy single ready (pre-v1.1)
+      fair_throughput_ready_go_topic:   "kafka_batch.fair_throughput_ready.go",
+      fair_throughput_ready_ruby_topic: "kafka_batch.fair_throughput_ready.ruby"
     }.freeze
 
     PREFIXED_SETTINGS.each do |name, base|
@@ -261,8 +265,33 @@ module KafkaBatch
       type.to_sym == :throughput ? fair_throughput_ingest_topic : fair_time_ingest_topic
     end
 
-    def fairness_ready_topic(type)
-      type.to_sym == :throughput ? fair_throughput_ready_topic : fair_time_ready_topic
+    def fairness_ready_topic(type, runtime = nil)
+      ft = type.to_sym == :throughput ? :throughput : :time
+      if runtime
+        rt = runtime.to_sym
+        case ft
+        when :throughput
+          rt == :go ? fair_throughput_ready_go_topic : fair_throughput_ready_ruby_topic
+        else
+          rt == :go ? fair_time_ready_go_topic : fair_time_ready_ruby_topic
+        end
+      else
+        ft == :throughput ? fair_throughput_ready_topic : fair_time_ready_topic
+      end
+    end
+
+    # True when per-runtime ready topics (.go / .ruby) are configured for a lane.
+    # Mirrors Go config.RuntimeSplitFairReady.
+    def runtime_split_fair_ready?(type = :time)
+      ft = type.to_sym == :throughput ? :throughput : :time
+      go_topic, ruby_topic =
+        case ft
+        when :throughput
+          [fair_throughput_ready_go_topic.to_s, fair_throughput_ready_ruby_topic.to_s]
+        else
+          [fair_time_ready_go_topic.to_s, fair_time_ready_ruby_topic.to_s]
+        end
+      !go_topic.empty? && !ruby_topic.empty?
     end
 
     # Global in-flight window: max jobs forwarded to the ready topic but not yet
@@ -410,23 +439,15 @@ module KafkaBatch
     attr_accessor :metrics_proc      # alias hook for :proc adapter
     attr_accessor :metrics_prefix    # metric name prefix; default "kafka_batch"
 
-    # ── Go execution sidecar (Phase 2) ─────────────────────────────────────────
-    # Unix socket path for `kbatch serve`. Required when any handler uses
-    # executor :go or a manifest entry with runtime: go.
-    attr_accessor :go_executor_socket          # String – e.g. /var/run/kbatch.sock
-    attr_accessor :go_executor_timeout         # Float – read timeout seconds; default 300
-    attr_accessor :go_executor_open_timeout    # Float – connect timeout seconds; default 1
-    # Optional YAML listing Go-only handlers (runtime/topic/retries). Loaded at boot
+    # ── Handler manifest (Go + Ruby routing) ─────────────────────────────────
+    # Optional YAML listing handlers (runtime/topic/retries). Loaded at boot
     # when set. Also via ENV KAFKA_BATCH_HANDLER_MANIFEST.
     attr_accessor :handler_manifest_path
 
-    # ── Go daemon mode (Phase 4) ─────────────────────────────────────────────
-    # When true, Karafka job/control consumers are skipped — kbatch daemon owns
-    # consumption. API pods set this; worker pods run WorkerServer instead.
+    # ── Daemon mode ────────────────────────────────────────────────────────────
+    # When true, Karafka consumers are skipped in this process — run a dedicated
+    # control plane (kbatch daemon or Karafka control pods) and separate execution.
     attr_accessor :daemon_mode                 # Boolean – default false
-    # Unix socket for Ruby Worker#perform when daemon dispatches runtime:ruby jobs.
-    attr_accessor :ruby_worker_socket           # String – e.g. /var/run/kbatch-ruby.sock
-    attr_accessor :ruby_worker_timeout         # Float – default 300
 
     # ── Passthrough rdkafka config ───────────────────────────────────────────
     attr_accessor :producer_config  # Hash – merged on top of producer defaults
@@ -533,12 +554,7 @@ module KafkaBatch
       @validate_topics_on_boot  = false
       @extra_job_topics         = []
       @web_authenticator        = nil
-      @go_executor_socket       = ENV["KAFKA_BATCH_GO_SOCKET"].to_s.strip
-      @go_executor_timeout      = 300.0
-      @go_executor_open_timeout = 1.0
       @daemon_mode              = truthy_env?("KAFKA_BATCH_DAEMON_MODE")
-      @ruby_worker_socket       = ENV["KAFKA_BATCH_WORKER_SOCKET"].to_s.strip
-      @ruby_worker_timeout      = 300.0
       @handler_manifest_path    = ENV["KAFKA_BATCH_HANDLER_MANIFEST"].to_s.strip
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end

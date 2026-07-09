@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module KafkaBatch
-# Maps stable job_type identifiers to execution handlers (:ruby in-process, :go sidecar).
+# Maps stable job_type identifiers to execution handlers (:ruby in-process via Karafka).
   class HandlerRegistry
     class UnknownHandler < Error; end
 
@@ -23,22 +23,14 @@ module KafkaBatch
 
         runtime = worker_class.executor
         if runtime == :go
-          return register_go(worker_class)
+          raise ArgumentError,
+                "executor :go is removed — declare runtime: go in the handler manifest and run kbatch worker"
         end
         unless runtime == :ruby
           raise ArgumentError, "unsupported executor #{runtime.inspect} for #{worker_class}"
         end
 
         register_definition(HandlerDefinition.from_worker(worker_class))
-      end
-
-      def register_go(worker_class = nil, definition: nil)
-        definition ||= HandlerDefinition.from_worker(worker_class)
-        unless definition.runtime == :go
-          raise ArgumentError, "register_go requires runtime :go (got #{definition.runtime.inspect})"
-        end
-
-        register_definition(definition, executor: Executors::Go.new)
       end
 
       def register_definition(definition, executor: nil)
@@ -52,7 +44,7 @@ module KafkaBatch
             raise ArgumentError, "ruby handler missing worker_class for #{job_type}" unless worker_class
             executor || Executors::Ruby.new(worker_class)
           when :go
-            executor || Executors::Go.new
+            nil
           else
             raise ArgumentError, "unsupported runtime #{runtime.inspect} for #{job_type}"
           end
@@ -121,6 +113,26 @@ module KafkaBatch
       def lookup_by_job_type(job_type)
         @mutex.synchronize { @by_job_type[job_type.to_s] }
       end
+
+      # Resolve handler runtime from a job payload (for fair forwarder routing).
+      # Defaults to :ruby when unknown (Ruby-only stacks).
+      def runtime_for_payload(data)
+        data = data.transform_keys(&:to_s) if data.respond_to?(:transform_keys)
+        job_type = data["job_type"]
+        if job_type && !job_type.to_s.empty?
+          handler = lookup_by_job_type(job_type)
+          return handler.runtime if handler
+        end
+
+        worker_name = data["worker_class"]
+        if worker_name && !worker_name.to_s.empty?
+          handler = @mutex.synchronize { @by_worker_class[worker_name.to_s] }
+          return handler.runtime if handler
+        end
+
+        :ruby
+      end
+
       private :lookup_by_job_type
 
       def resolve_by_worker_class!(worker_name)

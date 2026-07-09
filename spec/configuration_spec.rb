@@ -90,6 +90,8 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.fairness_weighted_concurrency).to eq(true)
       expect(config.fairness_ingest_topic(:time)).to eq("kafka_batch.fair_time_ingest")
       expect(config.fairness_ready_topic(:time)).to eq("kafka_batch.fair_time_ready")
+      expect(config.fairness_ready_topic(:time, :go)).to eq("kafka_batch.fair_time_ready.go")
+      expect(config.fairness_ready_topic(:time, :ruby)).to eq("kafka_batch.fair_time_ready.ruby")
       expect(config.fairness_ingest_topic(:throughput)).to eq("kafka_batch.fair_throughput_ingest")
       expect(config.fairness_ready_topic(:throughput)).to eq("kafka_batch.fair_throughput_ready")
       expect(config.fairness_min_ingest_partitions).to eq(2)

@@ -3,6 +3,8 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
 
   before do
     KafkaBatch.config.fair_time_ready_topic = "test.ready"
+    KafkaBatch.config.fair_time_ready_go_topic = ""
+    KafkaBatch.config.fair_time_ready_ruby_topic = ""
     allow(KafkaBatch).to receive(:scheduler).and_return(scheduler)
     allow(scheduler).to receive(:confirm_forward)
   end
@@ -11,6 +13,19 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
 
   describe "#forward_once" do
     subject(:forwarder) { described_class.new }
+
+    it "routes go handlers to the .go ready topic when runtime split is enabled" do
+      KafkaBatch.config.fair_time_ready_go_topic = "test.ready.go"
+      KafkaBatch.config.fair_time_ready_ruby_topic = "test.ready.ruby"
+      raw = Oj.dump({ "job_id" => "j-go", "job_type" => "segment.export", "tenant_id" => "acme", "payload" => {} }, mode: :compat)
+      definition = KafkaBatch::HandlerDefinition.new(job_type: "segment.export", runtime: :go, topic: "segment.exports")
+      KafkaBatch::HandlerRegistry.register_definition(definition)
+      allow(scheduler).to receive(:checkout).and_return({ tenant_id: "acme", payload: raw, slot_id: "slot-go" })
+
+      expect(forwarder.forward_once).to be(true)
+      expect(FakeProducer.for_topic("test.ready.go").size).to eq(1)
+      expect(FakeProducer.for_topic("test.ready.ruby")).to be_empty
+    end
 
     it "checks out a fair job and forwards it to the ready topic with the fair-slot marker" do
       raw = Oj.dump({ "job_id" => "j1", "tenant_id" => "acme", "payload" => {} }, mode: :compat)

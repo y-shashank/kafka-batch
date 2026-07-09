@@ -321,8 +321,6 @@ module KafkaBatch
     end
 
     def audit_web_action!(env, path, params, response, error: nil)
-      return unless defined?(KafkaBatch::AuditLog) && KafkaBatch::AuditLog.enabled?
-
       status =
         if error
           "error"
@@ -331,6 +329,17 @@ module KafkaBatch
         else
           "ok"
         end
+
+      action = KafkaBatch::AuditLog.action_name_for(path)
+      KafkaBatch::Instrumentation.web_action(
+        action: action,
+        path:   path,
+        status: status,
+        actor:  KafkaBatch::AuditLog.resolve_actor(env),
+        error:  error
+      )
+
+      return unless defined?(KafkaBatch::AuditLog) && KafkaBatch::AuditLog.enabled?
 
       KafkaBatch::AuditLog.record_web_action(
         env:    env,

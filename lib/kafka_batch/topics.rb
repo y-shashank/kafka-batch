@@ -100,6 +100,8 @@ module KafkaBatch
       lane_types.each do |ft|
         add.call(cfg.fairness_ingest_topic(ft), :ingest)
         add.call(cfg.fairness_ready_topic(ft), :ready)
+        add.call(cfg.fairness_ready_topic(ft, :go), :ready)
+        add.call(cfg.fairness_ready_topic(ft, :ruby), :ready)
       end
 
       # Plain workers are produced to their own topic (see Batch#produce_job).

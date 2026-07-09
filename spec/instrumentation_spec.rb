@@ -35,5 +35,8 @@ RSpec.describe KafkaBatch::Instrumentation do
     }.not_to raise_error
     expect { described_class.reconciler_ran(stale_count: 0, lost_count: 0, duration: 0.1) }.not_to raise_error
     expect { described_class.scheduled_index_failed(count: 2, batch_id: "b", attempts: 3, error: error) }.not_to raise_error
+    expect {
+      described_class.web_action(action: "batches.cancel", path: "/batches/a/cancel", status: "ok", actor: "ops")
+    }.not_to raise_error
   end
 end

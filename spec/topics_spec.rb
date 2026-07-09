@@ -43,7 +43,12 @@ RSpec.describe KafkaBatch::Topics do
       allow(KafkaBatch).to receive(:workers).and_return([FairWorker, SuccessfulWorker])
       names = described_class.specs.map { |s| s[:name] }
 
-      expect(names).to include(KafkaBatch.config.fairness_ingest_topic(:time), KafkaBatch.config.fairness_ready_topic(:time))
+      expect(names).to include(
+        KafkaBatch.config.fairness_ingest_topic(:time),
+        KafkaBatch.config.fairness_ready_topic(:time),
+        KafkaBatch.config.fairness_ready_topic(:time, :go),
+        KafkaBatch.config.fairness_ready_topic(:time, :ruby)
+      )
       # Only the time lane is used, so throughput-lane topics are NOT provisioned.
       expect(names).not_to include(KafkaBatch.config.fairness_ingest_topic(:throughput))
       expect(names).to include(SuccessfulWorker.kafka_topic)  # plain worker still wired
@@ -54,7 +59,12 @@ RSpec.describe KafkaBatch::Topics do
       allow(KafkaBatch).to receive(:workers).and_return([ThroughputFairWorker])
       names = described_class.specs.map { |s| s[:name] }
 
-      expect(names).to include(KafkaBatch.config.fairness_ingest_topic(:throughput), KafkaBatch.config.fairness_ready_topic(:throughput))
+      expect(names).to include(
+        KafkaBatch.config.fairness_ingest_topic(:throughput),
+        KafkaBatch.config.fairness_ready_topic(:throughput),
+        KafkaBatch.config.fairness_ready_topic(:throughput, :go),
+        KafkaBatch.config.fairness_ready_topic(:throughput, :ruby)
+      )
       expect(names).not_to include(KafkaBatch.config.fairness_ingest_topic(:time))
     end
 

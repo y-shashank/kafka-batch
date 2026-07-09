@@ -168,9 +168,17 @@ module KafkaBatch
       # Fair lanes — each lane has its OWN dispatch / jobs-fair groups.
       KafkaBatch::Configuration::FAIRNESS_TYPES.each do |t|
         ingest = cfg.fairness_ingest_topic(t)
-        ready  = cfg.fairness_ready_topic(t)
-        groups["#{prefix}-dispatch-#{t}"]  = [ingest] if ingest && !ingest.to_s.empty?
-        groups["#{prefix}-jobs-fair-#{t}"] = [ready]  if ready  && !ready.to_s.empty?
+        groups["#{prefix}-dispatch-#{t}"] = [ingest] if ingest && !ingest.to_s.empty?
+        if cfg.runtime_split_fair_ready?(t)
+          ruby_ready = cfg.fairness_ready_topic(t, :ruby)
+          go_ready   = cfg.fairness_ready_topic(t, :go)
+          groups["#{prefix}-jobs-fair-#{t}"] = [ruby_ready] if ruby_ready && !ruby_ready.to_s.empty?
+          go_group = "#{prefix}-go-worker-fair-ready-#{t}"
+          groups[go_group] = [go_ready] if go_ready && !go_ready.to_s.empty?
+        else
+          ready = cfg.fairness_ready_topic(t)
+          groups["#{prefix}-jobs-fair-#{t}"] = [ready] if ready && !ready.to_s.empty?
+        end
       end
 
       # Plain jobs group — the default topic PLUS any custom plain-worker topics.
