@@ -39,6 +39,23 @@ RSpec.describe KafkaBatch::Uniqueness do
       expect(described_class.claim(UniqWorker, { "id" => 2 }, job_id: "job-c")).to eq(true)
     end
 
+    it "claim_many pipelines many SET NX in one round-trip" do
+      items = [
+        { payload: { "id" => 1 }, job_id: "job-a" },
+        { payload: { "id" => 1 }, job_id: "job-b" },
+        { payload: { "id" => 2 }, job_id: "job-c" }
+      ]
+      expect(described_class.claim_many(UniqWorker, items)).to eq([true, false, true])
+    end
+
+    it "claim_many returns all true for non-uniq workers" do
+      items = [
+        { payload: { "id" => 1 }, job_id: "j1" },
+        { payload: { "id" => 1 }, job_id: "j2" }
+      ]
+      expect(described_class.claim_many(SuccessfulWorker, items)).to eq([true, true])
+    end
+
     it "no-ops for workers without uniq true" do
       expect(described_class.claim(SuccessfulWorker, { "id" => 1 }, job_id: "j1")).to eq(true)
       expect(described_class.claim(SuccessfulWorker, { "id" => 1 }, job_id: "j2")).to eq(true)

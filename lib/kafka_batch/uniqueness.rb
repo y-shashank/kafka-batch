@@ -38,6 +38,24 @@ module KafkaBatch
         !!result
       end
 
+      # Bulk claim for push_many / enqueue_many_at: one Redis round-trip per chunk
+      # instead of one SET NX per payload. +items+ is an Array of
+      # { payload:, job_id: } hashes; returns a parallel Array of booleans (true =
+      # acquired). Order is preserved so within-batch duplicate payloads dedupe like
+      # sequential claims (first wins).
+      #
+      # @param items [Array<Hash>] each element has :payload and :job_id
+      # @return [Array<Boolean>]
+      def claim_many(worker_class, items)
+        return [] if items.empty?
+        return items.map { true } unless applies_to?(worker_class)
+
+        chunk = claim_many_chunk_size
+        items.each_slice(chunk).flat_map do |slice|
+          claim_many_slice(worker_class, slice)
+        end
+      end
+
       # Release the lock for a completed / dropped job. No-op when the worker is
       # not uniq-enabled or the key is owned by another job_id.
       def release(worker_class, payload, job_id:)
@@ -190,6 +208,29 @@ module KafkaBatch
         else
           obj
         end
+      end
+
+      def claim_many_slice(worker_class, items)
+        results = redis_with do |r|
+          r.pipelined do |pipe|
+            items.each do |item|
+              pipe.set(
+                redis_key(worker_class, item[:payload]),
+                item[:job_id].to_s,
+                nx: true,
+                ex: ttl
+              )
+            end
+          end
+        end
+        return items.map { true } if results.nil? # Redis unavailable — fail open
+
+        results.map { |result| !!result }
+      end
+
+      def claim_many_chunk_size
+        size = KafkaBatch.config.push_many_chunk_size.to_i
+        size.positive? ? size : 500
       end
 
       def safe_release(key, job_id)

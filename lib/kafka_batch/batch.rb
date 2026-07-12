@@ -190,16 +190,12 @@ module KafkaBatch
 
       tid     = tenant_id || @tenant_id
       entries = []
-      job_ids = []
+      job_ids = self.class.bulk_uniq_job_ids(worker_class, payloads, batch_id: @id)
 
-      payloads.each do |payload|
-        job_id = SecureRandom.uuid
-        if self.class.uniq_duplicate?(worker_class, payload, job_id: job_id, batch_id: @id)
-          job_ids << nil
-          next
-        end
+      payloads.zip(job_ids).each do |payload, job_id|
+        next if job_id.nil?
+
         entries << [payload, job_id]
-        job_ids << job_id
       end
       return job_ids if entries.empty?
 
@@ -278,20 +274,16 @@ module KafkaBatch
       tid      = tenant_id || @tenant_id
       run_at   = self.class.clamp_run_at(self.class.to_time(time))
       entries  = []
-      job_ids  = []
+      job_ids  = self.class.bulk_uniq_job_ids(worker_class, payloads, batch_id: @id)
 
-      payloads.each do |payload|
-        job_id = SecureRandom.uuid
-        if self.class.uniq_duplicate?(worker_class, payload, job_id: job_id, batch_id: @id)
-          job_ids << nil
-          next
-        end
+      payloads.zip(job_ids).each do |payload, job_id|
+        next if job_id.nil?
+
         entries << self.class.build_message(
           worker_class: worker_class, payload: payload,
           job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tid,
           batch_seq: nil, valid_till: valid_till
         )
-        job_ids << job_id
       end
       return job_ids if entries.empty?
 
@@ -435,20 +427,16 @@ module KafkaBatch
 
       run_at   = clamp_run_at(to_time(time))
       messages = []
-      job_ids  = []
+      job_ids  = bulk_uniq_job_ids(worker_class, payloads)
 
-      payloads.each do |payload|
-        job_id = SecureRandom.uuid
-        if uniq_duplicate?(worker_class, payload, job_id: job_id)
-          job_ids << nil
-          next
-        end
+      payloads.zip(job_ids).each do |payload, job_id|
+        next if job_id.nil?
+
         messages << build_message(
           worker_class: worker_class, payload: payload,
           job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id,
           valid_till: valid_till
         )
-        job_ids << job_id
       end
       return job_ids if messages.empty?
 
@@ -773,6 +761,35 @@ module KafkaBatch
           raise DuplicateJobError.new(worker_class: worker_class, payload: payload)
         else
           true
+        end
+      end
+    end
+
+    # Bulk uniq for push_many / push_many_at / enqueue_many_at. Returns job ids in
+    # payload order; nil marks a skipped duplicate (config.uniq_on_duplicate :skip).
+    # Uses pipelined Redis SET NX (see Uniqueness.claim_many).
+    def self.bulk_uniq_job_ids(worker_class, payloads, batch_id: nil)
+      unless worker_class.uniq? && KafkaBatch.config.uniq_enabled
+        return payloads.map { SecureRandom.uuid }
+      end
+
+      items = payloads.map { |payload| { payload: payload, job_id: SecureRandom.uuid } }
+      claims = KafkaBatch::Uniqueness.claim_many(worker_class, items)
+
+      items.each_with_index.map do |item, i|
+        if claims[i]
+          item[:job_id]
+        else
+          KafkaBatch::Instrumentation.job_uniq_skipped(
+            worker_class: worker_class, payload: item[:payload],
+            job_id: item[:job_id], batch_id: batch_id
+          )
+          case KafkaBatch.config.uniq_on_duplicate
+          when :raise
+            raise DuplicateJobError.new(worker_class: worker_class, payload: item[:payload])
+          else
+            nil
+          end
         end
       end
     end
