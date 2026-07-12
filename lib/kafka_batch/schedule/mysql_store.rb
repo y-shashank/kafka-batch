@@ -5,6 +5,13 @@ require_relative "../database_connection"
 
 module KafkaBatch
   module Schedule
+    # Named AR model — AR 8.1+ rejects anonymous classes in establish_connection.
+    class ScheduledJobRecord < ActiveRecord::Base
+      self.table_name         = "kafka_batch_scheduled_jobs"
+      self.primary_key        = "job_id"
+      self.inheritance_column = nil
+    end
+
     # MySQL backend for the delayed-job index (config.schedule_store = :mysql),
     # detached from the batch ledger. Table kafka_batch_scheduled_jobs:
     #
@@ -151,17 +158,9 @@ module KafkaBatch
 
       def model
         @model ||= DatabaseConnection.bind(
-          schedule_model_class,
+          ScheduledJobRecord,
           connection: KafkaBatch.config.schedule_store_database_connection
         )
-      end
-
-      def schedule_model_class
-        klass = Class.new(ActiveRecord::Base)
-        klass.table_name         = "kafka_batch_scheduled_jobs"
-        klass.primary_key        = "job_id"
-        klass.inheritance_column = nil
-        klass
       end
     end
   end
