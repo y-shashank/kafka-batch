@@ -216,12 +216,16 @@ RSpec.describe KafkaBatch::Web do
       allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
       ingest_group = KafkaBatch.dispatch_consumer_group(:time)
       fair_group   = KafkaBatch.jobs_fair_consumer_group(:time)
-      ingest_t = KafkaBatch.config.fairness_ingest_topic(:time)
-      ready_t  = KafkaBatch.config.fairness_ready_topic(:time)
+      go_group     = KafkaBatch.go_worker_fair_ready_consumer_group(:time)
+      ingest_t     = KafkaBatch.config.fairness_ingest_topic(:time)
+      ruby_ready   = KafkaBatch.config.fairness_ready_topic(:time, :ruby)
+      go_ready     = KafkaBatch.config.fairness_ready_topic(:time, :go)
       allow(KafkaBatch::Lag).to receive(:read_group).with(ingest_group, [ingest_t])
         .and_return(ingest_group => { ingest_t => { 0 => { offset: 0, lag: 3 } } })
-      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [ready_t])
-        .and_return(fair_group => { ready_t => { 0 => { offset: 0, lag: 0 } } })
+      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [ruby_ready])
+        .and_return(fair_group => { ruby_ready => { 0 => { offset: 0, lag: 0 } } })
+      allow(KafkaBatch::Lag).to receive(:read_group).with(go_group, [go_ready])
+        .and_return(go_group => { go_ready => {} })
 
       html = get("/fairness/time").last.join
       expect(html).to include("No registered workers use the")
@@ -234,19 +238,43 @@ RSpec.describe KafkaBatch::Web do
       allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
       ingest_group = KafkaBatch.dispatch_consumer_group(:time)
       fair_group   = KafkaBatch.jobs_fair_consumer_group(:time)
-      ingest_t = KafkaBatch.config.fairness_ingest_topic(:time)
-      ready_t  = KafkaBatch.config.fairness_ready_topic(:time)
+      go_group     = KafkaBatch.go_worker_fair_ready_consumer_group(:time)
+      ingest_t     = KafkaBatch.config.fairness_ingest_topic(:time)
+      ruby_ready   = KafkaBatch.config.fairness_ready_topic(:time, :ruby)
+      go_ready     = KafkaBatch.config.fairness_ready_topic(:time, :go)
       allow(KafkaBatch::Lag).to receive(:read_group).with(ingest_group, [ingest_t])
         .and_return(ingest_group => { ingest_t => { 8 => { offset: 0, lag: 40 }, 9 => { offset: 0, lag: 25 } } })
-      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [ready_t])
-        .and_return(fair_group => { ready_t => { 0 => { offset: 0, lag: 12 } } })
+      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [ruby_ready])
+        .and_return(fair_group => { ruby_ready => { 0 => { offset: 0, lag: 12 } } })
+      allow(KafkaBatch::Lag).to receive(:read_group).with(go_group, [go_ready])
+        .and_return(go_group => { go_ready => { 1 => { offset: 0, lag: 5 } } })
 
       html = get("/fairness/time").last.join
       expect(html).to include("Active lanes")
       expect(html).to include(">2<")    # 2 active lanes
       expect(html).to include(">65<")   # un-dispatched total 40+25
-      expect(html).to include(">12<")   # ready buffer total
+      expect(html).to include(">17<")   # ready buffer total 12+5 across split topics
+      expect(html).to include("fair_time_ready.ruby")
+      expect(html).to include("fair_time_ready.go")
       expect(html).to include("Flowing")
+    end
+
+    it "reads the legacy single ready topic when split topics are not configured" do
+      allow(KafkaBatch).to receive(:active_fairness_types).and_return([:time])
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      allow(KafkaBatch.config).to receive(:runtime_split_fair_ready?).with(:time).and_return(false)
+      ingest_group = KafkaBatch.dispatch_consumer_group(:time)
+      fair_group   = KafkaBatch.jobs_fair_consumer_group(:time)
+      ingest_t     = KafkaBatch.config.fairness_ingest_topic(:time)
+      legacy_ready = KafkaBatch.config.fairness_ready_topic(:time)
+      allow(KafkaBatch::Lag).to receive(:read_group).with(ingest_group, [ingest_t])
+        .and_return(ingest_group => { ingest_t => {} })
+      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [legacy_ready])
+        .and_return(fair_group => { legacy_ready => { 2 => { offset: 0, lag: 7 } } })
+
+      html = get("/fairness/time").last.join
+      expect(html).to include(">7<")
+      expect(html).not_to include("fair_time_ready.ruby")
     end
 
     it "links to the fairness pages from the dashboard nav" do

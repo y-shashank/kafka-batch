@@ -982,20 +982,24 @@ module KafkaBatch
       groups  = rows.map { |r| r[:group] }.uniq.size
 
       topic_rows = topics.map do |t|
-        ctrl = lag_topic_control(t[:group], t[:topic], paused, tenant_q)
-        status = lag_topic_status(t[:group], t[:topic], paused)
+        archive = schedule_log_group?(t[:group])
+        ctrl = archive ? schedule_log_control : lag_topic_control(t[:group], t[:topic], paused, tenant_q)
+        status = archive ? schedule_log_status : lag_topic_status(t[:group], t[:topic], paused)
+        lag_cell = archive ? schedule_log_lag_badge(t[:lag]) : lag_badge(t[:lag])
         "<tr><td class='mono'>#{h(t[:group])}</td><td class='mono'>#{h(t[:topic])}</td>" \
-        "<td>#{t[:partitions]}</td><td>#{lag_badge(t[:lag])}</td><td>#{status}</td><td>#{ctrl}</td></tr>"
+        "<td>#{t[:partitions]}</td><td>#{lag_cell}</td><td>#{status}</td><td>#{ctrl}</td></tr>"
       end.join
       topic_rows = "<tr><td colspan='6' class='empty'>No consumed topics found.</td></tr>" if topics.empty?
 
       part_rows = rows.map do |r|
+        archive   = r[:log_archive]
         committed = r[:never_consumed] ? "<span class='muted'>never consumed</span>" : r[:committed]
         endoff    = r[:end_offset].nil? ? "<span class='muted'>—</span>" : r[:end_offset]
-        ctrl      = lag_partition_control(r[:group], r[:topic], r[:partition], paused, tenant_q)
-        status    = lag_partition_status(r[:group], r[:topic], r[:partition], paused)
+        ctrl      = archive ? schedule_log_control : lag_partition_control(r[:group], r[:topic], r[:partition], paused, tenant_q)
+        status    = archive ? schedule_log_status : lag_partition_status(r[:group], r[:topic], r[:partition], paused)
+        lag_cell  = archive ? schedule_log_lag_badge(r[:lag]) : lag_badge(r[:lag])
         "<tr><td class='mono'>#{h(r[:group])}</td><td class='mono'>#{h(r[:topic])}</td>" \
-        "<td>#{r[:partition]}</td><td>#{committed}</td><td>#{endoff}</td><td>#{lag_badge(r[:lag])}</td>" \
+        "<td>#{r[:partition]}</td><td>#{committed}</td><td>#{endoff}</td><td>#{lag_cell}</td>" \
         "<td>#{status}</td><td>#{ctrl}</td></tr>"
       end.join
       part_rows = "<tr><td colspan='8' class='empty'>No partitions found.</td></tr>" if rows.empty?
@@ -1031,6 +1035,7 @@ module KafkaBatch
         <div class="card">
           <h3>Pending by topic</h3>
           <p class="muted">Lag = messages produced but not yet committed by the consumer group (i.e. pending work). Auto-refreshing every 5s.</p>
+          <p class="muted"><code>#{h(KafkaBatch.config.consumer_group)}-schedule</code> rows show retained payload volume on the scheduled topic (log size, not execution lag). Pending delayed jobs are on the <a href="#{scheduled_path}">Scheduled</a> page.</p>
           #{pause_note}
           <table>
             <thead><tr><th>Group</th><th>Topic</th><th>Partitions</th><th>Pending (lag)</th><th>Status</th><th>Control</th></tr></thead>
@@ -1106,15 +1111,16 @@ module KafkaBatch
 
       cfg            = KafkaBatch.config
       ingest_topic   = cfg.fairness_ingest_topic(type)
-      ready_topic    = cfg.fairness_ready_topic(type)
-      ingest, ready =
+      ingest, ready  =
         begin
           [lag_partitions(KafkaBatch.dispatch_consumer_group(type), ingest_topic),
-           lag_partitions(KafkaBatch.jobs_fair_consumer_group(type), ready_topic)]
+           fairness_ready_lag_partitions(type)]
         rescue StandardError => e
           KafkaBatch.logger.warn("[KafkaBatch::Web] fairness lag read failed: #{e.message}")
           return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path(type), type: type)}<div class='card'><h2>#{lane_label}</h2><p class='muted'>Could not read lag from Kafka (see server logs for details).</p></div>"
         end
+
+      ready_topics_desc = fairness_ready_topics_description(type)
 
       # Augment ingest rows with :group and :topic so ingest_partition_lookup_result
       # can match against them (same shape as KafkaBatch::Lag.partitions rows).
@@ -1142,7 +1148,8 @@ module KafkaBatch
       ingest_rows = "<tr><td colspan='2' class='empty'>No un-dispatched jobs — all lanes drained.</td></tr>" if ingest_rows.empty?
 
       ready_rows = ready.map do |p|
-        "<tr><td>#{p[:partition]}</td><td>#{lag_badge(p[:lag])}</td></tr>"
+        label = fairness_ready_partition_label(type, p)
+        "<tr><td>#{label}</td><td>#{lag_badge(p[:lag])}</td></tr>"
       end.join
       ready_rows = "<tr><td colspan='2' class='empty'>Ready topic empty.</td></tr>" if ready_rows.empty?
 
@@ -1158,7 +1165,7 @@ module KafkaBatch
         </div>
         <div class="card">
           <h2>#{lane_label} <span class="muted" style="font-size:13px">(lane: <code>#{type}</code>)</span></h2>
-          <p class="muted">Jobs land on <code>#{h(ingest_topic)}</code> (keyed one-tenant-per-partition), the Dispatcher stages them into the <code>#{type}</code> Redis WFQ scheduler, and the Forwarder checks out the fairest jobs onto <code>#{h(ready_topic)}</code> (bounded by the in-flight window <code>fairness_global_concurrency=#{window}</code>), which the JobConsumer swarm drains. Auto-refreshing every 5s.</p>
+          <p class="muted">Jobs land on <code>#{h(ingest_topic)}</code> (keyed one-tenant-per-partition), the Dispatcher stages them into the <code>#{type}</code> Redis WFQ scheduler, and the Forwarder checks out the fairest jobs onto #{ready_topics_desc} (bounded by the in-flight window <code>fairness_global_concurrency=#{window}</code>), which the execution consumer swarm drains. Auto-refreshing every 5s.</p>
         </div>
         <div class="card">
           <h3>Ingest backlog by lane (un-dispatched, ≈ per tenant)</h3>
@@ -1586,6 +1593,70 @@ module KafkaBatch
         lag            = 0 if lag.negative?
         { partition: partition.to_i, lag: lag, never_consumed: never_consumed }
       end.sort_by { |p| -p[:lag] }
+    end
+
+    # Ready-topic lag for the fairness dashboard. When per-runtime ready topics
+    # are configured (.go / .ruby), reads each execution group's real topic —
+    # the legacy single ready topic is unused in hybrid Go-control setups.
+    def fairness_ready_lag_partitions(type)
+      cfg = KafkaBatch.config
+      rows = []
+      if cfg.runtime_split_fair_ready?(type)
+        ruby_topic = cfg.fairness_ready_topic(type, :ruby)
+        lag_partitions(KafkaBatch.jobs_fair_consumer_group(type), ruby_topic).each do |p|
+          rows << p.merge(topic: ruby_topic, runtime: :ruby)
+        end
+        go_topic = cfg.fairness_ready_topic(type, :go)
+        go_group = KafkaBatch.go_worker_fair_ready_consumer_group(type)
+        lag_partitions(go_group, go_topic).each do |p|
+          rows << p.merge(topic: go_topic, runtime: :go)
+        end
+      else
+        ready_topic = cfg.fairness_ready_topic(type)
+        lag_partitions(KafkaBatch.jobs_fair_consumer_group(type), ready_topic).each do |p|
+          rows << p.merge(topic: ready_topic)
+        end
+      end
+      rows.sort_by { |p| -p[:lag] }
+    end
+
+    def fairness_ready_topics_description(type)
+      cfg = KafkaBatch.config
+      if cfg.runtime_split_fair_ready?(type)
+        go   = cfg.fairness_ready_topic(type, :go)
+        ruby = cfg.fairness_ready_topic(type, :ruby)
+        "<code>#{h(go)}</code> (Go worker) and <code>#{h(ruby)}</code> (Ruby JobConsumer)"
+      else
+        "<code>#{h(cfg.fairness_ready_topic(type))}</code>"
+      end
+    end
+
+    def fairness_ready_partition_label(type, partition_row)
+      cfg = KafkaBatch.config
+      if cfg.runtime_split_fair_ready?(type) && partition_row[:runtime]
+        "#{partition_row[:partition]} <span class='muted'>(#{partition_row[:runtime]})</span>"
+      else
+        partition_row[:partition].to_s
+      end
+    end
+
+    # Scheduled-topic rows on /lag use log watermarks, not consumer-group lag.
+    def schedule_log_group?(group)
+      group.to_s.end_with?("-schedule")
+    end
+
+    def schedule_log_status
+      "<span class='badge' style='background:#6366f1'>payload log</span>"
+    end
+
+    def schedule_log_control
+      "<span class='muted'>—</span>"
+    end
+
+    def schedule_log_lag_badge(lag)
+      n = lag.to_i
+      return "<span class='muted'>0</span>" if n.zero?
+      "<span class='badge' style='background:#6366f1' title='Retained payloads in topic log'>#{n}</span>"
     end
 
     # Colour the lag number: grey at 0, amber when backed up.

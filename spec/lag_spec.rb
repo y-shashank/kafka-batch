@@ -7,6 +7,7 @@ RSpec.describe KafkaBatch::Lag do
 
     it "flattens Karafka's lag map into sorted per-partition rows" do
       allow(described_class).to receive(:available?).and_return(true)
+      allow(described_class).to receive(:scheduled_topic_partitions).and_return([])
       allow(described_class).to receive(:read).and_return(
         "g-jobs" => {
           "demo" => {
@@ -38,6 +39,28 @@ RSpec.describe KafkaBatch::Lag do
       expect(consumed[:end_offset]).to eq(42) # committed + lag
       expect(consumed[:lag]).to eq(2)
     end
+
+    it "appends scheduled-topic log rows from watermarks" do
+      allow(described_class).to receive(:available?).and_return(true)
+      allow(described_class).to receive(:read).and_return({})
+      KafkaBatch.config.consumer_group = "kb"
+      KafkaBatch.config.scheduled_topic = "kafka_batch.scheduled"
+      reader = instance_double(KafkaBatch::Dlt::Reader)
+      allow(KafkaBatch::Dlt::Reader).to receive(:new).with(topic: "kafka_batch.scheduled").and_return(reader)
+      allow(reader).to receive(:watermarks).and_return(
+        topic: "kafka_batch.scheduled", partitions: 2, total: 15,
+        watermarks: {
+          0 => { low: 10, high: 20 },
+          1 => { low: 0,  high: 5 }
+        }
+      )
+
+      rows = described_class.partitions
+      expect(rows.size).to eq(2)
+      expect(rows).to all(include(log_archive: true, group: "kb-schedule", topic: "kafka_batch.scheduled"))
+      expect(rows.find { |r| r[:partition] == 0 }).to include(committed: 10, end_offset: 20, lag: 10)
+      expect(rows.find { |r| r[:partition] == 1 }).to include(committed: 0, end_offset: 5, lag: 5)
+    end
   end
 
   describe ".gem_groups_with_topics" do
@@ -62,8 +85,10 @@ RSpec.describe KafkaBatch::Lag do
       expect(result).to eq(
         "kb-control"   => %w[events callbacks retry],
         "kb-dispatch"  => %w[ingest],
+        "kb-events"    => %w[kafka_batch.events],
         "kb-jobs-fair" => %w[ready],
-        "kb-jobs"      => %w[demo]
+        "kb-jobs"      => %w[demo],
+        "kb-retry"     => %w[kafka_batch.jobs.retry.short kafka_batch.jobs.retry.medium kafka_batch.jobs.retry.large]
       )
       expect(result).not_to have_key("app")
     end
@@ -97,6 +122,20 @@ RSpec.describe KafkaBatch::Lag do
         result = described_class.gem_groups_with_topics
         expect(result["kb-jobs"]).to eq(%w[kafka_batch.jobs orders.process])
         expect(result["kb-jobs-fast"]).to eq(%w[kafka_batch.jobs.p0 kafka_batch.jobs.p1])
+      end
+
+      it "includes go control groups (events, retry) for lag" do
+        KafkaBatch.config.events_topic = "kafka_batch.events"
+        KafkaBatch.config.retry_topic  = "kafka_batch.jobs.retry"
+        allow(KafkaBatch).to receive(:workers).and_return([])
+
+        result = described_class.gem_groups_with_topics
+        expect(result["kb-events"]).to eq(%w[kafka_batch.events])
+        expect(result["kb-retry"]).to eq(%w[
+          kafka_batch.jobs.retry.short
+          kafka_batch.jobs.retry.medium
+          kafka_batch.jobs.retry.large
+        ])
       end
 
       it "includes go-worker execution groups for lag pause/resume" do

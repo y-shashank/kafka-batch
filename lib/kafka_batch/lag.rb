@@ -63,6 +63,7 @@ module KafkaBatch
           end
         end
       end
+      rows.concat(scheduled_topic_partitions)
       rows.sort_by { |r| [r[:group], r[:topic], r[:partition]] }
     end
 
@@ -145,6 +146,7 @@ module KafkaBatch
       if own_routes.any?
         # Route-based: gem-owned consumer groups found in this process's routes.
         groups = own_routes.each_with_object({}) { |r, h| h[r.id] = r.topics.map(&:name) }
+        merge_go_control_groups!(groups, cfg, prefix)
         merge_go_worker_groups!(groups, cfg, prefix, registry)
         groups
       else
@@ -152,6 +154,16 @@ module KafkaBatch
         # process where karafka.rb runs but doesn't call draw_routes).
         config_based_groups(cfg, prefix)
       end
+    end
+
+    # @api private
+    # Adds kafka-batch-go control groups (events, retry) for the /lag UI.
+    def merge_go_control_groups!(groups, cfg, prefix)
+      events = cfg.events_topic.to_s
+      groups["#{prefix}-events"] = [events] if !events.empty?
+
+      retries = cfg.retry_topics
+      groups["#{prefix}-retry"] = retries if retries.any?
     end
 
     # @api private
@@ -229,6 +241,7 @@ module KafkaBatch
         ([cfg.jobs_topic] + registry_job_topics(reserved) + Array(cfg.extra_job_topics))
         .compact.uniq
 
+      merge_go_control_groups!(groups, cfg, prefix)
       merge_go_worker_groups!(groups, cfg, prefix, registry)
 
       groups.reject { |_, topics| topics.empty? }
@@ -248,6 +261,35 @@ module KafkaBatch
                 .compact
                 .reject { |t| priority.include?(t) }
     rescue StandardError
+      []
+    end
+
+    # Scheduled topic (perform_in / perform_at payload log). The poller reads by
+    # explicit partition:offset pointers from the schedule index — there is no
+    # steady consumer-group lag — so we report log size (high − low watermark)
+    # under a synthetic {consumer_group}-schedule group for observability.
+    def scheduled_topic_partitions
+      topic = KafkaBatch.config.scheduled_topic.to_s
+      return [] if topic.empty?
+
+      group = "#{KafkaBatch.config.consumer_group}-schedule"
+      wm    = KafkaBatch::Dlt::Reader.new(topic: topic).watermarks
+      wm[:watermarks].map do |partition, marks|
+        low  = marks[:low].to_i
+        high = marks[:high].to_i
+        {
+          group:          group,
+          topic:          topic,
+          partition:      partition.to_i,
+          committed:      low,
+          end_offset:     high,
+          lag:            [high - low, 0].max,
+          never_consumed: false,
+          log_archive:    true
+        }
+      end
+    rescue StandardError => e
+      KafkaBatch.logger.warn("[KafkaBatch::Lag] scheduled topic watermarks failed: #{e.message}")
       []
     end
   end
