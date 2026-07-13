@@ -47,6 +47,7 @@ RSpec.describe KafkaBatch::Lag do
       KafkaBatch.config.scheduled_topic = "kafka_batch.scheduled"
       reader = instance_double(KafkaBatch::Dlt::Reader)
       allow(KafkaBatch::Dlt::Reader).to receive(:new).with(topic: "kafka_batch.scheduled").and_return(reader)
+      allow(reader).to receive(:close)
       allow(reader).to receive(:watermarks).and_return(
         topic: "kafka_batch.scheduled", partitions: 2, total: 15,
         watermarks: {

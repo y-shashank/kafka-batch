@@ -272,25 +272,30 @@ module KafkaBatch
       topic = KafkaBatch.config.scheduled_topic.to_s
       return [] if topic.empty?
 
-      group = "#{KafkaBatch.config.consumer_group}-schedule"
-      wm    = KafkaBatch::Dlt::Reader.new(topic: topic).watermarks
-      wm[:watermarks].map do |partition, marks|
-        low  = marks[:low].to_i
-        high = marks[:high].to_i
-        {
-          group:          group,
-          topic:          topic,
-          partition:      partition.to_i,
-          committed:      low,
-          end_offset:     high,
-          lag:            [high - low, 0].max,
-          never_consumed: false,
-          log_archive:    true
-        }
+      group  = "#{KafkaBatch.config.consumer_group}-schedule"
+      reader = KafkaBatch::Dlt::Reader.new(topic: topic)
+      begin
+        wm = reader.watermarks
+        wm[:watermarks].map do |partition, marks|
+          low  = marks[:low].to_i
+          high = marks[:high].to_i
+          {
+            group:          group,
+            topic:          topic,
+            partition:      partition.to_i,
+            committed:      low,
+            end_offset:     high,
+            lag:            [high - low, 0].max,
+            never_consumed: false,
+            log_archive:    true
+          }
+        end
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch::Lag] scheduled topic watermarks failed: #{e.message}")
+        []
+      ensure
+        reader.close
       end
-    rescue StandardError => e
-      KafkaBatch.logger.warn("[KafkaBatch::Lag] scheduled topic watermarks failed: #{e.message}")
-      []
     end
   end
 end
