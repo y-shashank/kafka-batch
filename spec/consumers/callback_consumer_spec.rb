@@ -52,16 +52,16 @@ RSpec.describe KafkaBatch::Consumers::CallbackConsumer do
     end
   end
 
-  describe "at-least-once semantics (fix #2)" do
-    it "claims dispatch only AFTER the callback has run" do
+  describe "single-winner claim-before-invoke" do
+    it "claims dispatch BEFORE the callback has run" do
       id = seed_batch(on_complete: "OrderCheckingCallback")
       msg = callback_message(id: id, outcome: "complete", on_complete: "OrderCheckingCallback")
 
       consumer.send(:process_callback, msg)
 
       flag = KafkaBatchSpec::CallbackDoubles.invocations.find { |i| i[:name] == :dispatched_at_invocation }
-      expect(flag[:args]).to be(false)              # not yet claimed while running
-      expect(KafkaBatch.store.callback_dispatched?(id)).to be(true) # claimed afterwards
+      expect(flag[:args]).to be(true) # claimed before invoke (Redis fence)
+      expect(KafkaBatch.store.callback_dispatched?(id)).to be(true)
     end
 
     it "suppresses a duplicate callback message" do
@@ -70,6 +70,20 @@ RSpec.describe KafkaBatch::Consumers::CallbackConsumer do
 
       consumer.send(:process_callback, msg)
       consumer.send(:process_callback, msg) # redelivery
+
+      expect(KafkaBatchSpec::CallbackDoubles.invocations.size).to eq(1)
+    end
+
+    it "invokes only once when two consumers race the claim" do
+      id = seed_batch(on_complete: "RecordingCallback")
+      msg = callback_message(id: id, outcome: "complete", on_complete: "RecordingCallback")
+      other = build_consumer(described_class)
+
+      threads = [
+        Thread.new { consumer.send(:process_callback, msg) },
+        Thread.new { other.send(:process_callback, msg) }
+      ]
+      threads.each(&:join)
 
       expect(KafkaBatchSpec::CallbackDoubles.invocations.size).to eq(1)
     end

@@ -10,19 +10,22 @@ module KafkaBatch
     # Ruby runtime depending on handler manifest / worker registration.
     #
     # Legacy callbacks: produce to callbacks_topic for CallbackConsumer (Ruby class).
+    #
+    # Job-callback side effects are fenced with claim_callback BEFORE produce so
+    # two finalizers cannot double-enqueue. Legacy-only dispatch does not claim
+    # here — CallbackConsumer claims before invoke.
     module Dispatcher
       class << self
         # @return [Symbol] :none, :job_only, :legacy_only, or :mixed
         def dispatch!(batch:, outcome:, finished_at: nil)
           summary = batch_summary(batch, outcome, finished_at)
+          job_actions = []
           legacy_needed = false
-          job_produced  = false
 
           if outcome == "success" && present?(batch[:on_success])
             case Callback.parse(batch[:on_success])
             when Callback::Job
-              produce_job_callback!(batch[:on_success], summary, kind: :on_success)
-              job_produced = true
+              job_actions << { raw: batch[:on_success], kind: :on_success }
             when Callback::Legacy
               legacy_needed = true
             end
@@ -31,26 +34,35 @@ module KafkaBatch
           if present?(batch[:on_complete])
             case Callback.parse(batch[:on_complete])
             when Callback::Job
-              produce_job_callback!(batch[:on_complete], summary, kind: :on_complete)
-              job_produced = true
+              job_actions << { raw: batch[:on_complete], kind: :on_complete }
             when Callback::Legacy
               legacy_needed = true
             end
           end
 
-          if legacy_needed
-            produce_legacy!(batch, outcome, summary)
-            return :mixed if job_produced
+          return :none if job_actions.empty? && !legacy_needed
 
-            return :legacy_only
-          end
+          if job_actions.any?
+            # Claim BEFORE produce so two finalizers cannot both enqueue jobs.
+            unless KafkaBatch.store.claim_callback(batch[:id], KafkaBatch.node_id)
+              return :none
+            end
 
-          if job_produced
-            KafkaBatch.store.claim_callback(batch[:id], KafkaBatch.node_id)
+            job_actions.each do |action|
+              produce_job_callback!(action[:raw], summary, kind: action[:kind])
+            end
+
+            if legacy_needed
+              # Already claimed — CallbackConsumer would skip. Fire legacy inline.
+              fire_legacy!(batch, summary, outcome)
+              return :mixed
+            end
+
             return :job_only
           end
 
-          :none
+          produce_legacy!(batch, outcome, summary)
+          :legacy_only
         end
 
         def any_legacy?(batch)
@@ -107,6 +119,77 @@ module KafkaBatch
             batch_id:        batch_id,
             callback_class:  spec.job_type,
             callback_method: kind.to_s
+          )
+        end
+
+        def fire_legacy!(batch, summary, outcome)
+          payload = summary.merge(
+            "on_success"  => batch[:on_success],
+            "on_complete" => batch[:on_complete]
+          )
+          if outcome == "success" && legacy_class?(batch[:on_success])
+            invoke_legacy(batch[:on_success], :on_success, payload)
+          end
+          if legacy_class?(batch[:on_complete])
+            invoke_legacy(batch[:on_complete], :on_complete, payload)
+          end
+        end
+
+        def legacy_class?(raw)
+          present?(raw) && Callback.parse(raw).is_a?(Callback::Legacy)
+        end
+
+        def invoke_legacy(class_name, method_name, batch_summary)
+          klass = Object.const_get(class_name)
+          unless klass.method_defined?(method_name)
+            error = NoMethodError.new("#{class_name} does not define ##{method_name}")
+            KafkaBatch.logger.error(
+              "[KafkaBatch][Callbacks::Dispatcher] #{error.message} – sending to DLT"
+            )
+            publish_legacy_dlt(batch_summary, error, class_name, method_name, "callback")
+            return
+          end
+
+          klass.new.public_send(method_name, batch_summary)
+          KafkaBatch::Instrumentation.callback_invoked(
+            batch_id:        batch_summary["batch_id"],
+            callback_class:  class_name,
+            callback_method: method_name.to_s
+          )
+        rescue NameError, StandardError => e
+          dlt_type = e.is_a?(NameError) ? "callback" : "callback_error"
+          KafkaBatch.logger.error(
+            "[KafkaBatch][Callbacks::Dispatcher] #{class_name}##{method_name} " \
+            "#{e.class}: #{e.message}"
+          )
+          KafkaBatch::Instrumentation.callback_failed(
+            batch_id:        batch_summary["batch_id"],
+            callback_class:  class_name,
+            callback_method: method_name.to_s,
+            error:           e
+          )
+          publish_legacy_dlt(batch_summary, e, class_name, method_name, dlt_type)
+        end
+
+        def publish_legacy_dlt(batch_summary, error, class_name, method_name, dlt_type)
+          KafkaBatch::Dlt.publish(
+            payload: batch_summary.merge(
+              "dlt_type"            => dlt_type,
+              "dlt_callback_class"  => class_name.to_s,
+              "dlt_callback_method" => method_name.to_s,
+              "dlt_error_class"     => error.class.name,
+              "dlt_error_message"   => error.message,
+              "dlt_source_topic"    => KafkaBatch.config.callbacks_topic,
+              "dlt_at"              => Time.now.utc.iso8601
+            ),
+            key:          batch_summary["batch_id"],
+            dlt_type:     dlt_type,
+            source_topic: KafkaBatch.config.callbacks_topic,
+            batch_id:     batch_summary["batch_id"]
+          )
+        rescue KafkaBatch::ProducerError => e
+          KafkaBatch.logger.error(
+            "[KafkaBatch][Callbacks::Dispatcher] DLT publish failed: #{e.message}"
           )
         end
 

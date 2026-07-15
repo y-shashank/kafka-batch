@@ -146,6 +146,52 @@ RSpec.describe KafkaBatch::SchedulePoller do
     end
   end
 
+  describe "#tick — unknown worker / route error" do
+    it "parks the job on the DLT and acks it" do
+      member = "j6:0:2"
+      raw = Oj.dump(
+        {
+          "job_id"       => "j6",
+          "worker_class" => "TotallyMissingWorker",
+          "payload"      => { "n" => 1 },
+          "attempt"      => 0
+        },
+        mode: :compat
+      )
+      store  = FakeScheduleStore.new(due: [member])
+      reader = FakeReader.new(found: { "0:2" => raw })
+      poller = described_class.new(store: store, reader: reader)
+
+      expect(poller.tick).to eq(1)
+      dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
+      expect(dlt.size).to eq(1)
+      expect(dlt.first.payload["dlt_type"]).to eq("schedule_route_error")
+      expect(dlt.first.payload["job_id"]).to eq("j6")
+      expect(store.acked).to eq([member])
+    end
+
+    it "leaves the job leased when DLT produce fails" do
+      member = "j7:0:3"
+      raw = Oj.dump(
+        {
+          "job_id"       => "j7",
+          "worker_class" => "TotallyMissingWorker",
+          "payload"      => {},
+          "attempt"      => 0
+        },
+        mode: :compat
+      )
+      store  = FakeScheduleStore.new(due: [member])
+      reader = FakeReader.new(found: { "0:3" => raw })
+      poller = described_class.new(store: store, reader: reader)
+
+      FakeProducer.raise_for { |topic| topic == KafkaBatch.config.dead_letter_topic }
+
+      expect(poller.tick).to eq(0)
+      expect(store.acked).to be_empty
+    end
+  end
+
   # Adaptive idle backoff keeps many pods from hammering the schedule store while
   # nothing is due (the main throttle on idle DB/Redis load with a large fleet).
   describe "#run — adaptive idle backoff" do

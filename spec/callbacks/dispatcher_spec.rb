@@ -32,15 +32,25 @@ RSpec.describe KafkaBatch::Callbacks::Dispatcher do
       KafkaBatch::HandlerRegistry.register_definition(definition)
     end
 
-    it "enqueues on_success to the handler topic and claims dispatch" do
+    it "claims dispatch BEFORE enqueueing on_success to the handler topic" do
       batch[:on_success] = KafkaBatch::Callback.dump(
         KafkaBatch::Callback.job("segment.export.on_success", topic: "segment.exports.callbacks")
       )
       batch[:callback_args] = { "run_id" => "99" }
+      claim_order = []
+      allow(KafkaBatch.store).to receive(:claim_callback) do |*|
+        claim_order << :claim
+        true
+      end
+      allow(FakeProducer).to receive(:record).and_wrap_original do |orig, **kwargs|
+        claim_order << :produce
+        orig.call(**kwargs)
+      end
 
       mode = described_class.dispatch!(batch: batch, outcome: "success")
 
       expect(mode).to eq(:job_only)
+      expect(claim_order).to eq(%i[claim produce])
       produced = FakeProducer.for_topic("segment.exports.callbacks")
       expect(produced.size).to eq(1)
       payload = produced.first.payload
@@ -49,6 +59,18 @@ RSpec.describe KafkaBatch::Callbacks::Dispatcher do
       expect(payload["payload"]).not_to have_key("meta")
       expect(FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)).to be_empty
       expect(KafkaBatch.store).to have_received(:claim_callback).with(batch_id, KafkaBatch.node_id)
+    end
+
+    it "skips job enqueue when the claim is already taken" do
+      batch[:on_success] = KafkaBatch::Callback.dump(
+        KafkaBatch::Callback.job("segment.export.on_success", topic: "segment.exports.callbacks")
+      )
+      allow(KafkaBatch.store).to receive(:claim_callback).and_return(false)
+
+      mode = described_class.dispatch!(batch: batch, outcome: "success")
+
+      expect(mode).to eq(:none)
+      expect(FakeProducer.for_topic("segment.exports.callbacks")).to be_empty
     end
 
     it "enqueues on_complete with a distinct job_id" do

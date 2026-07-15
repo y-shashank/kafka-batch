@@ -219,10 +219,12 @@ module KafkaBatch
       unless worker_class
         KafkaBatch.logger.error(
           "[KafkaBatch][SchedulePoller] unknown worker_class=#{worker_name.inspect} " \
-          "for job_id=#{job_id} — dropping."
+          "for job_id=#{job_id} — parking on DLT."
         )
-        release_scheduled_uniq(data, job_id)
-        return true
+        return park_route_error(
+          payload: payload, data: data, job_id: job_id,
+          error: ArgumentError.new("unknown worker_class=#{worker_name.inspect}")
+        )
       end
 
       route = KafkaBatch::Batch.route_for(
@@ -249,6 +251,50 @@ module KafkaBatch
         "[KafkaBatch][SchedulePoller] malformed scheduled payload for job_id=#{job_id}: #{e.message} — dropping."
       )
       release_scheduled_uniq_raw(payload, job_id) if payload
+      true
+    rescue StandardError => e
+      # Permanent misconfig from route_for / handler resolution — park on DLT.
+      KafkaBatch.logger.error(
+        "[KafkaBatch][SchedulePoller] route job_id=#{job_id}: #{e.class}: #{e.message}"
+      )
+      data = begin
+        Oj.load(payload)
+      rescue StandardError
+        { "job_id" => job_id }
+      end
+      park_route_error(payload: payload, data: data, job_id: job_id, error: e)
+    end
+
+    # Park an unroutable scheduled job on the dead-letter topic, then ACK.
+    # If DLT produce fails, leave the lease so reclaim retries (no silent drop).
+    def park_route_error(payload:, data:, job_id:, error:)
+      batch_id     = data["batch_id"]
+      worker_class = data["worker_class"]
+      begin
+        KafkaBatch::Dlt.publish(
+          payload: {
+            "job_id"            => job_id,
+            "batch_id"          => batch_id,
+            "worker_class"      => worker_class,
+            "dlt_type"          => "schedule_route_error",
+            "dlt_error_class"   => error.class.name,
+            "dlt_error_message" => error.message,
+            "dlt_raw_payload"   => payload.to_s,
+            "dlt_at"            => Time.now.utc.iso8601
+          },
+          key:          job_id,
+          dlt_type:     "schedule_route_error",
+          source_topic: KafkaBatch.config.scheduled_topic,
+          batch_id:     batch_id,
+          job_id:       job_id
+        )
+      rescue KafkaBatch::ProducerError => e
+        KafkaBatch.logger.error(
+          "[KafkaBatch][SchedulePoller] DLT produce failed job_id=#{job_id}: #{e.message} — leaving leased"
+        )
+        return false
+      end
+      release_scheduled_uniq(data, job_id)
       true
     end
 

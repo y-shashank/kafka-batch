@@ -7,17 +7,16 @@ module KafkaBatch
   module Consumers
     # Karafka consumer that fires on_success / on_complete callbacks.
     #
-    # Delivery semantics – at-least-once (callbacks must be idempotent):
-    #   The callback is invoked FIRST, then the dispatch is claimed
-    #   (claim_callback marks callback_dispatched_at).  This ordering means a
-    #   crash between invocation and claim results in re-invocation on
-    #   redelivery – never a lost callback.  This matches Sidekiq-Pro's
-    #   "callbacks may run more than once" guarantee.
+    # Delivery semantics – single-winner via Redis:
+    #   claim_callback (HSETNX callback_dispatched_at) runs BEFORE invoke so two
+    #   consumers cannot both fire side effects. A crash between claim and invoke
+    #   can lose the callback (batch stays marked dispatched); prefer that over
+    #   double emails/webhooks. Matches kafka-batch-go Callback Processor.
     #
     #   Because callback messages are keyed by batch_id, all callbacks for a
     #   given batch land on the same partition and are processed sequentially
-    #   by a single consumer, so a pre-dispatch check (callback_dispatched?)
-    #   cheaply suppresses duplicates in the normal (non-crash) path.
+    #   by a single consumer in the common case; the Redis claim is the fence
+    #   under rebalance / multi-consumer races.
     #
     # Safety guarantees:
     #   1. Unresolvable callback classes are forwarded to the dead-letter topic
@@ -61,13 +60,19 @@ module KafkaBatch
           return
         end
 
-        # ── Duplicate suppression (normal path) ────────────────────────────
-        # If the dispatch was already claimed, the callback has already run.
-        # Callback messages are keyed by batch_id → same partition → processed
-        # sequentially, so this read reliably skips duplicates without a race.
+        # Fast path: skip Redis claim when another consumer already won.
         if KafkaBatch.store.callback_dispatched?(batch_id)
           KafkaBatch.logger.debug(
             "[KafkaBatch][CallbackConsumer] batch_id=#{batch_id} callback already dispatched – skipping"
+          )
+          mark_as_consumed!(message)
+          return
+        end
+
+        # Claim BEFORE invoke so two consumers cannot both fire side effects.
+        unless KafkaBatch.store.claim_callback(batch_id, KafkaBatch.node_id)
+          KafkaBatch.logger.debug(
+            "[KafkaBatch][CallbackConsumer] batch_id=#{batch_id} lost claim – skipping"
           )
           mark_as_consumed!(message)
           return
@@ -93,12 +98,6 @@ module KafkaBatch
             invoke_callback(data["on_complete"], :on_complete, data, message)
           end
         end
-
-        # ── Claim AFTER invocation ─────────────────────────────────────────
-        # Marking dispatch only after the callbacks have run guarantees that a
-        # crash mid-invocation leads to re-invocation (at-least-once), never a
-        # silently lost callback. Record which pod/process ran it for tracking.
-        KafkaBatch.store.claim_callback(batch_id, KafkaBatch.node_id)
 
         mark_as_consumed!(message)
       end
@@ -150,9 +149,6 @@ module KafkaBatch
           callback_method: method_name,
           error:           e
         )
-        # Bug #3 fix: wrap publish_to_dlt so that a broker outage doesn't
-        # propagate out of invoke_callback and skip the claim_callback call in
-        # process_callback, which would cause infinite redelivery.
         begin
           publish_to_dlt(
             original_message: original_message,
@@ -169,9 +165,7 @@ module KafkaBatch
         end
       rescue StandardError => e
         # Callback itself raised – forward to DLT with dlt_type "callback_error".
-        # claim_callback is called by process_callback after we return. If DLT
-        # publish fails here we must NOT let the exception propagate, otherwise
-        # claim_callback is skipped and every redelivery re-runs the callback.
+        # Claim already won; do not re-raise or every redelivery would re-run.
         KafkaBatch.logger.error(
           "[KafkaBatch][CallbackConsumer] #{class_name}##{method_name} raised " \
           "#{e.class}: #{e.message}\n#{e.backtrace&.first(5)&.join("\n")}"
@@ -182,7 +176,6 @@ module KafkaBatch
           callback_method: method_name,
           error:           e
         )
-        # Bug #3 fix: wrap publish_to_dlt – see NameError rescue above.
         begin
           publish_to_dlt(
             original_message: original_message,

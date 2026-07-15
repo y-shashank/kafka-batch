@@ -40,7 +40,7 @@ class MethodlessCallback
 end
 
 # Records whether the dispatch had been claimed at the moment the callback ran.
-# Used to prove the at-least-once ordering: invoke first, claim afterwards.
+# Used to prove claim-before-invoke: Redis fence is held while the callback runs.
 class OrderCheckingCallback
   def on_complete(summary)
     flag = KafkaBatch.store.callback_dispatched?(summary["batch_id"])
