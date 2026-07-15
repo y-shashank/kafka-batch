@@ -43,7 +43,6 @@ RSpec.describe "KafkaBatch::Batch delayed scheduling (perform_in / perform_at)" 
         worker_class: nil,
         worker_class_name: "go:test.go_job",
         max_retries: 3,
-        complete_after_retries: nil,
         retry_tier: nil
       )
     end

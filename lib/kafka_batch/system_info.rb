@@ -176,6 +176,7 @@ module KafkaBatch
             row("Backend", config.liveness_backend),
             row("Track running jobs", fmt_bool(config.track_running_jobs)),
             row("TTL", fmt_duration(config.liveness_ttl)),
+            row("Heartbeat interval", fmt_duration(config.liveness_heartbeat_interval)),
             row("Stats interval", config.liveness_stats_interval.zero? ? "off" : fmt_duration(config.liveness_stats_interval)),
             row("Consumption control refresh", fmt_duration(config.consumption_control_refresh_interval))
           ]
@@ -213,7 +214,6 @@ module KafkaBatch
           id: "retry", title: "Retry & events", icon: "↻", accent: "#f59e0b",
           rows: [
             row("Max retries", config.max_retries),
-            row("Complete after retries", config.complete_after_retries),
             row("Retry jitter", "±#{(config.retry_jitter.to_f * 100).round}%"),
             row("Retry tiers", tiers),
             row("Tier progression", config.retry_tier_progression.join(" → ")),

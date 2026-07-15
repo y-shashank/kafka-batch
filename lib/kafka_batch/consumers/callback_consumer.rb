@@ -51,8 +51,9 @@ module KafkaBatch
           return
         end
 
-        batch_id = data["batch_id"]
-        outcome  = data["outcome"]
+        batch_id   = data["batch_id"]
+        outcome    = data["outcome"]
+        preclaimed = data["preclaimed"] ? true : false
 
         unless batch_id
           KafkaBatch.logger.warn("[KafkaBatch][CallbackConsumer] Missing batch_id – skipping")
@@ -60,22 +61,36 @@ module KafkaBatch
           return
         end
 
-        # Fast path: skip Redis claim when another consumer already won.
-        if KafkaBatch.store.callback_dispatched?(batch_id)
-          KafkaBatch.logger.debug(
-            "[KafkaBatch][CallbackConsumer] batch_id=#{batch_id} callback already dispatched – skipping"
-          )
-          mark_as_consumed!(message)
-          return
-        end
+        unless preclaimed
+          # Fast path: skip Redis claim when another consumer already won.
+          if KafkaBatch.store.callback_dispatched?(batch_id) &&
+             outcome.to_s != "success_only"
+            KafkaBatch.logger.debug(
+              "[KafkaBatch][CallbackConsumer] batch_id=#{batch_id} callback already dispatched – skipping"
+            )
+            mark_as_consumed!(message)
+            return
+          end
 
-        # Claim BEFORE invoke so two consumers cannot both fire side effects.
-        unless KafkaBatch.store.claim_callback(batch_id, KafkaBatch.node_id)
-          KafkaBatch.logger.debug(
-            "[KafkaBatch][CallbackConsumer] batch_id=#{batch_id} lost claim – skipping"
-          )
-          mark_as_consumed!(message)
-          return
+          # Claim BEFORE invoke so two consumers cannot both fire side effects.
+          kind = KafkaBatch::Callbacks::Dispatcher.claim_kind(outcome)
+          unless KafkaBatch.store.claim_callback(batch_id, KafkaBatch.node_id, kind)
+            # EXISTS-guarded claim returns false when the batch hash is gone
+            # (TTL) as well as when another consumer won. Only skip on a real
+            # lost race — still invoke when the batch is missing so poison
+            # callback classes land in the DLT instead of being dropped.
+            if KafkaBatch.store.find_batch(batch_id)
+              KafkaBatch.logger.debug(
+                "[KafkaBatch][CallbackConsumer] batch_id=#{batch_id} lost claim – skipping"
+              )
+              mark_as_consumed!(message)
+              return
+            end
+            KafkaBatch.logger.warn(
+              "[KafkaBatch][CallbackConsumer] batch_id=#{batch_id} missing – " \
+              "invoking without claim (DLT poison path)"
+            )
+          end
         end
 
         KafkaBatch.logger.info(
@@ -83,16 +98,19 @@ module KafkaBatch
           "jobs=#{data['total_jobs']} ok=#{data['completed_count']} failed=#{data['failed_count']}"
         )
 
-        # on_success fires only when every job succeeded (legacy Ruby class only).
-        if outcome == "success" && present?(data["on_success"])
+        fire_success  = %w[success success_only].include?(outcome.to_s)
+        fire_complete = %w[success complete].include?(outcome.to_s)
+
+        # on_success fires for success / success_only (legacy Ruby class only).
+        if fire_success && present?(data["on_success"])
           spec = KafkaBatch::Callback.parse(data["on_success"])
           if spec.is_a?(KafkaBatch::Callback::Legacy)
             invoke_callback(data["on_success"], :on_success, data, message)
           end
         end
 
-        # on_complete fires for any terminal outcome (legacy Ruby class only).
-        if present?(data["on_complete"])
+        # on_complete fires for success / complete (legacy Ruby class only).
+        if fire_complete && present?(data["on_complete"])
           spec = KafkaBatch::Callback.parse(data["on_complete"])
           if spec.is_a?(KafkaBatch::Callback::Legacy)
             invoke_callback(data["on_complete"], :on_complete, data, message)

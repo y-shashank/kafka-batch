@@ -10,7 +10,9 @@ module KafkaBatch
       # Redis key layout:
       #   kafka_batch:b:{id}         – Hash of all batch fields (expires after batch_ttl)
       #   kafka_batch:b:seq:{id}     – Integer counter; reserves 1-based batch_seq at enqueue
-      #   kafka_batch:b:bitmap:{id}  – Completion dedup bitmap (~1 bit/job; pre-sized at seal)
+      #   kafka_batch:b:bitmap:{id}  – Touch (first-execution) dedup bitmap
+      #   kafka_batch:b:okbit:{id}   – Success dedup bitmap (completed_count)
+      #   kafka_batch:b:failbit:{id} – Terminal-fail dedup bitmap (failed_count)
       #   kafka_batch:offsets        – Hash of monotonic per-partition cursors;
       #                                field = "source_topic/source_partition"
       #                                → last applied source offset. O(num_partitions),
@@ -41,68 +43,141 @@ module KafkaBatch
       # can return in O(1) instead of O(N pipelined HGETs).
       COUNTS_KEY    = "kafka_batch:counts"
 
-      # Atomically apply a completion, deduplicating by batch_seq (1-based bitmap
-      # bit) so each job counts at most once regardless of completion order.
+      # Sidekiq-style batch completion (wire-compatible with kafka-batch-go):
+      #   - Touch bitmap (KEYS[2]) + touched_count: first execution (success|executed|failed)
+      #   - Success bitmap (KEYS[6]) + completed_count: on success (may follow an earlier touch)
+      #   - Fail bitmap (KEYS[7]) + failed_count: terminal failures only
+      #   - on_complete when touched_count >= total (may fire while retries still run)
+      #   - on_success when completed_count >= total
+      #   - Terminal status when completed+failed >= total
       #
       #   KEYS[1] = batch hash
-      #   KEYS[2] = per-batch bitmap (kafka_batch:b:bitmap:{batch_id})
+      #   KEYS[2] = touch bitmap (kafka_batch:b:bitmap:{batch_id})
       #   KEYS[3] = RUNNING_INDEX zset, KEYS[4] = DONE_INDEX zset
-      #   KEYS[5] = COUNTS_KEY hash (Bug #2: O(1) status counters)
-      #   ARGV[1] = batch_seq (1-based; must be > 0)
-      #   ARGV[2] = counter field ("completed_count"|"failed_count"),
+      #   KEYS[5] = COUNTS_KEY hash
+      #   KEYS[6] = ok bitmap, KEYS[7] = fail bitmap
+      #   ARGV[1] = batch_seq (1-based), ARGV[2] = op (success|failed|executed),
       #   ARGV[3] = ttl, ARGV[4] = now (iso8601),
       #   ARGV[5] = finished_at score (unix float as string, for DONE_INDEX zadd)
       # Returns [code, payload]:
-      #   [0, "duplicate"]  – batch_seq already applied (dedup)
-      #   [0, "not_found"]  – batch hash does not exist
-      #   [0, "invalid"]    – batch_seq missing or out of range
-      #   [1, outcome]      – batch just completed; outcome = "success"|"complete"
-      #   [2, "continue"]   – still jobs outstanding
+      #   [0, "duplicate"|"not_found"|"invalid"]
+      #   [1, outcome]  – fire callbacks; outcome = success|success_only|complete
+      #   [2, "continue"]
+      #   [3, "complete"] – early on_complete (batch may still be running)
       BATCH_DONE_JOB_LUA = <<~LUA.freeze
         local seq = tonumber(ARGV[1])
+        local op = ARGV[2]
         if not seq or seq < 1 then return {0, 'invalid'} end
-
-        local bit = seq - 1
-        if redis.call('GETBIT', KEYS[2], bit) == 1 then return {0, 'duplicate'} end
-        redis.call('SETBIT', KEYS[2], bit, 1)
-        redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
-
+        if op ~= 'success' and op ~= 'failed' and op ~= 'executed' then return {0, 'invalid'} end
         if redis.call('EXISTS', KEYS[1]) == 0 then return {0, 'not_found'} end
 
         local status = redis.call('HGET', KEYS[1], 'status')
-        if status == 'success' or status == 'complete' or status == 'cancelled' then
+        if status == 'cancelled' then return {0, 'duplicate'} end
+
+        local bit = seq - 1
+        local ttl = tonumber(ARGV[3])
+        local now = ARGV[4]
+        local score = tonumber(ARGV[5])
+        local touched_new = 0
+        local success_new = 0
+        local failed_new = 0
+
+        if redis.call('GETBIT', KEYS[2], bit) == 0 then
+          redis.call('SETBIT', KEYS[2], bit, 1)
+          redis.call('EXPIRE', KEYS[2], ttl)
+          redis.call('HINCRBY', KEYS[1], 'touched_count', 1)
+          touched_new = 1
+        elseif op == 'executed' then
           return {0, 'duplicate'}
         end
 
-        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
-        redis.call('HINCRBY', KEYS[1], ARGV[2], 1)
+        if op == 'success' then
+          if redis.call('GETBIT', KEYS[6], bit) == 0 then
+            redis.call('SETBIT', KEYS[6], bit, 1)
+            redis.call('EXPIRE', KEYS[6], ttl)
+            redis.call('HINCRBY', KEYS[1], 'completed_count', 1)
+            success_new = 1
+          elseif touched_new == 0 then
+            return {0, 'duplicate'}
+          end
+        elseif op == 'failed' then
+          if redis.call('GETBIT', KEYS[7], bit) == 0 and redis.call('GETBIT', KEYS[6], bit) == 0 then
+            redis.call('SETBIT', KEYS[7], bit, 1)
+            redis.call('EXPIRE', KEYS[7], ttl)
+            redis.call('HINCRBY', KEYS[1], 'failed_count', 1)
+            failed_new = 1
+          elseif touched_new == 0 then
+            return {0, 'duplicate'}
+          end
+        end
+
+        if status == 'success' or status == 'complete' then
+          if touched_new == 0 and success_new == 0 and failed_new == 0 then
+            return {0, 'duplicate'}
+          end
+        end
+
+        redis.call('EXPIRE', KEYS[1], ttl)
 
         local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))      or 0
+        local touched   = tonumber(redis.call('HGET', KEYS[1], 'touched_count'))   or 0
         local completed = tonumber(redis.call('HGET', KEYS[1], 'completed_count')) or 0
         local failed    = tonumber(redis.call('HGET', KEYS[1], 'failed_count'))    or 0
         local sealed    = redis.call('HGET', KEYS[1], 'locked_at')
-
-        -- Only finalize once the batch is sealed (block-form population finished,
-        -- or created bare). A still-held batch may keep growing, so don't fire.
-        if (completed + failed) >= total and sealed and sealed ~= '' then
-          local outcome = (failed > 0) and 'complete' or 'success'
-          redis.call('HSET', KEYS[1], 'status',      outcome)
-          redis.call('HSET', KEYS[1], 'finished_at', ARGV[4])
-          redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
-          -- Atomically move from RUNNING_INDEX to DONE_INDEX so no intermediate
-          -- state is visible if the process crashes after Lua returns.
-          local batch_id = redis.call('HGET', KEYS[1], 'id')
-          if batch_id then
-            redis.call('ZREM', KEYS[3], batch_id)
-            redis.call('ZADD', KEYS[4], tonumber(ARGV[5]), batch_id)
-          end
-          -- Bug #2: keep COUNTS_KEY in sync atomically with finalization so
-          -- batch_counts() can be answered in O(1) without scanning ALL_INDEX.
-          redis.call('HINCRBY', KEYS[5], 'running', -1)
-          redis.call('HINCRBY', KEYS[5], outcome, 1)
-          return {1, outcome}
+        if not sealed or sealed == '' or total < 1 then
+          return {2, 'continue'}
         end
 
+        local fire_complete = 0
+        local fire_success = 0
+        local terminal = nil
+
+        if completed >= total then
+          terminal = 'success'
+        elseif (completed + failed) >= total then
+          terminal = 'complete'
+        end
+
+        if terminal then
+          local cur = redis.call('HGET', KEYS[1], 'status')
+          if cur == 'running' then
+            redis.call('HSET', KEYS[1], 'status', terminal)
+            redis.call('HSET', KEYS[1], 'finished_at', now)
+            redis.call('EXPIRE', KEYS[1], ttl)
+            local batch_id = redis.call('HGET', KEYS[1], 'id')
+            if batch_id then
+              redis.call('ZREM', KEYS[3], batch_id)
+              redis.call('ZADD', KEYS[4], score, batch_id)
+            end
+            redis.call('HINCRBY', KEYS[5], 'running', -1)
+            redis.call('HINCRBY', KEYS[5], terminal, 1)
+          end
+          if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', now) == 1 then
+            redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', now)
+            fire_complete = 1
+          end
+          if terminal == 'success' and redis.call('HSETNX', KEYS[1], 'success_callback_dispatched_at', now) == 1 then
+            fire_success = 1
+          end
+        elseif touched >= total then
+          if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', now) == 1 then
+            redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', now)
+            fire_complete = 1
+          end
+        end
+
+        if fire_success == 1 and fire_complete == 1 then
+          return {1, 'success'}
+        end
+        if fire_success == 1 then
+          return {1, 'success_only'}
+        end
+        if fire_complete == 1 and terminal then
+          return {1, 'complete'}
+        end
+        if fire_complete == 1 then
+          return {3, 'complete'}
+        end
         return {2, 'continue'}
       LUA
 
@@ -112,16 +187,26 @@ module KafkaBatch
       # recreate a partial, TTL-less hash (orphan key); returns 0 in that case.
       #   KEYS[1] = batch hash, KEYS[2] = DONE_INDEX zset
       #   ARGV[1] = now (iso8601), ARGV[2] = dispatched_by, ARGV[3] = batch id
+      #   ARGV[4] = kind ("complete"|"success"|"any")
       # #8 fix: ZREM DONE_INDEX inside Lua so claim + index removal are atomic.
       CLAIM_CALLBACK_LUA = <<~LUA.freeze
         if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-        local won = redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
+        local kind = ARGV[4]
+        if not kind or kind == '' then kind = 'any' end
+        local field = 'callback_dispatched_at'
+        if kind == 'complete' then
+          field = 'complete_callback_dispatched_at'
+        elseif kind == 'success' then
+          field = 'success_callback_dispatched_at'
+        end
+        local won = redis.call('HSETNX', KEYS[1], field, ARGV[1])
         if won == 1 then
           if ARGV[2] ~= '' then
             redis.call('HSET', KEYS[1], 'callback_dispatched_by', ARGV[2])
           end
-          -- #8 fix: remove from DONE_INDEX atomically with the claim so the
-          -- reconciler cannot re-fire a callback whose claim just succeeded.
+          if kind == 'any' or kind == 'complete' then
+            redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
+          end
           redis.call('ZREM', KEYS[2], ARGV[3])
         end
         return won
@@ -137,6 +222,7 @@ module KafkaBatch
           'total_jobs',      ARGV[2],
           'completed_count', '0',
           'failed_count',    '0',
+          'touched_count',   '0',
           'status',          'running',
           'on_success',      ARGV[3],
           'on_complete',     ARGV[4],
@@ -176,15 +262,13 @@ module KafkaBatch
         return {1}
       LUA
 
-      # Seal a batch (open its completion gate) and finalize if already drained.
-      # Pre-allocates the completion bitmap (KEYS[5]) via SETBIT at index
-      # total_jobs (one past the last live bit total_jobs-1) so the completion
-      # storm does not grow the string incrementally without touching dedup bits.
-      #   KEYS[1] = batch hash, KEYS[2] = COUNTS_KEY (Bug #2: O(1) status counters)
-      #   KEYS[3] = RUNNING_INDEX zset, KEYS[4] = DONE_INDEX zset (#7 fix: atomic move)
-      #   KEYS[5] = per-batch bitmap
+      # Seal a batch (open its completion gate) and finalize / early-complete if drained.
+      # Pre-allocates touch/ok/fail bitmaps via SETBIT at index total_jobs.
+      #   KEYS[1] = batch hash, KEYS[2] = COUNTS_KEY
+      #   KEYS[3] = RUNNING_INDEX zset, KEYS[4] = DONE_INDEX zset
+      #   KEYS[5] = touch bitmap, KEYS[6] = ok bitmap, KEYS[7] = fail bitmap
       #   ARGV[1] = now (iso8601), ARGV[2] = ttl, ARGV[3] = now (unix float for DONE_INDEX score)
-      # Returns [0,'not_found'] | [1,outcome] (just finalized) | [2,'sealed']
+      # Returns [0,'not_found'] | [1,outcome] | [2,'sealed'] | [3,'complete'] (early)
       SEAL_BATCH_LUA = <<~LUA.freeze
         if redis.call('EXISTS', KEYS[1]) == 0 then return {0, 'not_found'} end
         local status = redis.call('HGET', KEYS[1], 'status')
@@ -198,28 +282,54 @@ module KafkaBatch
         if total > 0 then
           redis.call('SETBIT', KEYS[5], total, 0)
           redis.call('EXPIRE', KEYS[5], tonumber(ARGV[2]))
+          redis.call('SETBIT', KEYS[6], total, 0)
+          redis.call('EXPIRE', KEYS[6], tonumber(ARGV[2]))
+          redis.call('SETBIT', KEYS[7], total, 0)
+          redis.call('EXPIRE', KEYS[7], tonumber(ARGV[2]))
         end
 
         if status == 'running' then
           local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))      or 0
+          local touched   = tonumber(redis.call('HGET', KEYS[1], 'touched_count'))   or 0
           local completed = tonumber(redis.call('HGET', KEYS[1], 'completed_count')) or 0
           local failed    = tonumber(redis.call('HGET', KEYS[1], 'failed_count'))    or 0
-          if (completed + failed) >= total then
-            local outcome = (failed > 0) and 'complete' or 'success'
-            redis.call('HSET', KEYS[1], 'status', outcome)
+          local fire_complete = 0
+          local fire_success = 0
+          local terminal = nil
+          -- Empty sealed batches are immediately successful (Sidekiq-style).
+          if total == 0 then
+            terminal = 'success'
+          elseif completed >= total then
+            terminal = 'success'
+          elseif (completed + failed) >= total then
+            terminal = 'complete'
+          end
+          if terminal then
+            redis.call('HSET', KEYS[1], 'status', terminal)
             redis.call('HSET', KEYS[1], 'finished_at', ARGV[1])
-            -- Bug #2: keep COUNTS_KEY in sync atomically with finalization.
             redis.call('HINCRBY', KEYS[2], 'running', -1)
-            redis.call('HINCRBY', KEYS[2], outcome, 1)
-            -- #7 fix: move the batch from RUNNING_INDEX to DONE_INDEX inside Lua
-            -- so a process crash between Lua return and the Ruby ZREM/ZADD can
-            -- never strand the id in RUNNING_INDEX or miss DONE_INDEX.
+            redis.call('HINCRBY', KEYS[2], terminal, 1)
             local batch_id = redis.call('HGET', KEYS[1], 'id')
             if batch_id then
               redis.call('ZREM', KEYS[3], batch_id)
               redis.call('ZADD', KEYS[4], tonumber(ARGV[3]), batch_id)
             end
-            return {1, outcome}
+            if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', ARGV[1]) == 1 then
+              redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
+              fire_complete = 1
+            end
+            if terminal == 'success' and redis.call('HSETNX', KEYS[1], 'success_callback_dispatched_at', ARGV[1]) == 1 then
+              fire_success = 1
+            end
+            if fire_success == 1 then return {1, 'success'} end
+            if fire_complete == 1 then return {1, terminal} end
+            return {1, terminal}
+          end
+          if touched >= total and total > 0 then
+            if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', ARGV[1]) == 1 then
+              redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
+              return {3, 'complete'}
+            end
           end
         end
         return {2, 'sealed'}
@@ -333,21 +443,21 @@ module KafkaBatch
       def record_completion_by_offset(batch_id:, job_id:, source_topic:, source_partition:, source_offset:, status:, batch_seq:)
         return { status: :invalid } if batch_seq.nil? || batch_seq.to_i <= 0
 
-        field = status == "success" ? "completed_count" : "failed_count"
-        now   = Time.now.utc.iso8601
+        op  = completion_op(status)
+        now = Time.now.utc.iso8601
 
         result = with_redis do |r|
           r.eval(BATCH_DONE_JOB_LUA,
             keys: completion_lua_keys(batch_id),
-            argv: completion_lua_argv(batch_seq: batch_seq, field: field, now: now)
+            argv: completion_lua_argv(batch_seq: batch_seq, op: op, now: now)
           )
         end
 
         code, payload = result
         case code
         when 0 then { status: payload.to_sym } # :duplicate, :not_found, :invalid
-        when 1
-          { status: :done, outcome: payload, batch: find_batch(batch_id) }
+        when 1, 3
+          { status: :done, outcome: payload, batch: find_batch(batch_id), early: code == 3 }
         when 2 then { status: :continue }
         end
       end
@@ -355,10 +465,11 @@ module KafkaBatch
       # Batched counter application for a whole Kafka poll. Reuses the proven
       # per-event Lua (atomic dedup + increment + finalize) but pipelines all the
       # events in one network round-trip. Each event is still exactly-once via
-      # batch_seq bitmap (O(1) per event), so nothing is double-counted.
+      # bitmaps (O(1) per event), so nothing is double-counted.
       #
       # @return [Hash]
-      #   :finished [Array<Hash>] { batch:, outcome: } for batches that just finished
+      #   :finished [Array<Hash>] { batch:, outcome:, early: } for batches that
+      #     just need callbacks (code 1 terminal, or code 3 early on_complete)
       #   :replays  [Array<String>] batch_ids whose events were DEDUPED (Lua
       #     returned 'duplicate') — the only batches that can be already-finalized
       #     with an undispatched callback on a redelivery. In steady state (first
@@ -371,25 +482,23 @@ module KafkaBatch
         results = with_redis do |r|
           r.pipelined do |pipe|
             events.each do |e|
-              field = e[:status] == "success" ? "completed_count" : "failed_count"
               pipe.eval(BATCH_DONE_JOB_LUA,
                 keys: completion_lua_keys(e[:batch_id]),
                 argv: completion_lua_argv(
-                  batch_seq: e[:batch_seq], field: field,
+                  batch_seq: e[:batch_seq], op: completion_op(e[:status]),
                   now: now, now_float: now_float
                 ))
             end
           end
         end
 
-        # One pass over the results: code 1 = just finalized (needs a callback),
-        # code 0 + 'duplicate' = replayed event (candidate for inline callback
-        # re-fire). code 2 = still counting → nothing to do.
+        # code 1 = terminal callback fire; code 3 = early on_complete;
+        # code 0 + 'duplicate' = replayed event; code 2 = still counting.
         finalized_indices = []
         replays           = []
         results.each_with_index do |res, i|
           case res[0]
-          when 1 then finalized_indices << i
+          when 1, 3 then finalized_indices << i
           when 0 then replays << events[i][:batch_id] if res[1] == "duplicate"
           end
         end
@@ -406,9 +515,9 @@ module KafkaBatch
         end
 
         finished = finalized_indices.each_with_index.map do |idx, j|
-          _code, payload = results[idx]
+          code, payload = results[idx]
           h = batch_hashes[j]
-          { batch: (h && !h.empty? ? hash_to_batch(h) : nil), outcome: payload }
+          { batch: (h && !h.empty? ? hash_to_batch(h) : nil), outcome: payload, early: code == 3 }
         end.compact
 
         { finished: finished, replays: replays }
@@ -437,32 +546,30 @@ module KafkaBatch
         now_iso = now.iso8601
         now_f   = now.to_f.to_s
         result = with_redis do |r|
-          # Bug #2: KEYS[2]=COUNTS_KEY keeps status counters in sync.
-          # #7 fix: KEYS[3]=RUNNING_INDEX, KEYS[4]=DONE_INDEX so the index move
-          # happens atomically inside Lua — no split-brain if the process crashes
-          # between the Lua return and the former Ruby-side ZREM/ZADD.
           r.eval(SEAL_BATCH_LUA,
-            keys: [batch_key(id), COUNTS_KEY, RUNNING_INDEX, DONE_INDEX, bitmap_key(id)],
+            keys: [batch_key(id), COUNTS_KEY, RUNNING_INDEX, DONE_INDEX,
+                   bitmap_key(id), ok_bitmap_key(id), fail_bitmap_key(id)],
             argv: [now_iso, @ttl.to_s, now_f]
           )
         end
         code, payload = result
         case code
         when 0 then { status: :not_found }
-        when 1 then { status: :done, outcome: payload, batch: find_batch(id) }
+        when 1, 3 then { status: :done, outcome: payload, batch: find_batch(id), early: code == 3 }
         when 2 then { status: :sealed }
         end
       end
 
-      def claim_callback(id, dispatched_by = nil)
+      def claim_callback(id, dispatched_by = nil, kind = nil)
         now = Time.now.utc.iso8601
+        k = kind.nil? || kind.to_s.empty? ? "any" : kind.to_s
         # #8 fix: KEYS[2]=DONE_INDEX and ARGV[3]=id so the ZREM happens inside
         # the Lua script atomically with the HSETNX claim, preventing a crash
         # between the two from leaving the batch stranded in DONE_INDEX.
         result = with_redis do |r|
           r.eval(CLAIM_CALLBACK_LUA,
             keys: [batch_key(id), DONE_INDEX],
-            argv: [now, dispatched_by.to_s, id]
+            argv: [now, dispatched_by.to_s, id, k]
           )
         end
         result == 1
@@ -620,13 +727,14 @@ module KafkaBatch
 
         rows = with_redis do |r|
           r.pipelined do |p|
-            ids.each { |id| p.hmget(batch_key(id), "status", "total_jobs", "completed_count", "failed_count") }
+            # Running pending = jobs not yet first-touched (Sidekiq-style).
+            ids.each { |id| p.hmget(batch_key(id), "status", "total_jobs", "touched_count") }
           end
         end
 
         rows.sum do |h|
           next 0 if h[0].nil? || h[0] != "running"
-          [h[1].to_i - h[2].to_i - h[3].to_i, 0].max
+          [h[1].to_i - h[2].to_i, 0].max
         end
       end
 
@@ -756,8 +864,10 @@ module KafkaBatch
             to_prune << id  # expired – prune
           else
             batch = hash_to_batch(h)
-            if !batch[:callback_dispatched_at].nil?
-              to_prune << id  # already dispatched – prune
+            claimed = !batch[:callback_dispatched_at].nil? ||
+                      !batch[:complete_callback_dispatched_at].nil?
+            if claimed
+              to_prune << id  # already claimed (Lua or Dispatcher) – prune
             elsif !%w[success complete].include?(batch[:status])
               to_prune << id  # not actually done – prune
             else
@@ -777,7 +887,8 @@ module KafkaBatch
         with_redis do |r|
           # Bug #2: decrement COUNTS_KEY before erasing the batch hash.
           st = r.hget(batch_key(id), "status")
-          r.del(batch_key(id), failures_key(id), bitmap_key(id), seq_key(id))
+          r.del(batch_key(id), failures_key(id), bitmap_key(id),
+                ok_bitmap_key(id), fail_bitmap_key(id), seq_key(id))
           r.zrem(RUNNING_INDEX, id)
           r.zrem(DONE_INDEX, id)
           r.zrem(ALL_INDEX, id)
@@ -838,6 +949,14 @@ module KafkaBatch
         "#{KEY_PREFIX}:bitmap:#{batch_id}"
       end
 
+      def ok_bitmap_key(batch_id)
+        "#{KEY_PREFIX}:okbit:#{batch_id}"
+      end
+
+      def fail_bitmap_key(batch_id)
+        "#{KEY_PREFIX}:failbit:#{batch_id}"
+      end
+
       def seq_key(batch_id)
         "#{KEY_PREFIX}:seq:#{batch_id}"
       end
@@ -853,11 +972,20 @@ module KafkaBatch
 
       def completion_lua_keys(batch_id)
         [batch_key(batch_id), bitmap_key(batch_id),
-         RUNNING_INDEX, DONE_INDEX, COUNTS_KEY]
+         RUNNING_INDEX, DONE_INDEX, COUNTS_KEY,
+         ok_bitmap_key(batch_id), fail_bitmap_key(batch_id)]
       end
 
-      def completion_lua_argv(batch_seq:, field:, now:, now_float: nil)
-        [batch_seq.to_i.to_s, field, @ttl.to_s, now, (now_float || Time.now.to_f.to_s)]
+      def completion_op(status)
+        case status.to_s
+        when "success"  then "success"
+        when "executed" then "executed"
+        else "failed"
+        end
+      end
+
+      def completion_lua_argv(batch_seq:, op:, now:, now_float: nil)
+        [batch_seq.to_i.to_s, op, @ttl.to_s, now, (now_float || Time.now.to_f.to_s)]
       end
 
       # Legacy per-topic offset keys (pre-bitmap). Retained for reference only.
@@ -910,6 +1038,7 @@ module KafkaBatch
           total_jobs:             h["total_jobs"].to_i,
           completed_count:        h["completed_count"].to_i,
           failed_count:           h["failed_count"].to_i,
+          touched_count:          h["touched_count"].to_i,
           status:                 h["status"],
           on_success:             presence(h["on_success"]),
           on_complete:            presence(h["on_complete"]),
@@ -921,6 +1050,8 @@ module KafkaBatch
           finished_at:            h["finished_at"],
           callback_dispatched_at: presence(h["callback_dispatched_at"]),
           callback_dispatched_by: presence(h["callback_dispatched_by"]),
+          complete_callback_dispatched_at: presence(h["complete_callback_dispatched_at"]),
+          success_callback_dispatched_at:  presence(h["success_callback_dispatched_at"]),
           locked_at:              presence(h["locked_at"])
         }
       end

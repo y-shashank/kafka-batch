@@ -30,6 +30,22 @@ RSpec.describe KafkaBatch::Liveness do
       expect(consumers.first["pid"]).to eq(Process.pid)
     end
 
+    it "refreshes heartbeats from the background loop" do
+      KafkaBatch.config.liveness_heartbeat_interval = 1
+      described_class.heartbeat(topic: "loop.topic")
+      key = "kafka_batch:live:consumer:#{described_class.consumer_id}"
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      ttl_before = redis.ttl(key)
+      described_class.start_heartbeat_loop!
+      sleep 1.5
+      described_class.stop_heartbeat_loop!
+      ttl_after = redis.ttl(key)
+      expect(ttl_after).to be > 0
+      expect(ttl_after).to be >= ttl_before - 2
+      consumers = described_class.consumers
+      expect(consumers.first["topic"]).to eq("loop.topic")
+    end
+
     it "no-ops job tracking when track_running_jobs is false" do
       KafkaBatch.config.track_running_jobs = false
       described_class.job_started(job_id: "j9", batch_id: "b1", worker_class: "W")

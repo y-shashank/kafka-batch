@@ -68,7 +68,7 @@ RSpec.describe KafkaBatch::Consumers::PriorityJobConsumer do
 
     it "rank 1 pauses at the batch offset and skips processing when higher topics have lag" do
       inst = build_consumer(klass)
-      msg  = instance_double("Karafka::Messages::Message", offset: 42)
+      msg  = instance_double("Karafka::Messages::Message", offset: 42, raw_payload: nil)
       allow(inst).to receive(:messages).and_return([msg])
       allow(inst).to receive(:higher_topics_have_lag?).and_return(true)
       expect(inst).to receive(:pause).with(42, 2_000)
@@ -78,7 +78,8 @@ RSpec.describe KafkaBatch::Consumers::PriorityJobConsumer do
 
     it "rank 1 processes when higher topics have no lag" do
       inst = build_consumer(klass)
-      msg  = instance_double("Karafka::Messages::Message")
+      # raw_payload nil → SuperFetch sync path (no job_id) → process_message
+      msg  = instance_double("Karafka::Messages::Message", raw_payload: nil)
       allow(inst).to receive(:messages).and_return([msg])
       allow(inst).to receive(:higher_topics_have_lag?).and_return(false)
       expect(inst).not_to receive(:pause)
@@ -87,7 +88,7 @@ RSpec.describe KafkaBatch::Consumers::PriorityJobConsumer do
     end
     it "rank 1 processes when a higher topic is topic-paused via /lag" do
       inst = build_consumer(klass)
-      msg  = instance_double("Karafka::Messages::Message")
+      msg  = instance_double("Karafka::Messages::Message", raw_payload: nil)
       allow(inst).to receive(:messages).and_return([msg])
       allow(KafkaBatch::ConsumptionControl).to receive(:topic_level_paused?)
         .with(group: spec[:consumer_group], topic: "kafka_batch.jobs.p0").and_return(true)
@@ -101,7 +102,7 @@ RSpec.describe KafkaBatch::Consumers::PriorityJobConsumer do
     # per-message loop must live in #process_messages, not override #consume).
     it "honors its own /lag pause (does not bypass the ConsumptionGate)" do
       inst  = build_consumer(klass)
-      msg   = instance_double("Karafka::Messages::Message", offset: 7)
+      msg   = instance_double("Karafka::Messages::Message", offset: 7, raw_payload: nil)
       group = instance_double("Karafka::Routing::ConsumerGroup", id: spec[:consumer_group])
       topic = instance_double("Karafka::Routing::Topic", name: spec[:topic], consumer_group: group)
       allow(inst).to receive(:messages).and_return([msg])
@@ -125,8 +126,8 @@ RSpec.describe KafkaBatch::Consumers::PriorityJobConsumer do
 
     it "seeks to the current message, not the batch head" do
       inst = build_consumer(klass)
-      m0   = instance_double("Karafka::Messages::Message", offset: 100)
-      m1   = instance_double("Karafka::Messages::Message", offset: 101)
+      m0   = instance_double("Karafka::Messages::Message", offset: 100, raw_payload: nil)
+      m1   = instance_double("Karafka::Messages::Message", offset: 101, raw_payload: nil)
       allow(inst).to receive(:messages).and_return([m0, m1])
       # Process m0, then yield on m1.
       allow(inst).to receive(:should_yield_to_higher?).and_return(false, true)

@@ -40,7 +40,7 @@ module KafkaBatch
             yield_for_priority(spec, message)
             return
           end
-          process_message(message)
+          KafkaBatch::SuperFetch.executor.dispatch_one(self, message)
         end
       end
 

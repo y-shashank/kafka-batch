@@ -238,7 +238,8 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
 
     it "#done_batches_without_callback finds finished, unclaimed batches" do
       id = new_batch(total: 1)
-      complete(batch_id: id, seq: 1, status: "success")
+      # mark_finished does not claim callbacks (unlike completion Lua).
+      store.mark_finished(id, "success")
 
       lost = store.done_batches_without_callback(older_than: Time.now + 60)
       expect(lost.map { |b| b[:id] }).to include(id)

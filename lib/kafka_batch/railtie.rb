@@ -64,11 +64,37 @@ module KafkaBatch
           rescue => e
             KafkaBatch.logger.warn("[KafkaBatch] schedule poller start skipped: #{e.message}")
           end
+
+          # Dedicated heartbeat loop (default every 20s, TTL 180s) so CPU-heavy
+          # jobs that starve the consume path cannot look dead to reclaim/health.
+          begin
+            KafkaBatch::Liveness.start_heartbeat_loop!
+          rescue => e
+            KafkaBatch.logger.warn("[KafkaBatch] liveness heartbeat loop start skipped: #{e.message}")
+          end
+
+          # SuperFetch orphan reclaim (parity with Go kbatch daemon). NX-locked
+          # so multiple control/execution replicas can safely share the loop.
+          begin
+            KafkaBatch::Workset::ReclaimScheduler.ensure_running! if defined?(KafkaBatch::Workset::ReclaimScheduler)
+          rescue => e
+            KafkaBatch.logger.warn("[KafkaBatch] workset reclaim start skipped: #{e.message}")
+          end
         end
 
         Karafka::App.monitor.subscribe("app.stopped") do
+          # Drain SuperFetch pool before tearing down producer/heartbeats so
+          # in-flight #perform can Complete (or stay in the workset for reclaim).
+          begin
+            KafkaBatch::SuperFetch.drain(timeout: 30) if defined?(KafkaBatch::SuperFetch)
+          rescue => e
+            KafkaBatch.logger.warn("[KafkaBatch] SuperFetch drain: #{e.message}")
+          end
+
           # Stop the background threads (if this process ran them) before closing
           # the producer, so no in-flight work is cut off mid-produce.
+          KafkaBatch::Workset::ReclaimScheduler.stop! if defined?(KafkaBatch::Workset::ReclaimScheduler)
+          KafkaBatch::Liveness.stop_heartbeat_loop! if defined?(KafkaBatch::Liveness)
           KafkaBatch::Fairness::Forwarder.stop! if defined?(KafkaBatch::Fairness::Forwarder)
           KafkaBatch::SchedulePoller.stop!       if defined?(KafkaBatch::SchedulePoller)
           KafkaBatch::Producer.reset!            if defined?(KafkaBatch::Producer)

@@ -58,7 +58,7 @@ RSpec.describe KafkaBatch::Callbacks::Dispatcher do
       expect(payload["payload"]["callback_args"]).to eq("run_id" => "99")
       expect(payload["payload"]).not_to have_key("meta")
       expect(FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)).to be_empty
-      expect(KafkaBatch.store).to have_received(:claim_callback).with(batch_id, KafkaBatch.node_id)
+      expect(KafkaBatch.store).to have_received(:claim_callback).with(batch_id, KafkaBatch.node_id, "success")
     end
 
     it "skips job enqueue when the claim is already taken" do
@@ -71,6 +71,28 @@ RSpec.describe KafkaBatch::Callbacks::Dispatcher do
 
       expect(mode).to eq(:none)
       expect(FakeProducer.for_topic("segment.exports.callbacks")).to be_empty
+    end
+
+    it "skips claim when preclaimed and fires success_only as on_success only" do
+      batch[:on_success] = KafkaBatch::Callback.dump(
+        KafkaBatch::Callback.job("segment.export.on_success", topic: "segment.exports.callbacks")
+      )
+      batch[:on_complete] = KafkaBatch::Callback.dump(
+        KafkaBatch::Callback.job("segment.export.on_complete", topic: "segment.exports.callbacks")
+      )
+      definition = KafkaBatch::HandlerDefinition.new(
+        job_type: "segment.export.on_complete",
+        runtime:  :go,
+        topic:    "segment.exports.callbacks"
+      )
+      KafkaBatch::HandlerRegistry.register_definition(definition)
+
+      mode = described_class.dispatch!(batch: batch, outcome: "success_only", preclaimed: true)
+
+      expect(mode).to eq(:job_only)
+      expect(KafkaBatch.store).not_to have_received(:claim_callback)
+      produced = FakeProducer.for_topic("segment.exports.callbacks")
+      expect(produced.map { |m| m.payload["job_id"] }).to eq(["#{batch_id}:on_success"])
     end
 
     it "enqueues on_complete with a distinct job_id" do
@@ -88,6 +110,7 @@ RSpec.describe KafkaBatch::Callbacks::Dispatcher do
 
       produced = FakeProducer.for_topic("segment.exports.callbacks")
       expect(produced.map { |m| m.payload["job_id"] }).to eq(["#{batch_id}:on_complete"])
+      expect(KafkaBatch.store).to have_received(:claim_callback).with(batch_id, KafkaBatch.node_id, "complete")
     end
   end
 

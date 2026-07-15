@@ -22,6 +22,11 @@ module KafkaBatch
   # config.liveness_stats_interval seconds (default 15s) and piggyback on the
   # existing Redis heartbeat key — no extra round-trips.
   #
+  # A background thread refreshes the consumer heartbeat every
+  # config.liveness_heartbeat_interval seconds (default 20) so CPU-heavy
+  # #perform work that starves the poll path cannot miss enough cycles for the
+  # Redis key (default TTL 180s ≈ 9 intervals) to expire.
+  #
   # All entry points (job_started/job_finished/heartbeat) are best-effort and
   # never raise into the job hot path.
   module Liveness
@@ -62,7 +67,44 @@ module KafkaBatch
 
       def heartbeat(topic: nil)
         return unless backend == :redis
-        redis_heartbeat(topic: topic)
+        remember_topic(topic)
+        redis_heartbeat(topic: last_topic)
+      end
+
+      # Start the fixed-interval Redis heartbeat thread (idempotent).
+      def start_heartbeat_loop!
+        return unless backend == :redis
+        @heartbeat_mutex ||= Mutex.new
+        @heartbeat_mutex.synchronize do
+          return if @heartbeat_thread&.alive?
+
+          @heartbeat_stop = false
+          interval = KafkaBatch.config.liveness_heartbeat_interval.to_f
+          interval = 20.0 if interval <= 0
+          heartbeat(topic: last_topic)
+          @heartbeat_thread = Thread.new do
+            Thread.current.name = "kafka-batch-liveness-heartbeat" if Thread.current.respond_to?(:name=)
+            until @heartbeat_stop
+              sleep(interval)
+              break if @heartbeat_stop
+              begin
+                heartbeat(topic: last_topic)
+              rescue StandardError => e
+                KafkaBatch.logger.debug("[KafkaBatch::Liveness] heartbeat loop: #{e.message}")
+              end
+            end
+          end
+        end
+      end
+
+      def stop_heartbeat_loop!
+        @heartbeat_mutex ||= Mutex.new
+        @heartbeat_mutex.synchronize do
+          @heartbeat_stop = true
+          thr = @heartbeat_thread
+          @heartbeat_thread = nil
+          thr&.join(2)
+        end
       end
 
       def running_jobs(limit: 500)
@@ -76,12 +118,15 @@ module KafkaBatch
       end
 
       def reset!
+        stop_heartbeat_loop!
         @pool&.shutdown(&:close) rescue nil
         @pool = nil
         @circuit_open_until = nil
         @stats_mutex = nil
         @stats_cache = nil
         @stats_sampled_at = nil
+        @last_topic = nil
+        @heartbeat_mutex = nil
         ProcessStats.reset!
       end
 
@@ -107,6 +152,15 @@ module KafkaBatch
 
       def redis_job_finished(job_id)
         redis_with { |r| r.del("#{JOB_PREFIX}#{consumer_id}:#{job_id}") }
+      end
+
+      def remember_topic(topic)
+        return if topic.nil? || topic.to_s.empty?
+        @last_topic = topic.to_s
+      end
+
+      def last_topic
+        @last_topic
       end
 
       def redis_heartbeat(topic:)

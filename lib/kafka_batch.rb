@@ -33,6 +33,8 @@ require_relative "kafka_batch/callback"
 require_relative "kafka_batch/callbacks/dispatcher"
 require_relative "kafka_batch/schedule_poller"
 require_relative "kafka_batch/reconciler"
+require_relative "kafka_batch/workset"
+require_relative "kafka_batch/super_fetch"
 require_relative "kafka_batch/consumers/job_consumer"
 require_relative "kafka_batch/consumers/priority_gate"
 require_relative "kafka_batch/priority/config"
@@ -339,6 +341,9 @@ module KafkaBatch
       Producer.reset!
       CancellationCache.reset!
       Liveness.reset!
+      SuperFetch.reset! if defined?(SuperFetch)
+      Workset::ReclaimScheduler.reset! if defined?(Workset::ReclaimScheduler)
+      Workset.reset! if defined?(Workset)
       Uniqueness.reset! if defined?(Uniqueness)
       ConsumptionControl.reset!
       Fairness::TenantPartitions.reset! if defined?(Fairness::TenantPartitions)

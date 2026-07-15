@@ -157,10 +157,15 @@ KafkaBatch.configure do |config|
   # ── Other settings (sensible defaults; uncomment to tune) ─────────────────────
   # config.consumer_group          = "kafka-batch"   # overrides the prefix-derived name
   # config.liveness_backend        = :redis          # or :off
+  # config.liveness_ttl                 = 180             # seconds; Redis TTL on live:consumer:* heartbeats
+  #                                                       # (env: KAFKA_BATCH_LIVENESS_TTL). Pod considered
+  #                                                       # dead once the key expires without refresh.
+  # config.liveness_heartbeat_interval  = 20              # seconds between background heartbeat refreshes
+  #                                                       # (env: KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL).
+  #                                                       # Default 180/20 ≈ 9 missed cycles before dead.
   # config.track_running_jobs      = true            # default; set false at high throughput
   #                                                  # (heartbeats still work; skips per-job /live writes)
   # config.liveness_stats_interval = 15              # RSS/CPU sample period for /live (0 = off)
-  # config.complete_after_retries  = 3               # count a job toward its batch after N retries
   # config.reconciliation_interval = 300             # seconds between stuck-batch sweeps
   # config.max_failures_per_batch  = 1000            # 0 = unlimited (dashboard failure log)
   # config.producer_config = { "compression.type" => "snappy" }

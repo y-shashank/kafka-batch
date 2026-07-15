@@ -155,6 +155,24 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
     it "is a no-op for an empty list" do
       expect(store.record_completions_batch([])).to eq(finished: [], replays: [])
     end
+
+    it "touches on executed then counts success toward on_success (success_only)" do
+      id = new_batch(total: 1, on_complete: "C", on_success: "S")
+      early = complete(batch_id: id, seq: 1, status: "executed")
+      b = store.find_batch(id)
+      expect(b[:touched_count]).to eq(1)
+      expect(b[:completed_count]).to eq(0)
+      expect(b[:status]).to eq("running")
+      expect(early[:status]).to eq(:done)
+      expect(early[:outcome]).to eq("complete")
+      expect(early[:early]).to eq(true)
+
+      later = complete(batch_id: id, seq: 1, status: "success")
+      b = store.find_batch(id)
+      expect(b[:completed_count]).to eq(1)
+      expect(b[:status]).to eq("success")
+      expect(later[:outcome]).to eq("success_only")
+    end
   end
 
   describe "failure metadata bounds" do
@@ -219,10 +237,14 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
       expect(r[:status]).to eq(:done)
     end
 
-    it "moves the batch into the done index on completion" do
+    it "moves the batch into the done index on completion and claims callbacks in Lua" do
       id = new_batch(total: 1)
       complete(batch_id: id, seq: 1)
-      expect(store.done_batches_without_callback(older_than: Time.now + 60).map { |b| b[:id] }).to include(id)
+      b = store.find_batch(id)
+      expect(b[:status]).to eq("success")
+      expect(b[:complete_callback_dispatched_at]).not_to be_nil
+      # Lua HSETNX claims on finalize — reconciler must not treat as lost.
+      expect(store.done_batches_without_callback(older_than: Time.now + 60).map { |x| x[:id] }).not_to include(id)
     end
 
     it "rejects completions without batch_seq" do
@@ -276,7 +298,8 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
 
     it "#done_batches_without_callback finds finished, unclaimed batches and prunes after claim" do
       id = new_batch(total: 1)
-      complete(batch_id: id, seq: 1)
+      # mark_finished does not claim callbacks (unlike completion Lua).
+      store.mark_finished(id, "success")
 
       lost = store.done_batches_without_callback(older_than: Time.now + 60)
       expect(lost.map { |b| b[:id] }).to include(id)

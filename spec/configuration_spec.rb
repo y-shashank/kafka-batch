@@ -11,7 +11,6 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.retry_topic).to eq("kafka_batch.jobs.retry")
       expect(config.max_retries).to eq(7)
       expect(config.retry_jitter).to eq(0.1)
-      expect(config.complete_after_retries).to eq(7)
     end
 
     it "ships tiered retry delays (short/medium/large)" do
@@ -74,6 +73,15 @@ RSpec.describe KafkaBatch::Configuration do
 
     it "disables the schedule poller by default" do
       expect(config.schedule_poller_enabled).to eq(false)
+    end
+
+    it "ships SuperFetch concurrency + reclaim defaults (always on)" do
+      expect(config.super_fetch_concurrency).to eq(32)
+      expect(config.super_fetch_lease_ttl).to eq(120)
+      expect(config.super_fetch_orphan_grace).to eq(40)
+      expect(config.super_fetch_reclaim_enabled).to eq(true)
+      expect(config.super_fetch_reclaim_interval).to eq(30)
+      expect(config.super_fetch_reclaim_limit).to eq(100)
     end
 
     it "bounds failure-metadata retention separately from batch_ttl" do
@@ -143,6 +151,8 @@ RSpec.describe KafkaBatch::Configuration do
 
     it "defaults liveness_backend to :redis" do
       expect(config.liveness_backend).to eq(:redis)
+      expect(config.liveness_ttl).to eq(180)
+      expect(config.liveness_heartbeat_interval).to eq(20)
       expect(config.liveness_stats_interval).to eq(15)
     end
 

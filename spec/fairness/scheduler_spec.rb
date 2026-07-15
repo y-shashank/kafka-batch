@@ -390,6 +390,13 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       expect(scheduler.claim_slot_execution!("slot-x")).to be(true)
       expect(scheduler.claim_slot_execution!("slot-x")).to be(false)
     end
+
+    it "clear_slot_execution! allows a SuperFetch reclaim to re-claim" do
+      expect(scheduler.claim_slot_execution!("slot-r")).to be(true)
+      expect(scheduler.claim_slot_execution!("slot-r")).to be(false)
+      scheduler.clear_slot_execution!("slot-r")
+      expect(scheduler.claim_slot_execution!("slot-r")).to be(true)
+    end
   end
 
   describe "#stats" do

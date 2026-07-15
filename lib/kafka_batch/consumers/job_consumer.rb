@@ -40,11 +40,22 @@ module KafkaBatch
       # prepended ConsumptionGate (heartbeat + /lag pause) always wraps the work:
       # subclasses (e.g. PriorityJobConsumer) override THIS, not #consume, so they
       # can never bypass the gate by forgetting to call `super`.
+      #
+      # SuperFetch: Claim → mark_as_consumed! → thread-pool #perform so one
+      # partition can run many concurrent jobs (see KafkaBatch::SuperFetch).
       def process_messages
-        messages.each { |msg| process_message(msg) }
+        KafkaBatch::SuperFetch.executor.dispatch(self, messages)
       end
 
       private
+
+      # Under SuperFetch the listener already marked the offset after Claim;
+      # pool threads must not call mark_as_consumed! again.
+      def commit_offset!(message)
+        return if Thread.current[:kafka_batch_sf_acked]
+
+        mark_as_consumed!(message)
+      end
 
       # Wraps the per-message pipeline in a last-resort backstop for the ONE gap
       # the inner pipeline can't cover: a worker (or other code) that raises a
@@ -82,7 +93,7 @@ module KafkaBatch
             error: e,
             topic: message.topic
           )
-          mark_as_consumed!(message)
+          commit_offset!(message)
           return
         end
 
@@ -116,12 +127,17 @@ module KafkaBatch
         # or is skipped (cancelled). In :time_fairness mode complete also advances
         # the tenant's virtual time by (duration / weight). Retried messages have
         # the marker stripped (see schedule_retry), so they never double-release.
-        if fair_slot && fair_slot_id && !claim_fair_slot_execution!(fair_type, fair_slot_id)
-          KafkaBatch.logger.info(
-            "[KafkaBatch][JobConsumer] duplicate fair-slot delivery – skipping job_id=#{job_id}"
-          )
-          mark_as_consumed!(message)
-          return
+        if fair_slot && fair_slot_id
+          # SuperFetch reclaim re-delivers the same _fair_slot_id; clear dedup first
+          # so #perform can run again (same as Go ClearSlotExecution).
+          clear_fair_slot_execution!(fair_type, fair_slot_id) if data["_reclaim"]
+          unless claim_fair_slot_execution!(fair_type, fair_slot_id)
+            KafkaBatch.logger.info(
+              "[KafkaBatch][JobConsumer] duplicate fair-slot delivery – skipping job_id=#{job_id}"
+            )
+            commit_offset!(message)
+            return
+          end
         end
 
         # Everything below runs inside begin/ensure so the fair-lane in-flight
@@ -149,7 +165,7 @@ module KafkaBatch
             record_failure(batch_id, job_id, data["worker_class"], e)
             publish_to_dlt(data: data, error: e, topic: message.topic)
             release_uniq_lock(data)
-            mark_as_consumed!(message)
+            commit_offset!(message)
             return
           end
 
@@ -163,9 +179,8 @@ module KafkaBatch
 
         attempt        = data["attempt"].to_i
         max_retries    = data.fetch("max_retries", KafkaBatch.config.max_retries).to_i
-        complete_after = data.fetch("complete_after_retries", KafkaBatch.config.complete_after_retries).to_i
-        # Whether this job has already been counted toward its batch early (rides
-        # the retry message so a job is counted at most once).
+        # Whether this job already emitted an "executed" touch (rides the retry
+        # message so we do not re-emit executed on every retry).
         batch_counted  = data["batch_counted"] ? true : false
 
         KafkaBatch.logger.debug(
@@ -187,7 +202,7 @@ module KafkaBatch
             worker_class: worker_name
           )
           release_uniq_lock(data)
-          mark_as_consumed!(message)
+          commit_offset!(message)
           return
         end
 
@@ -211,16 +226,15 @@ module KafkaBatch
             handler.executor.call(context)
           rescue StandardError => e
             handle_failure(
-              message:                message,
-              data:                   data,
-              error:                  e,
-              job_id:                 job_id,
-              batch_id:               batch_id,
-              worker_class:           worker_name,
-              attempt:                attempt,
-              max_retries:            max_retries,
-              complete_after_retries: complete_after,
-              batch_counted:          batch_counted
+              message:       message,
+              data:          data,
+              error:         e,
+              job_id:        job_id,
+              batch_id:      batch_id,
+              worker_class:  worker_name,
+              attempt:       attempt,
+              max_retries:   max_retries,
+              batch_counted: batch_counted
             )
             return  # offset committed inside handle_failure
           end
@@ -235,18 +249,15 @@ module KafkaBatch
           # raise so the offset is NOT committed → Karafka redelivers the
           # message → worker runs again (idempotency required) → tries again.
           #
-          # If the job was already counted toward the batch early (after
-          # complete_after_retries), skip the success event so it isn't counted
-          # twice — the batch already advanced. The work still ran.
-          unless batch_counted
-            emit_event_with_retry(
-              batch_id:     batch_id,
-              job_id:       job_id,
-              status:       "success",
-              worker_class: worker_name,
-              message:      message
-            )
-          end
+          # Always emit success so a prior executed-touch can still count
+          # toward on_success (Sidekiq-style).
+          emit_event_with_retry(
+            batch_id:     batch_id,
+            job_id:       job_id,
+            status:       "success",
+            worker_class: worker_name,
+            message:      message
+          )
 
           duration = Time.now - started_at
           KafkaBatch::Instrumentation.job_processed(
@@ -257,7 +268,7 @@ module KafkaBatch
           )
 
           release_uniq_lock(data)
-          mark_as_consumed!(message)
+          commit_offset!(message)
         ensure
           stop_fair_lease_renewal(fair_renewer)
           KafkaBatch::Liveness.job_finished(job_id)
@@ -324,11 +335,18 @@ module KafkaBatch
         sched.claim_slot_execution!(slot_id)
       end
 
+      def clear_fair_slot_execution!(type, slot_id)
+        sched = KafkaBatch.scheduler(type)
+        return unless sched
+
+        sched.clear_slot_execution!(slot_id)
+      end
+
       # ── Failure handling ─────────────────────────────────────────────────
 
       def handle_failure(message:, data:, error:, job_id:, batch_id:,
                          worker_class:, attempt:, max_retries:,
-                         complete_after_retries:, batch_counted:)
+                         batch_counted:)
         KafkaBatch.logger.error(
           "[KafkaBatch][JobConsumer] job_id=#{job_id} attempt=#{attempt} " \
           "#{error.class}: #{error.message}"
@@ -348,23 +366,21 @@ module KafkaBatch
           record_failure(batch_id, job_id, worker_class, error,
                          attempt: attempt, status: "retrying", next_retry_at: retry_after)
 
-          # Early batch completion: once a still-failing job has retried
-          # complete_after_retries times, count it toward the batch (as failed)
-          # so on_complete needn't wait for the full retry budget. It keeps
-          # retrying; the batch_counted flag rides the retry message so it is
-          # counted exactly once.
-          if batch_id && !batch_counted && attempt >= complete_after_retries
+          # Sidekiq-style: first finish touches the batch for on_complete; job
+          # keeps retrying. batch_counted rides the retry message so "executed"
+          # is emitted at most once.
+          if batch_id && !batch_counted
             emit_event_with_retry(
               batch_id:     batch_id,
               job_id:       job_id,
-              status:       "failed",
+              status:       "executed",
               worker_class: worker_class,
               message:      message
             )
             batch_counted = true
             KafkaBatch.logger.info(
-              "[KafkaBatch][JobConsumer] job_id=#{job_id} counted toward batch after " \
-              "#{attempt} retries (still retrying up to #{max_retries})"
+              "[KafkaBatch][JobConsumer] job_id=#{job_id} touched batch " \
+              "(executed; still retrying up to #{max_retries})"
             )
           end
 
@@ -432,27 +448,25 @@ module KafkaBatch
           retry_after:  retry_after
         )
 
-        mark_as_consumed!(message)
+        commit_offset!(message)
       end
 
-      # Job has exhausted all retries.  Emit a failure event (so the batch
-      # counter is updated) and forward the raw message to the DLT.
+      # Job has exhausted all retries.  Emit a failure event (so failed_count
+      # increments — touch may already be set) and forward the raw message to the DLT.
       def exhaust_job(message:, data:, job_id:, batch_id:, worker_class:, error:, attempt: nil, batch_counted: false)
         KafkaBatch.logger.error(
           "[KafkaBatch][JobConsumer] job_id=#{job_id} exhausted retries – failing"
         )
 
-        # Skip the batch event if the job was already counted early
-        # (complete_after_retries < max_retries) — it's already in the tally.
-        unless batch_counted
-          emit_event_with_retry(
-            batch_id:     batch_id,
-            job_id:       job_id,
-            status:       "failed",
-            worker_class: worker_class,
-            message:      message
-          )
-        end
+        # Always emit failed so failed_count increments even after an earlier
+        # executed-touch (batch_counted only suppresses re-emitting executed).
+        emit_event_with_retry(
+          batch_id:     batch_id,
+          job_id:       job_id,
+          status:       "failed",
+          worker_class: worker_class,
+          message:      message
+        )
 
         KafkaBatch::Instrumentation.job_failed(
           job_id:       job_id,
@@ -471,7 +485,7 @@ module KafkaBatch
 
         publish_to_dlt(data: data, error: error, topic: message.topic)
         release_uniq_lock(data)
-        mark_as_consumed!(message)
+        commit_offset!(message)
       end
 
       def invoke_retries_exhausted(worker_class:, data:, error:, attempt:)
@@ -534,12 +548,20 @@ module KafkaBatch
             sleep(attempts * backoff) if backoff.positive?
             retry
           end
-          # All retries exhausted: re-raise so offset is NOT committed.
-          # Karafka will redeliver the original job message.
-          KafkaBatch.logger.error(
-            "[KafkaBatch][JobConsumer] Event emit failed after #{max_attempts} attempts – " \
-            "leaving offset uncommitted for redelivery (worker must be idempotent)"
-          )
+          # All retries exhausted: re-raise. Sync path leaves the Kafka offset
+          # uncommitted; SuperFetch (already acked) leaves the Redis workset for
+          # daemon reclaim. Handlers must be idempotent either way.
+          if Thread.current[:kafka_batch_sf_acked]
+            KafkaBatch.logger.error(
+              "[KafkaBatch][JobConsumer] Event emit failed after #{max_attempts} attempts – " \
+              "leaving SuperFetch workset for reclaim (worker must be idempotent)"
+            )
+          else
+            KafkaBatch.logger.error(
+              "[KafkaBatch][JobConsumer] Event emit failed after #{max_attempts} attempts – " \
+              "leaving offset uncommitted for redelivery (worker must be idempotent)"
+            )
+          end
           raise
         end
       end
@@ -599,9 +621,8 @@ module KafkaBatch
           "#{error.backtrace&.first(8)&.join("\n")}"
         )
 
-        # Advance the batch (as failed) so a poison job never wedges completion —
-        # unless it was already counted early (batch_counted rides the message).
-        if batch_id && !data["batch_counted"]
+        # Advance the batch (as failed) so a poison job never wedges completion.
+        if batch_id
           emit_event_with_retry(
             batch_id:     batch_id,
             job_id:       job_id,
@@ -614,7 +635,7 @@ module KafkaBatch
         record_failure(batch_id, job_id, data["worker_class"], error)
         publish_to_dlt(data: data, error: error, topic: message.topic)
         release_uniq_lock(data)
-        mark_as_consumed!(message)
+        commit_offset!(message)
       end
 
       # Best-effort decode for the poison-pill path: return the parsed envelope,

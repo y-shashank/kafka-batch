@@ -80,10 +80,30 @@ module KafkaBatch
     #   :off   – disabled.
     attr_accessor :liveness_backend            # Symbol – default :redis
     attr_accessor :track_running_jobs          # Boolean – default true (gates :redis per-job writes; set false at scale)
-    attr_accessor :liveness_ttl                # Integer – seconds; default 30 (staleness window)
+    # Redis EX TTL (seconds) for kafka_batch:live:consumer:* heartbeats — when the
+    # key expires the pod is treated as dead (/live + SuperFetch reclaim). Default 180
+    # (≈9×20s heartbeat interval). Env: KAFKA_BATCH_LIVENESS_TTL.
+    attr_accessor :liveness_ttl
+    # How often (seconds) the background loop refreshes the heartbeat key. Default 20.
+    # Env: KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL.
+    attr_accessor :liveness_heartbeat_interval # Integer – seconds; default 20
     # How often each consumer process re-samples its own RSS/CPU for /live.
     # 0 disables stats (heartbeats still update last_seen). Default 15s.
     attr_accessor :liveness_stats_interval     # Integer – seconds; default 15
+
+    # ── SuperFetch (in-partition job concurrency) ─────────────────────────────
+    # Always on: Claim → Kafka mark → thread-pool #perform. Size around
+    # pods × super_fetch_concurrency for IO-bound work (not only Karafka
+    # concurrency). Requires Go `kbatch daemon` reclaim + shared Redis.
+    attr_accessor :super_fetch_concurrency     # Integer – default 32
+    attr_accessor :super_fetch_lease_ttl       # Integer – seconds; default 120
+    # Steal/orphan grace after claim before a missing heartbeat is stealable.
+    # Align with Go daemon reclaim (default 40 ≈ 2× heartbeat interval).
+    attr_accessor :super_fetch_orphan_grace    # Integer – seconds; default 40
+    # Control-plane orphan reclaim (parity with Go kbatch daemon). Default on.
+    attr_accessor :super_fetch_reclaim_enabled # Boolean – default true
+    attr_accessor :super_fetch_reclaim_interval # Integer – seconds; default 30
+    attr_accessor :super_fetch_reclaim_limit   # Integer – per sweep; default 100
 
     # ── Job uniqueness (per-worker `uniq true`) ───────────────────────────────
     # Redis-backed dedup of worker_class + payload while a job is queued or in
@@ -112,14 +132,6 @@ module KafkaBatch
     # further in the future than this, the consumer pauses for this long and then
     # re-checks, so the partition is never suspended for an extreme duration.
     attr_accessor :retry_max_pause_seconds # Integer – default 30
-
-    # After this many retries a still-failing job counts toward its batch's
-    # on_complete (as failed) so the batch needn't wait for the full retry budget
-    # — the job keeps retrying in the background up to max_retries. Set equal to
-    # (or above) max_retries to disable early completion (the default 3 == default
-    # max_retries, so default behaviour is unchanged). on_success is unaffected:
-    # it still fires only when every job truly succeeds.
-    attr_accessor :complete_after_retries  # Integer – default 3 (worker can override)
 
     # ── Delayed jobs (perform_in / perform_at) ───────────────────────────────
     # The Sidekiq perform_in/perform_at equivalent. The job payload is produced
@@ -483,8 +495,17 @@ module KafkaBatch
       @cancellation_cache_ttl   = 120
       @liveness_backend         = :redis
       @track_running_jobs       = true
-      @liveness_ttl             = 30
-      @liveness_stats_interval  = 15
+      # Redis EX TTL on kafka_batch:live:consumer:* (and live:job:*) heartbeats.
+      # Override via config.liveness_ttl or KAFKA_BATCH_LIVENESS_TTL (seconds).
+      @liveness_ttl                   = env_positive_int("KAFKA_BATCH_LIVENESS_TTL", 180)
+      @liveness_heartbeat_interval    = env_positive_int("KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL", 20)
+      @liveness_stats_interval        = 15
+      @super_fetch_concurrency        = env_positive_int("KAFKA_BATCH_SUPER_FETCH_CONCURRENCY", 32)
+      @super_fetch_lease_ttl          = env_positive_int("KAFKA_BATCH_SUPER_FETCH_LEASE_TTL", 120)
+      @super_fetch_orphan_grace       = env_positive_int("KAFKA_BATCH_SUPER_FETCH_ORPHAN_GRACE", 40)
+      @super_fetch_reclaim_enabled    = !truthy_env?("KAFKA_BATCH_SUPER_FETCH_RECLAIM_DISABLED")
+      @super_fetch_reclaim_interval   = env_positive_int("KAFKA_BATCH_SUPER_FETCH_RECLAIM_INTERVAL", 30)
+      @super_fetch_reclaim_limit      = env_positive_int("KAFKA_BATCH_SUPER_FETCH_RECLAIM_LIMIT", 100)
       @uniq_enabled             = true
       @uniq_lock_ttl            = 7 * 24 * 3600  # 7 days — covers max_schedule_horizon + retries
       @uniq_on_duplicate        = :skip
@@ -494,7 +515,6 @@ module KafkaBatch
       @retry_tiers              = { short: 30, medium: 7 * 60, large: 20 * 60 }
       @retry_tier_progression   = %i[short medium large]
       @retry_max_pause_seconds  = 30
-      @complete_after_retries   = 7    # == max_retries default → no early completion by default
       @schedule_store           = :redis
       @schedule_poller_enabled  = false
       @schedule_poll_interval   = 5.0
@@ -688,6 +708,16 @@ module KafkaBatch
 
     def truthy_env?(key)
       %w[1 true yes].include?(ENV[key].to_s.strip.downcase)
+    end
+
+    def env_positive_int(key, default)
+      v = ENV[key].to_s.strip
+      return default if v.empty?
+
+      n = Integer(v, 10)
+      n.positive? ? n : default
+    rescue ArgumentError, TypeError
+      default
     end
 
     # Apply topic_prefix to a base name: "" → base, "myapp" → "myapp.base".

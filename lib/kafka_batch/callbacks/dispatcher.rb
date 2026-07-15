@@ -4,25 +4,32 @@ require "oj"
 
 module KafkaBatch
   module Callbacks
-    # Dispatches batch callbacks when a batch finalizes.
+    # Dispatches batch callbacks when a batch finalizes or early-completes.
     #
     # Job callbacks (Sidekiq-style): enqueue a normal job to a user topic — Go or
     # Ruby runtime depending on handler manifest / worker registration.
     #
     # Legacy callbacks: produce to callbacks_topic for CallbackConsumer (Ruby class).
     #
-    # Job-callback side effects are fenced with claim_callback BEFORE produce so
-    # two finalizers cannot double-enqueue. Legacy-only dispatch does not claim
-    # here — CallbackConsumer claims before invoke.
+    # Outcome-aware firing (matches kafka-batch-go):
+    #   complete / early complete → on_complete only
+    #   success                   → on_success + on_complete
+    #   success_only              → on_success only
+    #
+    # When Lua already won HSETNX claims (EventConsumer / seal), pass
+    # preclaimed: true to skip a second claim.
     module Dispatcher
       class << self
         # @return [Symbol] :none, :job_only, :legacy_only, or :mixed
-        def dispatch!(batch:, outcome:, finished_at: nil)
+        def dispatch!(batch:, outcome:, finished_at: nil, preclaimed: false)
           summary = batch_summary(batch, outcome, finished_at)
           job_actions = []
           legacy_needed = false
 
-          if outcome == "success" && present?(batch[:on_success])
+          fire_success  = %w[success success_only].include?(outcome.to_s)
+          fire_complete = %w[success complete].include?(outcome.to_s)
+
+          if fire_success && present?(batch[:on_success])
             case Callback.parse(batch[:on_success])
             when Callback::Job
               job_actions << { raw: batch[:on_success], kind: :on_success }
@@ -31,7 +38,7 @@ module KafkaBatch
             end
           end
 
-          if present?(batch[:on_complete])
+          if fire_complete && present?(batch[:on_complete])
             case Callback.parse(batch[:on_complete])
             when Callback::Job
               job_actions << { raw: batch[:on_complete], kind: :on_complete }
@@ -43,9 +50,12 @@ module KafkaBatch
           return :none if job_actions.empty? && !legacy_needed
 
           if job_actions.any?
-            # Claim BEFORE produce so two finalizers cannot both enqueue jobs.
-            unless KafkaBatch.store.claim_callback(batch[:id], KafkaBatch.node_id)
-              return :none
+            # Claim BEFORE produce so two finalizers cannot both enqueue jobs —
+            # unless Lua already claimed (preclaimed).
+            unless preclaimed
+              unless KafkaBatch.store.claim_callback(batch[:id], KafkaBatch.node_id, claim_kind(outcome))
+                return :none
+              end
             end
 
             job_actions.each do |action|
@@ -61,7 +71,7 @@ module KafkaBatch
             return :job_only
           end
 
-          produce_legacy!(batch, outcome, summary)
+          produce_legacy!(batch, outcome, summary, preclaimed: preclaimed)
           :legacy_only
         end
 
@@ -69,6 +79,13 @@ module KafkaBatch
           [batch[:on_success], batch[:on_complete]].compact.any? do |raw|
             spec = Callback.parse(raw)
             spec.is_a?(Callback::Legacy)
+          end
+        end
+
+        def claim_kind(outcome)
+          case outcome.to_s
+          when "success", "success_only" then "success"
+          else "complete"
           end
         end
 
@@ -81,6 +98,7 @@ module KafkaBatch
             "total_jobs"      => batch[:total_jobs],
             "completed_count" => batch[:completed_count],
             "failed_count"    => batch[:failed_count],
+            "touched_count"   => batch[:touched_count],
             "callback_args"   => batch[:callback_args] || {},
             "finished_at"     => finished_at || batch[:finished_at] || Time.now.utc.iso8601,
             "description"     => batch[:description],
@@ -127,10 +145,13 @@ module KafkaBatch
             "on_success"  => batch[:on_success],
             "on_complete" => batch[:on_complete]
           )
-          if outcome == "success" && legacy_class?(batch[:on_success])
+          fire_success  = %w[success success_only].include?(outcome.to_s)
+          fire_complete = %w[success complete].include?(outcome.to_s)
+
+          if fire_success && legacy_class?(batch[:on_success])
             invoke_legacy(batch[:on_success], :on_success, payload)
           end
-          if legacy_class?(batch[:on_complete])
+          if fire_complete && legacy_class?(batch[:on_complete])
             invoke_legacy(batch[:on_complete], :on_complete, payload)
           end
         end
@@ -212,10 +233,11 @@ module KafkaBatch
           topic.start_with?("#{prefix}.")
         end
 
-        def produce_legacy!(batch, outcome, summary)
+        def produce_legacy!(batch, outcome, summary, preclaimed: false)
           payload = summary.merge(
             "on_success"  => batch[:on_success],
-            "on_complete" => batch[:on_complete]
+            "on_complete" => batch[:on_complete],
+            "preclaimed"  => preclaimed
           )
           KafkaBatch::Producer.produce_sync(
             topic:   KafkaBatch.config.callbacks_topic,

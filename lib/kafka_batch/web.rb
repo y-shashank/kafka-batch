@@ -2187,9 +2187,11 @@ module KafkaBatch
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
+    # Pending for a running batch = jobs not yet first-touched (Sidekiq-style).
+    # Retries may still be in flight after on_complete; terminal batches show 0.
     def pending(b)
       return 0 if %w[success complete cancelled].include?(b[:status])
-      [b[:total_jobs].to_i - b[:completed_count].to_i - b[:failed_count].to_i, 0].max
+      [b[:total_jobs].to_i - b[:touched_count].to_i, 0].max
     end
 
     def safe_counts

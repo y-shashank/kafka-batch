@@ -129,6 +129,9 @@ RSpec.describe "Full consume loop (integration)", :integration do
       allow(consumer).to receive(:messages).and_return([wrapped])
 
       consumer.consume
+      # SuperFetch marks before #perform; wait for the pool so assertions see
+      # events/retries produced by the async pipeline.
+      KafkaBatch::SuperFetch.drain(timeout: 30) if defined?(KafkaBatch::SuperFetch)
 
       if committed
         commit(rd)

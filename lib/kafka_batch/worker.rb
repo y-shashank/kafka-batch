@@ -70,17 +70,6 @@ module KafkaBatch
         end
       end
 
-      # After this many retries a still-failing job counts toward its batch's
-      # on_complete (the job keeps retrying up to max_retries in the background).
-      # Defaults to KafkaBatch.config.complete_after_retries.
-      def complete_after_retries(n = nil)
-        if n
-          @complete_after_retries = n.to_i
-        else
-          @complete_after_retries || KafkaBatch.config.complete_after_retries
-        end
-      end
-
       # Whether this worker's jobs flow through the shared multi-tenant FAIR lane
       # (ingest topic → Dispatcher → ready topic → JobConsumer swarm) instead of
       # the worker's own/default topic. Fairness is a per-worker choice — there is

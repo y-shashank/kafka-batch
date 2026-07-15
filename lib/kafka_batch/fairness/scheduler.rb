@@ -675,6 +675,21 @@ module KafkaBatch
         true
       end
 
+      # Clear fair-slot dedup so a SuperFetch reclaim (`_reclaim: true`) can re-run
+      # #perform (parity with Go Scheduler.ClearSlotExecution).
+      def clear_slot_execution!(slot_id)
+        lease = slot_id.to_s
+        return if lease.empty?
+
+        with { |r| r.del("#{@slot_dedup_prefix}#{lease}") }
+        nil
+      rescue StandardError => e
+        KafkaBatch.logger.warn(
+          "[KafkaBatch][Scheduler] clear_slot_execution! failed slot=#{slot_id}: #{e.message}"
+        )
+        nil
+      end
+
       # Release the in-flight slot held by a tenant's finished job.
       #
       # In the :time lane, pass `duration:` (actual wall-clock seconds the job

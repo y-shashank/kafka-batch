@@ -16,7 +16,7 @@ module KafkaBatch
     #   {
     #     "batch_id"    => "uuid",
     #     "job_id"      => "uuid",
-    #     "status"      => "success" | "failed",
+    #     "status"      => "success" | "failed" | "executed",
     #     "occurred_at" => "ISO8601"
     #   }
     class EventConsumer < Karafka::BaseConsumer
@@ -157,8 +157,8 @@ module KafkaBatch
         end
       end
 
-      def produce_callback_for_batch!(batch, outcome)
-        trigger_callbacks(batch: batch, outcome: outcome)
+      def produce_callback_for_batch!(batch, outcome, preclaimed: true)
+        trigger_callbacks(batch: batch, outcome: outcome, preclaimed: preclaimed)
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error(
           "[KafkaBatch][EventConsumer] Failed to produce callback for " \
@@ -174,13 +174,26 @@ module KafkaBatch
 
         status = batch[:status].to_s
         return unless %w[success complete].include?(status)
-        return if KafkaBatch.store.callback_dispatched?(batch_id)
+
+        need_complete = batch[:complete_callback_dispatched_at].nil? &&
+                        batch[:callback_dispatched_at].nil?
+        need_success  = status == "success" && batch[:success_callback_dispatched_at].nil?
+        return unless need_complete || need_success
+
+        outcome =
+          if need_success && need_complete
+            "success"
+          elsif need_success
+            "success_only"
+          else
+            status
+          end
 
         KafkaBatch.logger.info(
           "[KafkaBatch][EventConsumer] Retrying undispatched callback for " \
           "batch_id=#{batch_id} (terminal batch, events deduped on replay)"
         )
-        produce_callback_for_batch!(batch, status)
+        produce_callback_for_batch!(batch, outcome, preclaimed: false)
       end
 
       # Decode + validate one event message. Returns a normalized event Hash, or
@@ -253,11 +266,12 @@ module KafkaBatch
         mark_as_consumed!(message)
       end
 
-      def trigger_callbacks(batch:, outcome:)
+      def trigger_callbacks(batch:, outcome:, preclaimed: true)
         KafkaBatch.logger.info(
-          "[KafkaBatch][EventConsumer] Batch #{batch[:id]} finished – " \
+          "[KafkaBatch][EventConsumer] Batch #{batch[:id]} callback – " \
           "outcome=#{outcome} jobs=#{batch[:total_jobs]} " \
-          "ok=#{batch[:completed_count]} failed=#{batch[:failed_count]}"
+          "ok=#{batch[:completed_count]} failed=#{batch[:failed_count]} " \
+          "touched=#{batch[:touched_count]}"
         )
 
         KafkaBatch::Instrumentation.batch_completed(
@@ -268,7 +282,10 @@ module KafkaBatch
           failed_count:    batch[:failed_count]
         )
 
-        KafkaBatch::Callbacks::Dispatcher.dispatch!(batch: batch, outcome: outcome)
+        # Lua already HSETNX'd callback claim fields on code 1/3 — skip second claim.
+        KafkaBatch::Callbacks::Dispatcher.dispatch!(
+          batch: batch, outcome: outcome, preclaimed: preclaimed
+        )
       end
 
       def publish_to_dlt(raw:, error:, topic:)

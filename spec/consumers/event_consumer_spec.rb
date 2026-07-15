@@ -97,7 +97,7 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     expect(KafkaBatch.store.find_batch(id)[:completed_count]).to eq(1)
   end
 
-  it "retries an undispatched callback on redelivery after events dedup" do
+  it "does not re-produce a callback on replay after Lua already claimed (produce failed)" do
     id = SecureRandom.uuid
     KafkaBatch.store.create_batch(id: id, total_jobs: 1, on_complete: "RecordingCallback")
     ev = event(id: id, status: "success", src_offset: 10, batch_seq: 1)
@@ -107,16 +107,32 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     )
     expect { consumer.send(:apply, [consumer.send(:extract_event, ev)]) }.to raise_error(KafkaBatch::ProducerError)
     expect(FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)).to be_empty
-    expect(KafkaBatch.store.find_batch(id)[:status]).to eq("success")
+    batch = KafkaBatch.store.find_batch(id)
+    expect(batch[:status]).to eq("success")
+    expect(batch[:complete_callback_dispatched_at]).not_to be_nil
 
     allow(KafkaBatch::Producer).to receive(:produce_sync) do |topic:, payload:, key: nil, partition: nil, headers: {}|
       FakeProducer.record(topic: topic, payload: payload, key: key, partition: partition, headers: headers)
     end
     consumer.send(:apply, [consumer.send(:extract_event, ev)])
 
+    # Prefer lost callback over double-fire once Lua claimed (matches Go).
+    expect(FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)).to be_empty
+  end
+
+  it "fires early on_complete when all jobs are touched while still running" do
+    id = SecureRandom.uuid
+    KafkaBatch.store.create_batch(id: id, total_jobs: 1, on_complete: "RecordingCallback")
+
+    consumer.send(:process_event, event(id: id, status: "executed", src_offset: 10, batch_seq: 1))
+
+    b = KafkaBatch.store.find_batch(id)
+    expect(b[:touched_count]).to eq(1)
+    expect(b[:status]).to eq("running")
     cb = FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)
     expect(cb.size).to eq(1)
-    expect(cb.first.payload["outcome"]).to eq("success")
+    expect(cb.first.payload["outcome"]).to eq("complete")
+    expect(cb.first.payload["preclaimed"]).to eq(true)
   end
 
   it "does not count an event missing batch_seq, but forwards it to the DLT (no silent drop)" do

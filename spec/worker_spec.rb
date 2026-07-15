@@ -109,22 +109,6 @@ RSpec.describe KafkaBatch::Worker do
       expect(klass.kafka_topic).to eq("legacy.queue")
     end
 
-    describe "complete_after_retries" do
-      it "falls back to the global config default when not overridden" do
-        KafkaBatch.config.complete_after_retries = 7
-        klass = Class.new { include KafkaBatch::Worker }
-        expect(klass.complete_after_retries).to eq(7)
-      end
-
-      it "can be pinned per worker, independently of max_retries" do
-        klass = Class.new do
-          include KafkaBatch::Worker
-          complete_after_retries 1
-        end
-        expect(klass.complete_after_retries).to eq(1)
-      end
-    end
-
     describe "retries_exhausted" do
       it "stores a class-level callback block" do
         received = []

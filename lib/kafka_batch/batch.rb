@@ -818,7 +818,6 @@ module KafkaBatch
         "payload"                => payload,
         "attempt"                => attempt,
         "max_retries"            => definition.max_retries,
-        "complete_after_retries" => definition.complete_after_retries,
         "enqueued_at"            => Time.now.utc.iso8601
       }
       msg["tenant_id"]   = tenant_id            if tenant_id
@@ -992,10 +991,12 @@ module KafkaBatch
     # Produce batch callbacks when locking finalizes the batch.
     def produce_callback(batch, outcome)
       b = batch.transform_keys(&:to_sym)
+      # Lua already claimed callback fields on seal finalize / early complete.
       KafkaBatch::Callbacks::Dispatcher.dispatch!(
         batch:       b.merge(id: b[:id]),
         outcome:     outcome,
-        finished_at: b[:finished_at]
+        finished_at: b[:finished_at],
+        preclaimed:  true
       )
     end
   end
