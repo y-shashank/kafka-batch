@@ -16,7 +16,8 @@ Gem::Specification.new do |spec|
   spec.license       = "MIT"
   spec.required_ruby_version = ">= 2.7.0"
 
-  spec.files         = Dir["lib/**/*", "bin/*", "db/**/*", "*.gemspec", "*.md"]
+  spec.files         = Dir["lib/**/*", "bin/*", "db/**/*", "*.gemspec", "*.md"] -
+                       Dir["lib/kafka_batch/web/public/**/*.map"]
   spec.bindir        = "bin"
   spec.executables   = []
   spec.require_paths = ["lib"]

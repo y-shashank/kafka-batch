@@ -141,16 +141,18 @@ module KafkaBatch
       end
 
       def web_action_name(path)
-        case path
+        # Strip optional /api prefix used by the React dashboard JSON API.
+        p = path.to_s.sub(%r{\A/api}, "")
+        case p
         when %r{\A/lag/pause\z} then "lag.pause"
         when %r{\A/lag/resume\z} then "lag.resume"
-        when %r{\A/weights/throughput/reset\z} then "weights.throughput.reset"
-        when %r{\A/weights/(?:time/)?reset\z} then "weights.reset"
+        when %r{\A/weights/throughput/reset\z}, %r{\A/weights/throughput/[^/]+\z} then "weights.throughput.reset"
+        when %r{\A/weights/(?:time/)?reset\z}, %r{\A/weights/time/[^/]+\z} then "weights.reset"
         when %r{\A/weights/throughput\z} then "weights.throughput.set"
         when %r{\A/weights} then "weights.set"
         when %r{\A/batches/bulk\z} then "batches.bulk"
         when %r{\A/batches/[^/]+/cancel\z} then "batches.cancel"
-        when %r{\A/batches/[^/]+/delete\z} then "batches.delete"
+        when %r{\A/batches/[^/]+/delete\z}, %r{\A/batches/[^/]+\z} then "batches.delete"
         else "web.#{path.delete_prefix('/').tr('/', '.')}"
         end
       end

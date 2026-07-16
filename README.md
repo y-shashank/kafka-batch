@@ -1245,19 +1245,45 @@ Autoscale execution Deployments on **consumer lag** (KEDA / HPA). Partitions are
 
 ## Web UI & reconciler
 
-Mount `KafkaBatch::Web` at `/kafka_batch`:
+Mount `KafkaBatch::Web` at `/kafka_batch`. The dashboard is a **React + Material UI** SPA (assets shipped in the gem) that loads all data from JSON under `/kafka_batch/api/*`.
 
 | Page | Shows |
 |---|---|
-| `/` | Batch list, status, cancel |
+| `/` | Batch list, status, cancel / delete / bulk |
+| `/batches/:id` | Batch detail + paginated job failures |
 | `/lag` | Per-group/topic lag, pause/resume (consumers see changes within `consumption_control_refresh_interval`, default **30s**) |
 | `/live` | Running jobs & consumer heartbeats |
-| `/weights` | Tenant fairness weights |
+| `/weights/time` · `/weights/throughput` | Tenant fairness weights |
+| `/fairness/time` · `/fairness/throughput` | Ingest / ready lag by fairness lane |
 | `/failures` | Failure log |
 | `/dead_letter` | Kafka dead-letter topic (paginated, newest first) |
+| `/scheduled` | Delayed jobs in the schedule store |
 | `/reconciler` | Last reconciler sweep + recovery counts |
+| `/system` | Masked configuration snapshot |
+| `/audit` | Web UI audit log (when enabled) |
+
+**Live refresh:** the toolbar Live toggle (localStorage key `kafka_batch_live`) refetches API data every 5s.
+
+**Building UI assets** (only needed when changing the frontend; built files are committed under `lib/kafka_batch/web/public/`):
+
+```bash
+cd frontend && npm ci && npm run build
+```
 
 **Reconciler** (inside `EventConsumer`, periodic): recovers stuck `running` batches and re-dispatches lost callbacks. Summary is persisted in Redis for `/reconciler`. Manual: `rake kafka_batch:reconcile`.
+
+### JSON API (same mount)
+
+All mutating calls require the `_kb_csrf` cookie **and** a matching `X-CSRF-Token` header (or body `_csrf`). Obtain the token from `GET /api/bootstrap` (or the SPA shell bootstrap).
+
+| Method | Path |
+|---|---|
+| GET | `/api/bootstrap`, `/api/dashboard`, `/api/batches`, `/api/batches/:id` |
+| POST / DELETE | `/api/batches/:id/cancel`, `/api/batches/:id`, `/api/batches/bulk` |
+| GET | `/api/failures`, `/api/live`, `/api/lag`, `/api/scheduled`, `/api/system`, `/api/reconciler`, `/api/dead_letter`, `/api/audit` |
+| GET | `/api/fairness/:type`, `/api/weights/:type` (`time` \| `throughput`) |
+| POST | `/api/lag/pause`, `/api/lag/resume` |
+| PUT / DELETE | `/api/weights/:type`, `/api/weights/:type/:tenant_id` |
 
 ### Securing the dashboard
 
@@ -1271,7 +1297,7 @@ end
 
 Built-in defences:
 
-- **CSRF** — double-submit cookie (`SameSite=Strict`, `HttpOnly`, `Secure` on HTTPS); the token rides a hidden form field (never the URL), and comparison is constant-time.
+- **CSRF** — double-submit cookie (`SameSite=Strict`, `HttpOnly`, `Secure` on HTTPS); SPA clients send `X-CSRF-Token` (token from `/api/bootstrap`), and comparison is constant-time.
 - **Credential masking** — the Redis URL (and other secrets) are masked wherever displayed (`/system`, `/lag`).
 - **DoS caps** — POST bodies are capped (1 MiB), bulk cancel/delete enumeration is bounded, and the weights page caps rendered tenants.
 - **Optional authenticator** (defence-in-depth, not a replacement for host auth):
@@ -1282,6 +1308,7 @@ Built-in defences:
     ActionController::HttpAuthentication::Basic.with_credentials(env) { |u, p| Rack::Utils.secure_compare(p, ENV["KB_WEB_PASS"]) && u == "admin" }
   }
   ```
+
 
 ### Web UI audit log
 
