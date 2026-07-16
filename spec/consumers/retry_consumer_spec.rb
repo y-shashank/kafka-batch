@@ -23,6 +23,7 @@ RSpec.describe KafkaBatch::Consumers::RetryConsumer do
     expect(msg.payload).not_to have_key("retry_after")
     expect(msg.payload).not_to have_key("retry_to")
     expect(msg.payload["attempt"]).to eq(1)
+    expect(msg.payload["retry_count"]).to eq(1)
     expect(msg.key).to eq("j1")
   end
 

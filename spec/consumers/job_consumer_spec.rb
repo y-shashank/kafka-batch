@@ -164,13 +164,14 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       expect(KafkaBatch.config.retry_topics.flat_map { |t| FakeProducer.for_topic(t) }).to be_empty
     end
 
-    it "records the failure for the batch (always-on failure tracking)" do
+    it "does not persist failure metadata in Redis on exhaustion (DLT is the record)" do
       consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 2, job_id: "jx"))
 
-      failures = KafkaBatch.store.list_failures("b1")
-      expect(failures.size).to eq(1)
-      expect(failures.first[:job_id]).to eq("jx")
-      expect(failures.first[:error_class]).to eq("RuntimeError")
+      expect(KafkaBatch.store.list_failures("b1")).to be_empty
+
+      dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
+      expect(dlt.first.payload["job_id"]).to eq("jx")
+      expect(dlt.first.payload["dlt_error_class"]).to eq("RuntimeError")
     end
 
     it "invokes the worker retries_exhausted callback before forwarding to the DLT" do
@@ -291,17 +292,20 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
     end
   end
 
-  describe "clearing failures on a successful retry" do
-    it "removes a prior 'retrying' failure record once the job succeeds" do
-      KafkaBatch.store.record_failure(
-        batch_id: "b1", job_id: "jx", worker_class: "SuccessfulWorker",
-        error_class: "RuntimeError", error_message: "transient", attempt: 0, status: "retrying"
-      )
-      expect(KafkaBatch.store.list_failures("b1").size).to eq(1)
+  describe "#record_failure / #clear_failure are Redis no-ops" do
+    it "never populate the store, and a subsequent successful retry still runs cleanly" do
+      expect {
+        KafkaBatch.store.record_failure(
+          batch_id: "b1", job_id: "jx", worker_class: "SuccessfulWorker",
+          error_class: "RuntimeError", error_message: "transient", attempt: 0, status: "retrying"
+        )
+      }.not_to raise_error
+      expect(KafkaBatch.store.list_failures("b1")).to be_empty
 
-      # re-run (attempt 1) succeeds → failure record should be cleared
+      # re-run (attempt 1) succeeds regardless
       consumer.send(:process_message, job_message(worker: SuccessfulWorker, batch_id: "b1", attempt: 1, job_id: "jx"))
 
+      expect(KafkaBatchSpec::WorkerRuns.runs.last).to include(name: :success)
       expect(KafkaBatch.store.list_failures("b1")).to be_empty
     end
   end

@@ -25,6 +25,12 @@ module KafkaBatch
       # done_batches_without_callback).  Members are pruned as batches advance
       # through their lifecycle, and the reconciler self-heals any stale members
       # (e.g. left behind by a TTL-expired batch) by re-validating actual state.
+      #
+      # No per-job failure metadata is stored here: exhausted jobs land on the
+      # dead-letter topic and retrying jobs are listed live from the retry
+      # topics, so #record_failure / #clear_failure / #list_failures /
+      # #list_all_failures fall back to Base's no-ops (see Stores::MysqlStore
+      # for the durable, MySQL-table-backed implementation).
 
       KEY_PREFIX    = "kafka_batch:b"
       RUNNING_INDEX = "kafka_batch:index:running"
@@ -349,24 +355,6 @@ module KafkaBatch
         return 0
       LUA
 
-      # Record (upsert) a failure with a per-batch cap + TTL.
-      #   KEYS[1] failures hash; ARGV[1] job_id, ARGV[2] entry, ARGV[3] ttl, ARGV[4] cap
-      # Existing jobs always update (status/attempt change). A brand-new failing
-      # job is skipped once the cap is reached, bounding RAM – the real job data
-      # remains durable in Kafka, so this only trims the dashboard view.
-      # Returns 1 if stored, 0 if skipped due to the cap.
-      RECORD_FAILURE_LUA = <<~LUA.freeze
-        local cap = tonumber(ARGV[4])
-        if cap > 0 and redis.call('HEXISTS', KEYS[1], ARGV[1]) == 0 then
-          if redis.call('HLEN', KEYS[1]) >= cap then
-            return 0
-          end
-        end
-        redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
-        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
-        return 1
-      LUA
-
       # Transition a batch to a terminal outcome only when it is still running.
       #   KEYS[1]=batch hash  KEYS[2]=COUNTS_KEY  KEYS[3]=RUNNING_INDEX  KEYS[4]=DONE_INDEX
       #   ARGV[1]=outcome  ARGV[2]=finished_at  ARGV[3]=done_score  ARGV[4]=batch_id
@@ -388,10 +376,6 @@ module KafkaBatch
           KafkaBatch::RedisClient.new(cfg) || raise(ConfigurationError, "Redis is not configured")
         end
         @ttl          = cfg.batch_ttl
-        # Failure metadata is a UI convenience (real data lives in Kafka), so it
-        # gets its own shorter TTL and an optional per-batch cap to bound RAM.
-        @failures_ttl = (cfg.failures_ttl || cfg.batch_ttl).to_i
-        @failures_cap = cfg.max_failures_per_batch.to_i
       end
 
       # ── Public interface ──────────────────────────────────────────────────
@@ -625,60 +609,6 @@ module KafkaBatch
         end
       end
 
-      def record_failure(batch_id:, job_id:, worker_class:, error_class:, error_message:, attempt: 0, status: "failed", next_retry_at: nil)
-        entry = Oj.dump({
-          "job_id"        => job_id,
-          "worker_class"  => worker_class.to_s,
-          "error_class"   => error_class.to_s,
-          "error_message" => error_message.to_s,
-          "attempt"       => attempt.to_i,
-          "status"        => status,
-          "next_retry_at" => (next_retry_at.respond_to?(:iso8601) ? next_retry_at.iso8601 : next_retry_at),
-          "failed_at"     => Time.now.utc.iso8601
-        }, mode: :compat)
-
-        with_redis do |r|
-          r.eval(RECORD_FAILURE_LUA,
-            keys: [failures_key(batch_id)],
-            argv: [job_id, entry, @failures_ttl.to_s, @failures_cap.to_s]
-          )
-        end
-      end
-
-      def clear_failure(batch_id, job_id)
-        with_redis { |r| r.hdel(failures_key(batch_id), job_id) }
-      end
-
-      def list_failures(batch_id, limit: 100, offset: 0)
-        raw = with_redis { |r| r.hvals(failures_key(batch_id)) }
-        entries = raw.map { |v| failure_hash(deserialize(v)) }
-        sort_paginate(entries, limit, offset)
-      end
-
-      # Bug #10 fix: pipeline all hvals calls into one round-trip instead of
-      # O(N) sequential round-trips (one per batch ID).
-      def list_all_failures(limit: 100, offset: 0, status: nil)
-        ids = with_redis { |r| r.zrevrange(ALL_INDEX, 0, -1) }
-        return sort_paginate([], limit, offset) if ids.empty?
-
-        all_vals = with_redis do |r|
-          r.pipelined do |pipe|
-            ids.each { |bid| pipe.hvals(failures_key(bid)) }
-          end
-        end
-
-        entries = []
-        ids.zip(all_vals).each do |bid, vals|
-          next if vals.nil? || vals.empty?
-          vals.each do |v|
-            h = deserialize(v)
-            next if status && h["status"] != status
-            entries << failure_hash(h, batch_id: bid)
-          end
-        end
-        sort_paginate(entries, limit, offset)
-      end
-
       # Bug #5 fix: pipeline all hgetall calls into a single round-trip instead
       # of calling find_batch (one HGETALL each) per ID in a Ruby loop.
       def list_batches(status: nil, limit: 50, offset: 0, search: nil)
@@ -887,7 +817,7 @@ module KafkaBatch
         with_redis do |r|
           # Bug #2: decrement COUNTS_KEY before erasing the batch hash.
           st = r.hget(batch_key(id), "status")
-          r.del(batch_key(id), failures_key(id), bitmap_key(id),
+          r.del(batch_key(id), bitmap_key(id),
                 ok_bitmap_key(id), fail_bitmap_key(id), seq_key(id))
           r.zrem(RUNNING_INDEX, id)
           r.zrem(DONE_INDEX, id)
@@ -939,10 +869,6 @@ module KafkaBatch
 
       def batch_key(id)
         "#{KEY_PREFIX}:#{id}"
-      end
-
-      def failures_key(id)
-        "#{batch_key(id)}:failures"
       end
 
       def bitmap_key(batch_id)
@@ -1011,25 +937,6 @@ module KafkaBatch
         now_f = Time.now.to_f
         # Score all legacy entries as "now" — they will age out naturally.
         r.zadd(CANCELLED_INDEX, ids.flat_map { |i| [now_f, i] }) unless ids.empty?
-      end
-
-      def failure_hash(h, batch_id: nil)
-        out = {
-          job_id:        h["job_id"],
-          worker_class:  h["worker_class"],
-          error_class:   h["error_class"],
-          error_message: h["error_message"],
-          attempt:       h["attempt"].to_i,
-          status:        h["status"],
-          next_retry_at: h["next_retry_at"],
-          failed_at:     h["failed_at"]
-        }
-        out[:batch_id] = batch_id if batch_id
-        out
-      end
-
-      def sort_paginate(entries, limit, offset)
-        entries.sort_by { |e| e[:failed_at].to_s }.reverse.drop(offset).first(limit)
       end
 
       def hash_to_batch(h)

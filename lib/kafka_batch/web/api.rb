@@ -191,26 +191,8 @@ module KafkaBatch
       end
 
       def failures_index(params)
-        status = @web.non_empty(params["status"]) || "retrying"
-        if status == "retrying"
-          return failures_retrying(params)
-        end
-
-        page = [params["page"].to_i, 1].max
-        offset = (page - 1) * Web::PER_PAGE
-        failures = KafkaBatch.store.list_all_failures(limit: Web::PER_PAGE + 1, offset: offset, status: status)
-        has_next = failures.size > Web::PER_PAGE
-        failures = failures.first(Web::PER_PAGE)
-        Json.ok(
-          ok: true,
-          page: page,
-          has_next: has_next,
-          status: status,
-          source: "store",
-          failures: failures.map { |f| serialize_failure(f) },
-          retry_lag_by_tier: @web.retry_lag_by_tier,
-          retry_lag_total: @web.retry_lag
-        )
+        # Failures page is retries-only (exhausted jobs live on Dead letter / batch ledger).
+        failures_retrying(params)
       end
 
       def failures_retrying(params)

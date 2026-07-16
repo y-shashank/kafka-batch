@@ -234,11 +234,12 @@ module KafkaBatch
     # ZSET never grows unbounded.
     attr_accessor :all_index_max_size  # Integer – default 200_000
 
-    # ── Failure metadata retention ───────────────────────────────────────────
-    # Failure records are only a dashboard convenience – the real job data is
-    # durable in Kafka (retry / dead-letter topics). Redis auto-expires via
-    # failures_ttl; MySQL relies on the reconciler purge. max_failures_per_batch
-    # caps how many failing jobs are tracked per batch (0 = unlimited).
+    # ── Failure metadata retention (MySQL store only) ────────────────────────
+    # The real job data is durable in Kafka (retry / dead-letter topics), so
+    # the default (:redis) store never persists per-job failure metadata.
+    # These only apply to Stores::MysqlStore's kafka_batch_failures table:
+    # failures_ttl bounds the reconciler purge window and max_failures_per_batch
+    # is unused there (kept for config backward-compatibility).
     attr_accessor :failures_ttl              # Integer – seconds; default 1 day
     attr_accessor :max_failures_per_batch    # Integer – 0 = unlimited; default 1000
     attr_accessor :retry_cancel_ttl          # Integer – cancel/skip Redis TTL; default 7 days

@@ -135,7 +135,12 @@ module KafkaBatch
         end
 
         # ── Due: re-enqueue to original topic ──────────────────────────────
+        # Keep attempt/retry_count on the jobs-topic payload so #perform can
+        # read worker.retry_count (and Go handlers can read Context.Attempt).
         job_message = data.reject { |k, _| %w[retry_after retry_to].include?(k) }
+        attempt = data["attempt"].to_i
+        job_message["attempt"] = attempt
+        job_message["retry_count"] = attempt
 
         if expired_job?(job_message)
           handle_expired_job(message: message, data: job_message, log_tag: "RetryConsumer")
@@ -144,7 +149,7 @@ module KafkaBatch
 
         KafkaBatch.logger.info(
           "[KafkaBatch][RetryConsumer] Re-enqueuing job_id=#{data['job_id']} " \
-          "attempt=#{data['attempt']} to #{retry_to}"
+          "attempt=#{attempt} to #{retry_to}"
         )
 
         KafkaBatch::Producer.produce_sync(

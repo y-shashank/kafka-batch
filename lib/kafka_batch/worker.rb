@@ -313,7 +313,9 @@ module KafkaBatch
     def bind_job_context!(data, worker_class: self.class)
       @job_id      = data["job_id"]
       @batch_id    = data["batch_id"]
-      @retry_count = data["attempt"].to_i
+      # Prefer explicit retry_count; fall back to attempt (set on schedule_retry /
+      # RetryConsumer re-enqueue so #perform always sees the current retry).
+      @retry_count = (data.key?("retry_count") ? data["retry_count"] : data["attempt"]).to_i
       @kafka_batch = nil
 
       wc = worker_class.is_a?(Class) ? worker_class : self.class

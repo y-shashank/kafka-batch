@@ -296,15 +296,8 @@ RSpec.describe KafkaBatch::Web do
   end
 
   describe "GET /api/failures" do
-    it "lists store failures for status=failed" do
-      payload = json_body(get("/api/failures", query: "status=failed"))
-      expect(payload["ok"]).to eq(true)
-      expect(payload["source"]).to eq("store")
-      expect(payload["failures"]).to be_a(Array)
-    end
-
-    it "lists retrying from kafka source when Redis is available" do
-      payload = json_body(get("/api/failures", query: "status=retrying"))
+    it "lists pending retries from kafka (retries-only page)" do
+      payload = json_body(get("/api/failures"))
       expect(payload["ok"]).to eq(true)
       expect(payload["status"]).to eq("retrying")
       expect(payload["source"]).to eq("kafka")

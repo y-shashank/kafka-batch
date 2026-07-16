@@ -112,31 +112,39 @@ module KafkaBatch
         raise NotImplementedError, "#{self.class}#cancelled_batch_ids"
       end
 
-      # Record that a job failed (always-on failure tracking). Called on EVERY
-      # failed attempt – status "retrying" while retries remain, "failed" once
-      # exhausted – so problems surface immediately, not hours later. Upserted
-      # per (batch_id, job_id); bounded by the number of failing jobs.
+      # Record that a job failed. Called on every failed attempt – status
+      # "retrying" while retries remain, "failed"/"expired" once exhausted.
+      #
+      # Default is a no-op: exhausted jobs are durably recorded on the
+      # dead-letter topic (plus audit/events), and retrying jobs are listed
+      # live from the retry topics, so the default (Redis-backed) store does
+      # NOT persist any per-job failure metadata. Stores::MysqlStore overrides
+      # this with a real, durable implementation backed by the
+      # kafka_batch_failures table (not Redis).
       def record_failure(batch_id:, job_id:, worker_class:, error_class:, error_message:, attempt: 0, status: "failed", next_retry_at: nil)
-        raise NotImplementedError, "#{self.class}#record_failure"
+        nil
       end
 
       # Remove a recorded failure for a job (called when a retry finally
-      # succeeds, so it no longer shows as "retrying"). No-op if none exists.
+      # succeeds, so it no longer shows as "retrying"). No-op by default (see
+      # #record_failure); MysqlStore overrides this too.
       def clear_failure(batch_id, job_id)
-        raise NotImplementedError, "#{self.class}#clear_failure"
+        nil
       end
 
-      # List recorded failures for a batch, newest-first.
+      # List recorded failures for a batch, newest-first. Empty by default
+      # (see #record_failure); MysqlStore overrides this.
       # @return [Array<Hash>] each: { job_id:, worker_class:, error_class:, error_message:, attempt:, status:, failed_at: }
       def list_failures(batch_id, limit: 100, offset: 0)
-        raise NotImplementedError, "#{self.class}#list_failures"
+        []
       end
 
       # List failures across ALL batches, newest-first (for the global view).
-      # Each hash additionally includes :batch_id.
+      # Each hash additionally includes :batch_id. Empty by default (see
+      # #record_failure); MysqlStore overrides this.
       # @return [Array<Hash>]
       def list_all_failures(limit: 100, offset: 0, status: nil)
-        raise NotImplementedError, "#{self.class}#list_all_failures"
+        []
       end
 
       # List batches newest-first for the admin UI.

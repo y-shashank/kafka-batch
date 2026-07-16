@@ -4,7 +4,6 @@ import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Checkbox from '@mui/material/Checkbox'
-import Chip from '@mui/material/Chip'
 import Stack from '@mui/material/Stack'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
@@ -22,12 +21,9 @@ import { StatusChip } from '../components/StatusChip'
 import { SectionCard } from '../components/SectionCard'
 import { MonoLink, monoSx } from '../components/MonoLink'
 import { useLiveRefresh } from '../hooks/useLiveRefresh'
-import { PaginationBar } from '../components/PaginationBar'
 
 export function FailuresPage() {
   const [params, setParams] = useSearchParams()
-  const status = params.get('status') || 'retrying'
-  const page = Math.max(1, Number(params.get('page') || 1))
   const cursor = params.get('cursor') || ''
   const [data, setData] = useState<any>(null)
   const [error, setError] = useState<string | null>(null)
@@ -38,19 +34,15 @@ export function FailuresPage() {
 
   const load = useCallback(async () => {
     try {
-      const qs = new URLSearchParams({ status })
-      if (status === 'retrying') {
-        if (cursor) qs.set('cursor', cursor)
-      } else {
-        qs.set('page', String(page))
-      }
+      const qs = new URLSearchParams({ status: 'retrying' })
+      if (cursor) qs.set('cursor', cursor)
       setData(await apiGet(`/api/failures?${qs}`))
       setError(null)
       setSelected([])
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load')
     }
-  }, [status, page, cursor])
+  }, [cursor])
 
   useEffect(() => {
     void load()
@@ -75,53 +67,13 @@ export function FailuresPage() {
 
   const tiers = data?.retry_lag_by_tier || {}
   const failures: any[] = data?.failures || []
-  const isRetrying = status === 'retrying'
   const allIds = failures.map((f) => f.job_id).filter(Boolean)
-
-  const retryPagination = (
-    <Stack direction="row" spacing={1} alignItems="center" justifyContent="center" sx={{ minHeight: 40 }}>
-      <Button
-        size="small"
-        disabled={!cursorStack.length || busy}
-        onClick={() => {
-          const prev = [...cursorStack]
-          const back = prev.pop() || ''
-          setCursorStack(prev)
-          setParams(back ? { status: 'retrying', cursor: back } : { status: 'retrying' })
-        }}
-        sx={{ minHeight: 36 }}
-      >
-        Previous
-      </Button>
-      <Box sx={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minHeight: 36, px: 1 }}>
-        <Typography variant="body2" color="text.secondary" component="span" sx={{ lineHeight: 1 }}>
-          Page {cursorStack.length + 1}
-        </Typography>
-      </Box>
-      <Button
-        size="small"
-        disabled={!data?.has_next || busy}
-        onClick={() => {
-          if (!data?.cursor) return
-          setCursorStack((s) => [...s, cursor])
-          setParams({ status: 'retrying', cursor: data.cursor })
-        }}
-        sx={{ minHeight: 36 }}
-      >
-        Next
-      </Button>
-    </Stack>
-  )
 
   return (
     <Box>
       <PageHeader
-        title="Failures"
-        subtitle={
-          isRetrying
-            ? 'Pending retries loaded from Kafka retry topics (50 per tier). Delete skips execution; delete-all advances past a watermark.'
-            : 'Exhausted job failures across all batches.'
-        }
+        title="Retries"
+        subtitle="Pending retries from Kafka retry topics (50 per tier). Delete skips execution; delete-all advances past a watermark. Exhausted jobs appear on Dead letter."
       />
       {data?.retry_lag_by_tier ? (
         <MetricCards
@@ -138,62 +90,42 @@ export function FailuresPage() {
         </Alert>
       ) : null}
 
-      {isRetrying && data?.available === false ? (
+      {data?.available === false ? (
         <Alert severity="warning" sx={{ mb: 2 }}>
           {data.message || 'Retry listing unavailable.'}
         </Alert>
       ) : null}
 
       <SectionCard noPadding>
-        <Stack direction="row" spacing={1} sx={{ px: 2, pt: 2, pb: 1 }} flexWrap="wrap" useFlexGap>
-          {['retrying', 'failed'].map((s) => (
-            <Chip
-              key={s}
-              label={s === 'retrying' ? 'Retrying' : 'Failed'}
-              clickable
-              color={status === s ? 'primary' : 'default'}
-              variant={status === s ? 'filled' : 'outlined'}
-              onClick={() => {
-                setCursorStack([])
-                setParams(s === 'retrying' ? { status: s } : { status: s, page: '1' })
-              }}
-            />
-          ))}
-        </Stack>
         <TableContainer>
           <Table size="small">
             <TableHead>
               <TableRow>
-                {isRetrying ? (
-                  <TableCell padding="checkbox">
-                    <Checkbox
-                      checked={allIds.length > 0 && selected.length === allIds.length}
-                      indeterminate={selected.length > 0 && selected.length < allIds.length}
-                      disabled={busy || allIds.length === 0}
-                      onChange={(e) => setSelected(e.target.checked ? allIds : [])}
-                    />
-                  </TableCell>
-                ) : null}
+                <TableCell padding="checkbox">
+                  <Checkbox
+                    checked={allIds.length > 0 && selected.length === allIds.length}
+                    indeterminate={selected.length > 0 && selected.length < allIds.length}
+                    disabled={busy || allIds.length === 0}
+                    onChange={(e) => setSelected(e.target.checked ? allIds : [])}
+                  />
+                </TableCell>
                 <TableCell>Batch</TableCell>
                 <TableCell>Job</TableCell>
                 <TableCell>Worker</TableCell>
                 <TableCell>Status</TableCell>
                 <TableCell>Attempt</TableCell>
                 <TableCell>Next retry</TableCell>
-                {isRetrying ? <TableCell>Location</TableCell> : null}
+                <TableCell>Location</TableCell>
                 <TableCell>Error</TableCell>
                 <TableCell>Message</TableCell>
-                <TableCell>Failed at</TableCell>
-                {isRetrying ? <TableCell align="right">Actions</TableCell> : null}
+                <TableCell align="right">Actions</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
               {failures.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={isRetrying ? 11 : 9} align="center" sx={{ py: 6 }}>
-                    <Typography color="text.secondary">
-                      {isRetrying ? 'No pending retries in Kafka.' : 'No failures recorded.'}
-                    </Typography>
+                  <TableCell colSpan={11} align="center" sx={{ py: 6 }}>
+                    <Typography color="text.secondary">No pending retries in Kafka.</Typography>
                   </TableCell>
                 </TableRow>
               ) : (
@@ -201,21 +133,19 @@ export function FailuresPage() {
                   <TableRow
                     key={`${f.topic || f.batch_id}-${f.partition ?? ''}-${f.offset ?? f.job_id}`}
                     hover
-                    selected={isRetrying && selected.includes(f.job_id)}
+                    selected={selected.includes(f.job_id)}
                   >
-                    {isRetrying ? (
-                      <TableCell padding="checkbox">
-                        <Checkbox
-                          checked={selected.includes(f.job_id)}
-                          disabled={busy}
-                          onChange={(e) =>
-                            setSelected((prev) =>
-                              e.target.checked ? [...prev, f.job_id] : prev.filter((id) => id !== f.job_id),
-                            )
-                          }
-                        />
-                      </TableCell>
-                    ) : null}
+                    <TableCell padding="checkbox">
+                      <Checkbox
+                        checked={selected.includes(f.job_id)}
+                        disabled={busy}
+                        onChange={(e) =>
+                          setSelected((prev) =>
+                            e.target.checked ? [...prev, f.job_id] : prev.filter((id) => id !== f.job_id),
+                          )
+                        }
+                      />
+                    </TableCell>
                     <TableCell>
                       {f.batch_id ? (
                         <MonoLink to={`/batches/${f.batch_id}`}>{String(f.batch_id).slice(0, 8)}</MonoLink>
@@ -226,37 +156,32 @@ export function FailuresPage() {
                     <TableCell sx={monoSx}>{String(f.job_id).slice(0, 8)}</TableCell>
                     <TableCell>{f.worker_class || '—'}</TableCell>
                     <TableCell>
-                      <StatusChip status={f.status} />
+                      <StatusChip status={f.status || 'retrying'} />
                     </TableCell>
                     <TableCell>{f.attempt}</TableCell>
                     <TableCell>{f.next_retry_eta || '—'}</TableCell>
-                    {isRetrying ? (
-                      <TableCell sx={{ ...monoSx, whiteSpace: 'nowrap' }}>
-                        {f.tier ? `${f.tier} ` : ''}
-                        {f.topic != null ? `${f.partition}@${f.offset}` : '—'}
-                      </TableCell>
-                    ) : null}
+                    <TableCell sx={{ ...monoSx, whiteSpace: 'nowrap' }}>
+                      {f.tier ? `${f.tier} ` : ''}
+                      {f.topic != null ? `${f.partition}@${f.offset}` : '—'}
+                    </TableCell>
                     <TableCell sx={{ color: 'error.main', fontWeight: 500 }}>{f.error_class || '—'}</TableCell>
                     <TableCell sx={{ maxWidth: 260 }}>{f.error_message || '—'}</TableCell>
-                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{f.failed_at_label || '—'}</TableCell>
-                    {isRetrying ? (
-                      <TableCell align="right">
-                        <Button
-                          size="small"
-                          color="error"
-                          disabled={busy}
-                          onClick={() => {
-                            if (!confirm('Skip this retrying job?')) return
-                            void mutate(
-                              () => apiMutate('POST', '/api/retries/delete', { job_ids: [f.job_id] }),
-                              'Retry cancelled',
-                            )
-                          }}
-                        >
-                          Delete
-                        </Button>
-                      </TableCell>
-                    ) : null}
+                    <TableCell align="right">
+                      <Button
+                        size="small"
+                        color="error"
+                        disabled={busy}
+                        onClick={() => {
+                          if (!confirm('Skip this retrying job?')) return
+                          void mutate(
+                            () => apiMutate('POST', '/api/retries/delete', { job_ids: [f.job_id] }),
+                            'Retry cancelled',
+                          )
+                        }}
+                      >
+                        Delete
+                      </Button>
+                    </TableCell>
                   </TableRow>
                 ))
               )}
@@ -264,54 +189,74 @@ export function FailuresPage() {
           </Table>
         </TableContainer>
 
-        {isRetrying ? (
-          <Stack
-            direction={{ xs: 'column', sm: 'row' }}
-            spacing={1.5}
-            alignItems="center"
-            justifyContent="space-between"
-            sx={{ p: 2 }}
-          >
-            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-              <Button
-                variant="outlined"
-                color="error"
-                disabled={busy || !selected.length}
-                onClick={() => {
-                  if (!confirm(`Skip ${selected.length} retrying job(s)?`)) return
-                  void mutate(
-                    () => apiMutate('POST', '/api/retries/delete', { job_ids: selected }),
-                    'Selected retries cancelled',
-                  )
-                }}
-              >
-                Delete selected
-              </Button>
-            </Stack>
-            {retryPagination}
-            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-              <Button
-                color="error"
-                disabled={busy}
-                onClick={() => {
-                  if (!confirm('Skip all pending retries up to the current Kafka watermarks?')) return
-                  void mutate(() => apiMutate('POST', '/api/retries/delete_all', {}), 'All pending retries marked to skip')
-                }}
-              >
-                Delete all
-              </Button>
-            </Stack>
+        <Stack
+          direction={{ xs: 'column', sm: 'row' }}
+          spacing={1.5}
+          alignItems="center"
+          justifyContent="space-between"
+          sx={{ p: 2 }}
+        >
+          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+            <Button
+              variant="outlined"
+              color="error"
+              disabled={busy || !selected.length}
+              onClick={() => {
+                if (!confirm(`Skip ${selected.length} retrying job(s)?`)) return
+                void mutate(
+                  () => apiMutate('POST', '/api/retries/delete', { job_ids: selected }),
+                  'Selected retries cancelled',
+                )
+              }}
+            >
+              Delete selected
+            </Button>
           </Stack>
-        ) : (
-          <Box sx={{ p: 2 }}>
-            <PaginationBar
-              page={page}
-              hasNext={!!data?.has_next}
-              onPrev={() => setParams({ status, page: String(page - 1) })}
-              onNext={() => setParams({ status, page: String(page + 1) })}
-            />
-          </Box>
-        )}
+          <Stack direction="row" spacing={1} alignItems="center" justifyContent="center" sx={{ minHeight: 40 }}>
+            <Button
+              size="small"
+              disabled={!cursorStack.length || busy}
+              onClick={() => {
+                const prev = [...cursorStack]
+                const back = prev.pop() || ''
+                setCursorStack(prev)
+                setParams(back ? { cursor: back } : {})
+              }}
+              sx={{ minHeight: 36 }}
+            >
+              Previous
+            </Button>
+            <Box sx={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minHeight: 36, px: 1 }}>
+              <Typography variant="body2" color="text.secondary" component="span" sx={{ lineHeight: 1 }}>
+                Page {cursorStack.length + 1}
+              </Typography>
+            </Box>
+            <Button
+              size="small"
+              disabled={!data?.has_next || busy}
+              onClick={() => {
+                if (!data?.cursor) return
+                setCursorStack((s) => [...s, cursor])
+                setParams({ cursor: data.cursor })
+              }}
+              sx={{ minHeight: 36 }}
+            >
+              Next
+            </Button>
+          </Stack>
+          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+            <Button
+              color="error"
+              disabled={busy}
+              onClick={() => {
+                if (!confirm('Skip all pending retries up to the current Kafka watermarks?')) return
+                void mutate(() => apiMutate('POST', '/api/retries/delete_all', {}), 'All pending retries marked to skip')
+              }}
+            >
+              Delete all
+            </Button>
+          </Stack>
+        </Stack>
       </SectionCard>
 
       <Snackbar open={!!toast} autoHideDuration={3000} onClose={() => setToast(null)} message={toast} />

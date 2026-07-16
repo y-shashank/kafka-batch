@@ -114,7 +114,7 @@ gem "kafka-batch", require: "kafka_batch/ui"
 
 ```bash
 bundle exec rails generate kafka_batch:install
-# optional: --store mysql           (failure log / pauses in MySQL; ledger still Redis)
+# optional: --store mysql           (durable failure log / pauses in MySQL; ledger still Redis)
 # optional: --schedule-store mysql  (delayed-job index in MySQL)
 # optional: --audit                 (copy the Web UI audit-log migration)
 ```
@@ -681,7 +681,7 @@ All options live on `KafkaBatch.config`. The install generator ships enterprise-
 | `brokers` | `["localhost:9092"]` | Kafka bootstrap servers |
 | `redis_url` | `redis://localhost:6379/0` | **Required** |
 | `topic_prefix` | `""` | Namespaces all topics + consumer group (`myapp` → `myapp.kafka_batch.jobs`, `myapp.kafka-batch`) |
-| `store` | `:redis` | `:mysql` moves failure log / pauses to MySQL; **ledger stays Redis** |
+| `store` | `:redis` | `:mysql` adds a durable failure log / pauses in MySQL (`:redis` keeps no per-job failure log); **ledger stays Redis** |
 | `schedule_store` | `:redis` | Delayed-job index (`:mysql` for disk-backed scale) |
 | `schedule_poller_enabled` | `false` | Enable on scheduler pods only |
 | `max_retries` | `3` | Override per worker |
@@ -711,8 +711,13 @@ All options live on `KafkaBatch.config`. The install generator ships enterprise-
 | | `store: :redis` | `store: :mysql` |
 |---|---|---|
 | Batch ledger | Redis | Redis (always) |
-| Failure log | Redis | MySQL `kafka_batch_failures` |
+| Failure log | *(none — DLT + retry topics only)* | MySQL `kafka_batch_failures` |
 | Migrations | None | `rails db:migrate` |
+
+No per-job failure metadata is ever written to Redis: exhausted jobs are
+recorded durably on the dead-letter topic, and retrying jobs are listed live
+from the retry topics. `store: :mysql` additionally persists a durable
+failure log to the `kafka_batch_failures` MySQL table.
 
 ### Priority config paths
 

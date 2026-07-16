@@ -92,7 +92,7 @@ export function AppLayout({
         title: 'Operations',
         items: [
           { to: '/', label: 'Batches', icon: <ViewListOutlinedIcon fontSize="small" /> },
-          { to: '/failures', label: 'Failures', icon: <WarningAmberOutlinedIcon fontSize="small" /> },
+          { to: '/failures', label: 'Retries', icon: <WarningAmberOutlinedIcon fontSize="small" /> },
           { to: '/dead_letter', label: 'Dead letter', icon: <ReportOutlinedIcon fontSize="small" /> },
           { to: '/live', label: 'Consumers', icon: <SensorsOutlinedIcon fontSize="small" /> },
           { to: '/lag', label: 'Kafka lag', icon: <SpeedOutlinedIcon fontSize="small" /> },

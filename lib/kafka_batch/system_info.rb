@@ -135,8 +135,6 @@ module KafkaBatch
 
         rows << row("Pool size", config.redis_pool_size)
         rows << row("Batch TTL", fmt_duration(config.batch_ttl))
-        rows << row("Failures TTL", fmt_duration(config.failures_ttl))
-        rows << row("Max failures / batch", config.max_failures_per_batch.zero? ? "unlimited" : config.max_failures_per_batch)
         rows << row("All-index max size", config.all_index_max_size)
 
         Section.new(id: "redis", title: "Redis", icon: "⬡", accent: "#dc2626", rows: rows)
@@ -147,7 +145,8 @@ module KafkaBatch
 
         rows = [
           row("Role", "failures, consumption pauses"),
-          row("Batch ledger", "Redis (shared with :redis store)")
+          row("Batch ledger", "Redis (shared with :redis store)"),
+          row("Failures TTL", fmt_duration(config.failures_ttl))
         ]
 
         if defined?(ActiveRecord::Base)

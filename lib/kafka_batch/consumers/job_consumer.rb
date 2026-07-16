@@ -453,6 +453,7 @@ module KafkaBatch
         # Scheduler#complete when it runs.
         retry_payload = data.merge(
           "attempt"       => next_attempt,
+          "retry_count"   => next_attempt,
           "retry_after"   => retry_after.iso8601,
           "retry_to"      => message.topic,
           "batch_counted" => batch_counted

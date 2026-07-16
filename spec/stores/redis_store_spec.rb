@@ -175,27 +175,21 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
     end
   end
 
-  describe "failure metadata bounds" do
-    it "caps the number of distinct failing jobs tracked per batch" do
-      KafkaBatch.config.max_failures_per_batch = 2
+  describe "failure metadata is NOT stored in Redis" do
+    it "#record_failure is a no-op and never populates a Redis failures hash" do
       id = new_batch
-      3.times do |i|
-        store.record_failure(batch_id: id, job_id: "j#{i}", worker_class: "W",
-                             error_class: "E", error_message: "m", status: "failed")
-      end
-      expect(store.list_failures(id).size).to eq(2)  # 3rd new job skipped at cap
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W",
+                           error_class: "E", error_message: "m", status: "failed")
+
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      expect(redis.exists?("kafka_batch:b:#{id}:failures")).to be(false)
+      expect(store.list_failures(id)).to eq([])
     end
 
-    it "still updates an already-tracked job once at the cap" do
-      KafkaBatch.config.max_failures_per_batch = 1
+    it "#clear_failure and #list_all_failures are safe no-ops" do
       id = new_batch
-      store.record_failure(batch_id: id, job_id: "j0", worker_class: "W",
-                           error_class: "E", error_message: "m", status: "retrying")
-      store.record_failure(batch_id: id, job_id: "j0", worker_class: "W",
-                           error_class: "E", error_message: "m", status: "failed")
-      failures = store.list_failures(id)
-      expect(failures.size).to eq(1)
-      expect(failures.first[:status]).to eq("failed")
+      expect { store.clear_failure(id, "j1") }.not_to raise_error
+      expect(store.list_all_failures).to eq([])
     end
   end
 
@@ -342,40 +336,27 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
     end
   end
 
-  describe "failure tracking (#record_failure / #list_failures)" do
-    it "records and lists failures, idempotent per job_id" do
+  describe "failure tracking (#record_failure / #list_failures) is a Redis no-op" do
+    it "never lists a failure regardless of how many are recorded" do
       id = new_batch
-      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "RuntimeError", error_message: "boom")
       store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "RuntimeError", error_message: "boom")
       store.record_failure(batch_id: id, job_id: "j2", worker_class: "W", error_class: "ArgumentError", error_message: "boom2")
 
-      failures = store.list_failures(id)
-      expect(failures.map { |f| f[:job_id] }).to contain_exactly("j1", "j2")
-      expect(failures.first[:error_class]).to be_a(String)
+      expect(store.list_failures(id)).to eq([])
     end
 
-    it "is removed with the batch" do
+    it "#clear_failure does not raise when nothing was ever recorded" do
       id = new_batch
-      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x")
-      store.delete_batch(id)
-      expect(store.list_failures(id)).to be_empty
+      expect { store.clear_failure(id, "j1") }.not_to raise_error
     end
 
-    it "#clear_failure removes a single job's failure" do
-      id = new_batch
-      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x", status: "retrying")
-      store.clear_failure(id, "j1")
-      expect(store.list_failures(id)).to be_empty
-    end
-
-    it "#list_all_failures aggregates across batches with status filter" do
+    it "#list_all_failures stays empty across batches" do
       a = new_batch
       b = new_batch
       store.record_failure(batch_id: a, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x", status: "retrying")
       store.record_failure(batch_id: b, job_id: "j2", worker_class: "W", error_class: "E", error_message: "y", status: "failed")
 
-      expect(store.list_all_failures.map { |f| f[:batch_id] }).to contain_exactly(a, b)
-      expect(store.list_all_failures(status: "failed").map { |f| f[:job_id] }).to eq(["j2"])
+      expect(store.list_all_failures).to eq([])
     end
   end
 
