@@ -109,6 +109,34 @@ module KafkaBatch
         fair_slot_id  = data["_fair_slot_id"]                  # lease id (nil for pre-upgrade messages)
         fair_started  = nil  # set right before perform so duration reflects run time
 
+        # Operator cancelled this retry (UI delete). Emit terminal failed so the
+        # batch can finish; on_success may never fire (accepted).
+        if job_id && KafkaBatch::RetryCancel.cancelled?(job_id)
+          KafkaBatch.logger.info(
+            "[KafkaBatch][JobConsumer] Skipping cancelled job_id=#{job_id}"
+          )
+          begin
+            if batch_id && data["batch_seq"]
+              emit_event_with_retry(
+                batch_id:     batch_id,
+                job_id:       job_id,
+                status:       "failed",
+                worker_class: data["worker_class"].to_s,
+                message:      message
+              )
+            end
+            clear_failure(batch_id, job_id) if batch_id
+            KafkaBatch::RetryCancel.acknowledge!(job_id)
+            release_uniq_lock(data)
+            commit_offset!(message)
+          ensure
+            if fair_slot
+              release_fair_slot(fair_tenant, 0.0, fair_type, fair_slot_id)
+            end
+          end
+          return
+        end
+
         if expired_job?(data)
           begin
             handle_expired_job(message: message, data: data)
@@ -361,10 +389,8 @@ module KafkaBatch
           delay        = KafkaBatch.config.retry_delay_for(tier)
           retry_after  = Time.now + delay
 
-          # Record the failure on EVERY attempt (not just exhaustion) so problems
-          # surface immediately, with when the next retry is due.
-          record_failure(batch_id, job_id, worker_class, error,
-                         attempt: attempt, status: "retrying", next_retry_at: retry_after)
+          # Retrying jobs are listed from Kafka retry topics (not Redis). Only
+          # terminal exhaustion is cached in the store for the Failed tab.
 
           # Sidekiq-style: first finish touches the batch for on_complete; job
           # keeps retrying. batch_counted rides the retry message so "executed"

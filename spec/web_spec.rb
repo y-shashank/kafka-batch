@@ -296,10 +296,44 @@ RSpec.describe KafkaBatch::Web do
   end
 
   describe "GET /api/failures" do
-    it "lists failures" do
+    it "lists store failures for status=failed" do
+      payload = json_body(get("/api/failures", query: "status=failed"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["source"]).to eq("store")
+      expect(payload["failures"]).to be_a(Array)
+    end
+
+    it "lists retrying from kafka source when Redis is available" do
       payload = json_body(get("/api/failures", query: "status=retrying"))
       expect(payload["ok"]).to eq(true)
+      expect(payload["status"]).to eq("retrying")
+      expect(payload["source"]).to eq("kafka")
       expect(payload["failures"]).to be_a(Array)
+    end
+  end
+
+  describe "POST /api/retries/delete" do
+    it "adds job ids to the cancel set" do
+      KafkaBatch::RetryCancel.reset!
+      payload = json_body(post("/api/retries/delete", json: { job_ids: %w[j1 j2] }))
+      expect(payload["ok"]).to eq(true)
+      expect(KafkaBatch::RetryCancel.cancelled?("j1")).to eq(true)
+      expect(KafkaBatch::RetryCancel.cancelled?("j2")).to eq(true)
+    ensure
+      KafkaBatch::RetryCancel.reset!
+    end
+  end
+
+  describe "POST /api/retries/delete_all" do
+    it "clears the cancel set after writing skip watermarks" do
+      KafkaBatch::RetryCancel.reset!
+      KafkaBatch::RetryCancel.cancel!(%w[a b])
+      payload = json_body(post("/api/retries/delete_all", json: {}))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["delete_all"]).to eq(true)
+      expect(KafkaBatch::RetryCancel.cancelled?("a")).to eq(false)
+    ensure
+      KafkaBatch::RetryCancel.reset!
     end
   end
 

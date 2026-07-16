@@ -34,6 +34,52 @@ RSpec.describe KafkaBatch::Consumers::RetryConsumer do
     expect(FakeProducer.for_topic("test.success")).to be_empty
   end
 
+  it "skips a cancelled job_id before pause and acknowledges it" do
+    KafkaBatch::RetryCancel.reset!
+    KafkaBatch::RetryCancel.cancel!(["j1"])
+    msg = retry_message(retry_after: (Time.now + 120).iso8601, offset: 9)
+    consumer.send(:process_retry, msg)
+
+    expect(consumer).not_to have_received(:pause)
+    expect(consumer).to have_received(:mark_as_consumed!).with(msg)
+    expect(FakeProducer.for_topic("test.success")).to be_empty
+    expect(KafkaBatch::RetryCancel.cancelled?("j1")).to eq(false)
+  ensure
+    KafkaBatch::RetryCancel.reset!
+  end
+
+  it "skips via delete-all watermark before pause and emits failed for batch jobs" do
+    KafkaBatch::RetryCancel.reset!
+    id = SecureRandom.uuid
+    KafkaBatch.store.create_batch(id: id, total_jobs: 1, on_complete: "RecordingCallback")
+    topic = KafkaBatch.config.retry_topic_for(:short)
+    KafkaBatch::RetryCancel.set_skip_watermarks!(topic => { 0 => 9 })
+
+    msg = FakeMessage.new(
+      topic: topic,
+      partition: 0,
+      offset: 9,
+      payload: {
+        "job_id" => "j9",
+        "batch_id" => id,
+        "batch_seq" => 1,
+        "worker_class" => "SuccessfulWorker",
+        "attempt" => 1,
+        "retry_after" => (Time.now + 120).iso8601,
+        "retry_to" => "test.success"
+      }
+    )
+    consumer.send(:process_retry, msg)
+
+    expect(consumer).not_to have_received(:pause)
+    expect(consumer).to have_received(:mark_as_consumed!).with(msg)
+    evt = FakeProducer.for_topic(KafkaBatch.config.events_topic).first
+    expect(evt.payload["status"]).to eq("failed")
+    expect(evt.payload["job_id"]).to eq("j9")
+  ensure
+    KafkaBatch::RetryCancel.reset!
+  end
+
   it "stops the batch at the first not-yet-due message and never skips it (regression)" do
     not_due = retry_message(retry_after: (Time.now + 120).iso8601, offset: 9)
     later   = retry_message(retry_after: (Time.now - 10).iso8601,  offset: 10)

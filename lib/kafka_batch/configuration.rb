@@ -241,6 +241,7 @@ module KafkaBatch
     # caps how many failing jobs are tracked per batch (0 = unlimited).
     attr_accessor :failures_ttl              # Integer – seconds; default 1 day
     attr_accessor :max_failures_per_batch    # Integer – 0 = unlimited; default 1000
+    attr_accessor :retry_cancel_ttl          # Integer – cancel/skip Redis TTL; default 7 days
 
     # ── Multi-tenant fairness (Redis-backed WFQ; Redis REQUIRED) ─────────────
     # Fairness is a PER-WORKER property (`fairness true` on the Worker class) —
@@ -544,6 +545,7 @@ module KafkaBatch
       @batch_ttl                = 7 * 24 * 3600  # 7 days
       @failures_ttl             = 24 * 3600      # 1 day (metadata only; Kafka is the source of truth)
       @max_failures_per_batch   = 1000           # cap tracked failing jobs per batch (0 = unlimited)
+      @retry_cancel_ttl         = 7 * 24 * 3600  # cancel set + skip watermarks TTL
       @fairness_global_concurrency      = 50
       @fairness_max_inflight_per_tenant = 0      # 0 = dynamic fair share only (ceil(window/active))
       @fairness_weighted_concurrency    = true   # false = equal in-flight cap per active tenant

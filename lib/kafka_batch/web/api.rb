@@ -34,6 +34,10 @@ module KafkaBatch
           batches_bulk(env, params)
         elsif method == "GET" && path == "/api/failures"
           failures_index(params)
+        elsif method == "POST" && path == "/api/retries/delete"
+          retries_delete(params, env)
+        elsif method == "POST" && path == "/api/retries/delete_all"
+          retries_delete_all(params, env)
         elsif method == "GET" && path == "/api/live"
           live
         elsif method == "GET" && path == "/api/lag"
@@ -187,7 +191,11 @@ module KafkaBatch
       end
 
       def failures_index(params)
-        status = @web.non_empty(params["status"])
+        status = @web.non_empty(params["status"]) || "retrying"
+        if status == "retrying"
+          return failures_retrying(params)
+        end
+
         page = [params["page"].to_i, 1].max
         offset = (page - 1) * Web::PER_PAGE
         failures = KafkaBatch.store.list_all_failures(limit: Web::PER_PAGE + 1, offset: offset, status: status)
@@ -198,10 +206,82 @@ module KafkaBatch
           page: page,
           has_next: has_next,
           status: status,
+          source: "store",
           failures: failures.map { |f| serialize_failure(f) },
           retry_lag_by_tier: @web.retry_lag_by_tier,
           retry_lag_total: @web.retry_lag
         )
+      end
+
+      def failures_retrying(params)
+        unless KafkaBatch::RetryCancel.available?
+          return Json.ok(
+            ok: true,
+            status: "retrying",
+            source: "kafka",
+            available: false,
+            message: "Retry listing requires Redis (cancel/skip control plane).",
+            failures: [],
+            has_next: false,
+            cursor: nil,
+            retry_lag_by_tier: @web.retry_lag_by_tier,
+            retry_lag_total: @web.retry_lag
+          )
+        end
+
+        reader = KafkaBatch::Retry::Reader.new
+        begin
+          page = reader.fetch_page(cursor: @web.non_empty(params["cursor"]))
+          Json.ok(
+            ok: true,
+            status: "retrying",
+            source: "kafka",
+            available: true,
+            failures: page[:failures].map { |f| serialize_retry_failure(f) },
+            has_next: page[:has_next],
+            cursor: page[:cursor],
+            per_tier: page[:per_tier],
+            retry_lag_by_tier: @web.retry_lag_by_tier,
+            retry_lag_total: @web.retry_lag
+          )
+        ensure
+          reader.close
+        end
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch::Web] retry listing failed: #{e.message}")
+        Json.error(503, "Could not read retry topics: #{e.message}")
+      end
+
+      def retries_delete(params, env)
+        unless KafkaBatch::RetryCancel.available?
+          return Json.error(503, "Redis is required to cancel retries")
+        end
+
+        body = @web.scalarize_params(@web.body_params_multi(env).merge(json_body(env)))
+        merged = params.merge(body.is_a?(Hash) ? body : {})
+        ids = Array(merged["job_ids"] || merged["job_id"]).flatten.map(&:to_s).reject(&:empty?).uniq
+        return Json.error(400, "job_ids required") if ids.empty?
+
+        n = KafkaBatch::RetryCancel.cancel!(ids)
+        Json.ok(ok: true, cancelled: n, job_ids: ids)
+      end
+
+      def retries_delete_all(_params, _env)
+        unless KafkaBatch::RetryCancel.available?
+          return Json.error(503, "Redis is required to cancel retries")
+        end
+
+        reader = KafkaBatch::Retry::Reader.new
+        begin
+          marks = reader.snapshot_watermarks
+          KafkaBatch::RetryCancel.set_skip_watermarks!(marks)
+          KafkaBatch::RetryCancel.clear_cancel_set!
+          Json.ok(ok: true, delete_all: true, watermarks: marks)
+        ensure
+          reader.close
+        end
+      rescue StandardError => e
+        Json.error(503, "delete_all failed: #{e.message}")
       end
 
       def live
@@ -629,6 +709,30 @@ module KafkaBatch
           error_message: f[:error_message],
           failed_at: f[:failed_at],
           failed_at_label: @web.fmt_time(f[:failed_at])
+        }
+      end
+
+      def serialize_retry_failure(f)
+        attempt = f[:attempt].to_i
+        attempt = 1 if attempt < 1
+        {
+          batch_id: f[:batch_id],
+          job_id: f[:job_id],
+          worker_class: f[:worker_class],
+          status: "retrying",
+          attempt: attempt,
+          next_retry_at: f[:next_retry_at],
+          next_retry_eta: f[:next_retry_at] ? @web.fmt_eta(f[:next_retry_at]) : nil,
+          next_retry_at_label: f[:next_retry_at] ? @web.fmt_time(f[:next_retry_at]) : nil,
+          error_class: f[:error_class],
+          error_message: f[:error_message],
+          failed_at: f[:failed_at],
+          failed_at_label: f[:failed_at] ? @web.fmt_time(f[:failed_at]) : nil,
+          topic: f[:topic],
+          partition: f[:partition],
+          offset: f[:offset],
+          tier: f[:tier],
+          retry_to: f[:retry_to]
         }
       end
 

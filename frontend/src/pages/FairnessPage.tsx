@@ -1,23 +1,25 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Link as RouterLink, useParams, useSearchParams } from 'react-router-dom'
+import { useParams, useSearchParams } from 'react-router-dom'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import Paper from '@mui/material/Paper'
+import Chip from '@mui/material/Chip'
 import Stack from '@mui/material/Stack'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
+import TableContainer from '@mui/material/TableContainer'
 import TableHead from '@mui/material/TableHead'
 import TableRow from '@mui/material/TableRow'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
-import Chip from '@mui/material/Chip'
 import { apiGet } from '../api/client'
 import { EmptyState } from '../components/EmptyState'
 import { LoadingBlock } from '../components/LoadingBlock'
 import { MetricCards } from '../components/MetricCards'
 import { PageHeader } from '../components/PageHeader'
+import { SectionCard } from '../components/SectionCard'
+import { monoSx } from '../components/MonoLink'
 import { useLiveRefresh } from '../hooks/useLiveRefresh'
 
 export function FairnessPage() {
@@ -47,36 +49,32 @@ export function FairnessPage() {
   if (!data && !error) return <LoadingBlock />
   if (error) return <Alert severity="error">{error}</Alert>
 
-  const title = lane === 'throughput' ? 'Throughput Fairness' : 'Time Fairness'
+  const title = lane === 'throughput' ? 'Throughput fairness' : 'Time fairness'
 
   return (
     <Box>
-      <Button component={RouterLink} to="/" sx={{ mb: 1 }}>
-        ← All batches
-      </Button>
       <PageHeader title={title} subtitle={data.ready_topics_description || undefined} />
       {!data.lane_active ? (
         <Alert severity="warning" sx={{ mb: 2 }}>
           This fairness lane has no registered workers in this process.
         </Alert>
       ) : null}
-      <Paper sx={{ p: 2, mb: 2 }}>
-        <Typography variant="h6" sx={{ mb: 1 }}>
-          Ingest partition lookup
-        </Typography>
-        <Stack direction="row" spacing={1}>
-          <TextField size="small" label="tenant_id" value={tenantInput} onChange={(e) => setTenantInput(e.target.value)} />
+
+      <SectionCard title="Ingest partition lookup">
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
+          <TextField label="Tenant ID" value={tenantInput} onChange={(e) => setTenantInput(e.target.value)} />
           <Button variant="contained" onClick={() => setParams(tenantInput ? { tenant_id: tenantInput } : {})}>
             Lookup
           </Button>
         </Stack>
         {data.tenant_lookup?.partition != null ? (
-          <Typography variant="body2" sx={{ mt: 1.5 }}>
+          <Typography variant="body2" sx={{ mt: 2 }}>
             Tenant <code>{data.tenant_lookup.tenant_id}</code> → partition <strong>{data.tenant_lookup.partition}</strong> on{' '}
             <code>{data.tenant_lookup.topic}</code>
           </Typography>
         ) : null}
-      </Paper>
+      </SectionCard>
+
       {!data.available ? (
         <EmptyState message={data.message} />
       ) : (
@@ -86,61 +84,55 @@ export function FairnessPage() {
               { label: 'Active lanes', value: data.active_lanes },
               { label: 'Ingest lag', value: data.ingest_total },
               { label: 'Ready lag', value: data.ready_total },
-              {
-                label: 'Dispatcher',
-                value: data.throttled ? 'Throttled' : 'Flowing',
-                color: data.throttled ? '#d97706' : '#059669',
-              },
+              { label: 'Dispatcher', value: data.throttled ? 'Throttled' : 'Flowing', color: data.throttled ? 'warning.main' : 'success.main' },
             ]}
           />
-          <Paper sx={{ p: 2, mb: 2, overflow: 'auto' }}>
-            <Typography variant="h6" sx={{ mb: 1 }}>
-              Ingest ({data.ingest_topic})
-            </Typography>
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>Partition</TableCell>
-                  <TableCell>Lag</TableCell>
-                  <TableCell>Status</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {data.ingest.map((p: any) => (
-                  <TableRow key={p.partition}>
-                    <TableCell>{p.partition}</TableCell>
-                    <TableCell>{p.lag}</TableCell>
-                    <TableCell>{p.never_consumed ? <Chip size="small" color="warning" label="Never consumed" /> : '—'}</TableCell>
+          <SectionCard title={`Ingest (${data.ingest_topic})`} noPadding>
+            <TableContainer>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Partition</TableCell>
+                    <TableCell align="right">Lag</TableCell>
+                    <TableCell>Status</TableCell>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </Paper>
-          <Paper sx={{ p: 2, overflow: 'auto' }}>
-            <Typography variant="h6" sx={{ mb: 1 }}>
-              Ready topics
-            </Typography>
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>Partition</TableCell>
-                  <TableCell>Topic</TableCell>
-                  <TableCell>Runtime</TableCell>
-                  <TableCell>Lag</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {data.ready.map((p: any, i: number) => (
-                  <TableRow key={`${p.topic}-${p.partition}-${i}`}>
-                    <TableCell>{p.partition}</TableCell>
-                    <TableCell sx={{ fontFamily: 'JetBrains Mono, monospace' }}>{p.topic}</TableCell>
-                    <TableCell>{p.runtime || '—'}</TableCell>
-                    <TableCell>{p.lag}</TableCell>
+                </TableHead>
+                <TableBody>
+                  {data.ingest.map((p: any) => (
+                    <TableRow key={p.partition} hover>
+                      <TableCell>{p.partition}</TableCell>
+                      <TableCell align="right">{p.lag}</TableCell>
+                      <TableCell>{p.never_consumed ? <Chip size="small" color="warning" label="Never consumed" /> : '—'}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          </SectionCard>
+          <SectionCard title="Ready topics" noPadding>
+            <TableContainer>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Partition</TableCell>
+                    <TableCell>Topic</TableCell>
+                    <TableCell>Runtime</TableCell>
+                    <TableCell align="right">Lag</TableCell>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </Paper>
+                </TableHead>
+                <TableBody>
+                  {data.ready.map((p: any, i: number) => (
+                    <TableRow key={`${p.topic}-${p.partition}-${i}`} hover>
+                      <TableCell>{p.partition}</TableCell>
+                      <TableCell sx={monoSx}>{p.topic}</TableCell>
+                      <TableCell>{p.runtime || '—'}</TableCell>
+                      <TableCell align="right">{p.lag}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          </SectionCard>
         </>
       )}
     </Box>

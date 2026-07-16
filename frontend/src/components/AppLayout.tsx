@@ -8,28 +8,36 @@ import List from '@mui/material/List'
 import ListItemButton from '@mui/material/ListItemButton'
 import ListItemIcon from '@mui/material/ListItemIcon'
 import ListItemText from '@mui/material/ListItemText'
+import ListSubheader from '@mui/material/ListSubheader'
 import Toolbar from '@mui/material/Toolbar'
 import Typography from '@mui/material/Typography'
 import Button from '@mui/material/Button'
 import Divider from '@mui/material/Divider'
+import Stack from '@mui/material/Stack'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import { useTheme } from '@mui/material/styles'
 import MenuIcon from '@mui/icons-material/Menu'
-import ViewListIcon from '@mui/icons-material/ViewList'
-import WarningAmberIcon from '@mui/icons-material/WarningAmber'
-import DangerousIcon from '@mui/icons-material/Dangerous'
-import PlayCircleIcon from '@mui/icons-material/PlayCircle'
-import SpeedIcon from '@mui/icons-material/Speed'
-import ScheduleIcon from '@mui/icons-material/Schedule'
-import SyncIcon from '@mui/icons-material/Sync'
-import HistoryIcon from '@mui/icons-material/History'
-import TimerIcon from '@mui/icons-material/Timer'
-import BoltIcon from '@mui/icons-material/Bolt'
-import BalanceIcon from '@mui/icons-material/Balance'
-import SettingsIcon from '@mui/icons-material/Settings'
+import ViewListOutlinedIcon from '@mui/icons-material/ViewListOutlined'
+import WarningAmberOutlinedIcon from '@mui/icons-material/WarningAmberOutlined'
+import ReportOutlinedIcon from '@mui/icons-material/ReportOutlined'
+import SensorsOutlinedIcon from '@mui/icons-material/SensorsOutlined'
+import SpeedOutlinedIcon from '@mui/icons-material/SpeedOutlined'
+import ScheduleOutlinedIcon from '@mui/icons-material/ScheduleOutlined'
+import SyncOutlinedIcon from '@mui/icons-material/SyncOutlined'
+import HistoryOutlinedIcon from '@mui/icons-material/HistoryOutlined'
+import TimerOutlinedIcon from '@mui/icons-material/TimerOutlined'
+import BoltOutlinedIcon from '@mui/icons-material/BoltOutlined'
+import TuneOutlinedIcon from '@mui/icons-material/TuneOutlined'
+import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined'
+import FiberManualRecordIcon from '@mui/icons-material/FiberManualRecord'
+import DarkModeOutlinedIcon from '@mui/icons-material/DarkModeOutlined'
+import LightModeOutlinedIcon from '@mui/icons-material/LightModeOutlined'
+import Tooltip from '@mui/material/Tooltip'
+import type { PaletteMode } from '@mui/material/styles'
 import type { Bootstrap } from '../api/client'
+import { BrandMark } from './BrandMark'
 
-const DRAWER_WIDTH = 260
+const DRAWER_WIDTH = 256
 
 type NavItem = { to: string; label: string; icon: React.ReactNode; auditOnly?: boolean }
 
@@ -37,119 +45,151 @@ export function AppLayout({
   bootstrap,
   live,
   onToggleLive,
+  mode,
+  onToggleMode,
 }: {
   bootstrap: Bootstrap | null
   live: boolean
   onToggleLive: () => void
+  mode: PaletteMode
+  onToggleMode: () => void
 }) {
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
   const [open, setOpen] = useState(false)
   const location = useLocation()
 
-  const nav = useMemo<NavItem[]>(
+  const groups = useMemo(
     () => [
-      { to: '/', label: 'Batches', icon: <ViewListIcon /> },
-      { to: '/failures', label: 'Failures', icon: <WarningAmberIcon /> },
-      { to: '/dead_letter', label: 'Dead letter', icon: <DangerousIcon /> },
-      { to: '/live', label: 'Consumer Process', icon: <PlayCircleIcon /> },
-      { to: '/lag', label: 'Kafka Lag', icon: <SpeedIcon /> },
-      { to: '/scheduled', label: 'Scheduled', icon: <ScheduleIcon /> },
-      { to: '/reconciler', label: 'Reconciler', icon: <SyncIcon /> },
-      { to: '/audit', label: 'Audit', icon: <HistoryIcon />, auditOnly: true },
-      { to: '/fairness/time', label: 'Time Fairness', icon: <TimerIcon /> },
-      { to: '/weights/time', label: 'Time Weights', icon: <BalanceIcon /> },
-      { to: '/fairness/throughput', label: 'Throughput Fairness', icon: <BoltIcon /> },
-      { to: '/weights/throughput', label: 'Throughput Weights', icon: <BalanceIcon /> },
-      { to: '/system', label: 'System', icon: <SettingsIcon /> },
+      {
+        title: 'Operations',
+        items: [
+          { to: '/', label: 'Batches', icon: <ViewListOutlinedIcon fontSize="small" /> },
+          { to: '/failures', label: 'Failures', icon: <WarningAmberOutlinedIcon fontSize="small" /> },
+          { to: '/dead_letter', label: 'Dead letter', icon: <ReportOutlinedIcon fontSize="small" /> },
+          { to: '/live', label: 'Consumers', icon: <SensorsOutlinedIcon fontSize="small" /> },
+          { to: '/lag', label: 'Kafka lag', icon: <SpeedOutlinedIcon fontSize="small" /> },
+          { to: '/scheduled', label: 'Scheduled', icon: <ScheduleOutlinedIcon fontSize="small" /> },
+        ] as NavItem[],
+      },
+      {
+        title: 'Fairness',
+        items: [
+          { to: '/fairness/time', label: 'Time fairness', icon: <TimerOutlinedIcon fontSize="small" /> },
+          { to: '/weights/time', label: 'Time weights', icon: <TuneOutlinedIcon fontSize="small" /> },
+          { to: '/fairness/throughput', label: 'Throughput fairness', icon: <BoltOutlinedIcon fontSize="small" /> },
+          { to: '/weights/throughput', label: 'Throughput weights', icon: <TuneOutlinedIcon fontSize="small" /> },
+        ] as NavItem[],
+      },
+      {
+        title: 'Platform',
+        items: [
+          { to: '/reconciler', label: 'Reconciler', icon: <SyncOutlinedIcon fontSize="small" /> },
+          { to: '/audit', label: 'Audit log', icon: <HistoryOutlinedIcon fontSize="small" />, auditOnly: true },
+          { to: '/system', label: 'System', icon: <SettingsOutlinedIcon fontSize="small" /> },
+        ] as NavItem[],
+      },
     ],
     [],
   )
 
-  const items = nav.filter((n) => !n.auditOnly || bootstrap?.audit_enabled)
+  const isActive = (to: string) => {
+    if (to === '/') return location.pathname === '/' || location.pathname.startsWith('/batches/')
+    return location.pathname === to || location.pathname.startsWith(`${to}/`)
+  }
 
   const drawer = (
-    <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', bgcolor: '#0b1220', color: '#e2e8f0' }}>
-      <Box sx={{ px: 2.5, py: 2.25, display: 'flex', alignItems: 'center', gap: 1.25 }}>
-        <Box
-          sx={{
-            width: 28,
-            height: 28,
-            borderRadius: 1.5,
-            background: 'linear-gradient(135deg, #0f766e, #0369a1)',
-            boxShadow: '0 0 0 1px rgba(255,255,255,.12)',
-          }}
-        />
-        <Box>
-          <Typography sx={{ fontWeight: 800, letterSpacing: '-0.02em', lineHeight: 1.1 }}>KafkaBatch</Typography>
-          <Typography variant="caption" sx={{ color: '#94a3b8' }}>
-            v{bootstrap?.version || '—'}
+    <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+      <Box sx={{ px: 2, py: 1.5 }}>
+        <Stack direction="row" spacing={1.5} alignItems="center">
+          <Box sx={{ width: 32, height: 32, flexShrink: 0, lineHeight: 0 }}>
+            <BrandMark size={32} />
+          </Box>
+          <Typography variant="subtitle1" noWrap sx={{ lineHeight: 1.2 }}>
+            KafkaBatch
           </Typography>
-        </Box>
+        </Stack>
+        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.75, pl: 0.25 }}>
+          v{bootstrap?.version || '—'}
+        </Typography>
       </Box>
-      <Divider sx={{ borderColor: 'rgba(148,163,184,.15)' }} />
-      <List dense sx={{ flex: 1, py: 1, overflow: 'auto' }}>
-        {items.map((item) => {
-          const active =
-            item.to === '/'
-              ? location.pathname === '/' || location.pathname.startsWith('/batches/')
-              : location.pathname === item.to || location.pathname.startsWith(`${item.to}/`)
+      <Divider />
+      <Box sx={{ flex: 1, overflow: 'auto', py: 1 }}>
+        {groups.map((group) => {
+          const items = group.items.filter((n) => !n.auditOnly || bootstrap?.audit_enabled)
+          if (!items.length) return null
           return (
-            <ListItemButton
-              key={item.to}
-              component={RouterLink}
-              to={item.to}
-              selected={active}
-              onClick={() => setOpen(false)}
-              sx={{
-                mx: 1,
-                mb: 0.25,
-                borderRadius: 2,
-                color: active ? '#fff' : '#cbd5e1',
-                '&.Mui-selected': { bgcolor: 'rgba(20,184,166,.18)' },
-                '&:hover': { bgcolor: 'rgba(148,163,184,.10)' },
-              }}
+            <List
+              key={group.title}
+              dense
+              subheader={
+                <ListSubheader
+                  disableSticky
+                  sx={{
+                    bgcolor: 'transparent',
+                    lineHeight: '32px',
+                    typography: 'overline',
+                    color: 'text.secondary',
+                  }}
+                >
+                  {group.title}
+                </ListSubheader>
+              }
             >
-              <ListItemIcon sx={{ minWidth: 36, color: active ? '#5eead4' : '#94a3b8' }}>{item.icon}</ListItemIcon>
-              <ListItemText primary={item.label} primaryTypographyProps={{ fontSize: 13.5, fontWeight: active ? 700 : 500 }} />
-            </ListItemButton>
+              {items.map((item) => (
+                <ListItemButton
+                  key={item.to}
+                  component={RouterLink}
+                  to={item.to}
+                  selected={isActive(item.to)}
+                  onClick={() => setOpen(false)}
+                  sx={{ mx: 1, mb: 0.25, borderRadius: 1, minHeight: 40 }}
+                >
+                  <ListItemIcon sx={{ minWidth: 36 }}>{item.icon}</ListItemIcon>
+                  <ListItemText
+                    primary={item.label}
+                    primaryTypographyProps={{ variant: 'body2', fontWeight: isActive(item.to) ? 500 : 400 }}
+                  />
+                </ListItemButton>
+              ))}
+            </List>
           )
         })}
-      </List>
+      </Box>
     </Box>
   )
 
   return (
-    <Box sx={{ display: 'flex', minHeight: '100vh' }}>
+    <Box sx={{ display: 'flex', minHeight: '100vh', bgcolor: 'background.default' }}>
       <AppBar
         position="fixed"
-        color="inherit"
-        elevation={0}
         sx={{
           width: { md: `calc(100% - ${DRAWER_WIDTH}px)` },
           ml: { md: `${DRAWER_WIDTH}px` },
-          bgcolor: 'rgba(255,255,255,.78)',
-          backdropFilter: 'blur(12px)',
-          borderBottom: '1px solid',
-          borderColor: 'divider',
         }}
       >
-        <Toolbar sx={{ gap: 1 }}>
+        <Toolbar>
           {mobile ? (
-            <IconButton edge="start" onClick={() => setOpen(true)}>
+            <IconButton edge="start" onClick={() => setOpen(true)} sx={{ mr: 1 }} aria-label="Open navigation">
               <MenuIcon />
             </IconButton>
           ) : null}
-          <Typography variant="subtitle1" sx={{ flex: 1, fontWeight: 700 }}>
-            Control plane
+          <Typography variant="subtitle1" sx={{ flex: 1 }} color="text.secondary">
+            Operations console
           </Typography>
+          <Tooltip title={mode === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}>
+            <IconButton onClick={onToggleMode} aria-label="Toggle dark mode" size="small" sx={{ mr: 1 }}>
+              {mode === 'dark' ? <LightModeOutlinedIcon fontSize="small" /> : <DarkModeOutlinedIcon fontSize="small" />}
+            </IconButton>
+          </Tooltip>
           <Button
             variant={live ? 'contained' : 'outlined'}
             color={live ? 'success' : 'inherit'}
             onClick={onToggleLive}
             size="small"
+            startIcon={<FiberManualRecordIcon sx={{ fontSize: 12, color: live ? undefined : 'text.disabled' }} />}
           >
-            {live ? '● Live' : '○ Live'}
+            {live ? 'Live' : 'Live off'}
           </Button>
         </Toolbar>
       </AppBar>
@@ -167,7 +207,6 @@ export function AppLayout({
               '& .MuiDrawer-paper': {
                 width: DRAWER_WIDTH,
                 boxSizing: 'border-box',
-                borderRight: 'none',
               },
             }}
           >
@@ -176,7 +215,18 @@ export function AppLayout({
         )}
       </Box>
 
-      <Box component="main" sx={{ flexGrow: 1, width: { md: `calc(100% - ${DRAWER_WIDTH}px)` }, p: { xs: 2, md: 3 }, pt: { xs: 10, md: 11 } }}>
+      <Box
+        component="main"
+        sx={{
+          flexGrow: 1,
+          width: { md: `calc(100% - ${DRAWER_WIDTH}px)` },
+          maxWidth: '100%',
+          minWidth: 0,
+          px: { xs: 2, md: 3 },
+          py: { xs: 2, md: 3 },
+          mt: 7,
+        }}
+      >
         <Outlet />
       </Box>
     </Box>

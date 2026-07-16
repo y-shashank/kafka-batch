@@ -1,22 +1,26 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Link as RouterLink, useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router-dom'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import Paper from '@mui/material/Paper'
+import InputAdornment from '@mui/material/InputAdornment'
 import Stack from '@mui/material/Stack'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
+import TableContainer from '@mui/material/TableContainer'
 import TableHead from '@mui/material/TableHead'
 import TableRow from '@mui/material/TableRow'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
+import SearchIcon from '@mui/icons-material/Search'
 import { apiGet } from '../api/client'
 import { EmptyState } from '../components/EmptyState'
 import { LoadingBlock } from '../components/LoadingBlock'
 import { MetricCards } from '../components/MetricCards'
 import { PageHeader } from '../components/PageHeader'
+import { SectionCard } from '../components/SectionCard'
+import { MonoLink, monoSx } from '../components/MonoLink'
 import { useLiveRefresh } from '../hooks/useLiveRefresh'
 
 export function ScheduledPage() {
@@ -47,9 +51,6 @@ export function ScheduledPage() {
 
   return (
     <Box>
-      <Button component={RouterLink} to="/" sx={{ mb: 1 }}>
-        ← All batches
-      </Button>
       <PageHeader title="Scheduled" subtitle="Delayed jobs waiting in the schedule index." />
       <MetricCards
         metrics={[
@@ -57,56 +58,76 @@ export function ScheduledPage() {
           { label: 'Backend', value: String(data.backend) },
         ]}
       />
-      <Stack direction="row" spacing={1} sx={{ mb: 2 }}>
-        <TextField size="small" placeholder="Search by job ID…" value={search} onChange={(e) => setSearch(e.target.value)} sx={{ minWidth: 280 }} />
-        <Button variant="outlined" onClick={() => setParams(search ? { q: search } : {})}>
-          Search
-        </Button>
-        {q ? <Button onClick={() => { setSearch(''); setParams({}) }}>Clear</Button> : null}
-      </Stack>
-      <Paper sx={{ overflow: 'auto' }}>
-        <Table size="small">
-          <TableHead>
-            <TableRow>
-              <TableCell>Pointer</TableCell>
-              <TableCell>Batch</TableCell>
-              <TableCell>Run at</TableCell>
-              <TableCell>State</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {data.jobs.length === 0 ? (
+      <SectionCard noPadding>
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} sx={{ p: 2 }}>
+          <TextField
+            placeholder="Search by job ID"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') setParams(search ? { q: search } : {})
+            }}
+            sx={{ minWidth: { sm: 280 } }}
+            InputProps={{
+              startAdornment: (
+                <InputAdornment position="start">
+                  <SearchIcon fontSize="small" />
+                </InputAdornment>
+              ),
+            }}
+          />
+          <Button variant="contained" onClick={() => setParams(search ? { q: search } : {})}>
+            Search
+          </Button>
+          {q ? (
+            <Button
+              onClick={() => {
+                setSearch('')
+                setParams({})
+              }}
+            >
+              Clear
+            </Button>
+          ) : null}
+        </Stack>
+        <TableContainer>
+          <Table size="small">
+            <TableHead>
               <TableRow>
-                <TableCell colSpan={4} align="center" sx={{ py: 4, color: 'text.secondary' }}>
-                  No scheduled jobs.
-                </TableCell>
+                <TableCell>Pointer</TableCell>
+                <TableCell>Batch</TableCell>
+                <TableCell>Run at</TableCell>
+                <TableCell>State</TableCell>
               </TableRow>
-            ) : (
-              data.jobs.map((j: any) => (
-                <TableRow key={j.pointer}>
-                  <TableCell sx={{ fontFamily: 'JetBrains Mono, monospace' }}>{j.pointer}</TableCell>
-                  <TableCell>
-                    {j.batch_id ? (
-                      <Typography component={RouterLink} to={`/batches/${j.batch_id}`} sx={{ fontFamily: 'JetBrains Mono, monospace', textDecoration: 'none' }}>
-                        {String(j.batch_id).slice(0, 8)}
-                      </Typography>
-                    ) : (
-                      '—'
-                    )}
+            </TableHead>
+            <TableBody>
+              {data.jobs.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={4} align="center" sx={{ py: 5 }}>
+                    <Typography color="text.secondary">No scheduled jobs.</Typography>
                   </TableCell>
-                  <TableCell>
-                    {j.run_at_eta}
-                    <Typography variant="caption" display="block" color="text.secondary">
-                      {j.run_at_label}
-                    </Typography>
-                  </TableCell>
-                  <TableCell>{j.state}</TableCell>
                 </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-      </Paper>
+              ) : (
+                data.jobs.map((j: any) => (
+                  <TableRow key={j.pointer} hover>
+                    <TableCell sx={monoSx}>{j.pointer}</TableCell>
+                    <TableCell>
+                      {j.batch_id ? <MonoLink to={`/batches/${j.batch_id}`}>{String(j.batch_id).slice(0, 8)}</MonoLink> : '—'}
+                    </TableCell>
+                    <TableCell>
+                      {j.run_at_eta}
+                      <Typography variant="caption" display="block" color="text.secondary">
+                        {j.run_at_label}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>{j.state}</TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      </SectionCard>
     </Box>
   )
 }

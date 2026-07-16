@@ -1,5 +1,7 @@
-import Box from '@mui/material/Box'
-import Paper from '@mui/material/Paper'
+import Card from '@mui/material/Card'
+import CardActionArea from '@mui/material/CardActionArea'
+import CardContent from '@mui/material/CardContent'
+import Grid from '@mui/material/Grid'
 import Typography from '@mui/material/Typography'
 import { Link as RouterLink } from 'react-router-dom'
 
@@ -12,35 +14,33 @@ export type Metric = {
 
 export function MetricCards({ metrics }: { metrics: Metric[] }) {
   return (
-    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.5, mb: 2 }}>
+    <Grid container spacing={1.5} sx={{ mb: 2.5 }}>
       {metrics.map((m) => {
-        const inner = (
-          <Paper
-            key={m.label}
-            sx={{
-              px: 2,
-              py: 1.5,
-              minWidth: 120,
-              transition: 'transform .15s ease, box-shadow .15s ease',
-              '&:hover': m.to ? { transform: 'translateY(-2px)', boxShadow: '0 8px 24px rgba(15,23,42,.08)' } : undefined,
-            }}
-          >
-            <Typography variant="h5" sx={{ color: m.color || 'text.primary', fontWeight: 800, lineHeight: 1.1 }}>
+        const content = (
+          <CardContent sx={{ py: 1.75, '&:last-child': { pb: 1.75 } }}>
+            <Typography variant="h5" sx={{ color: m.color || 'text.primary', fontWeight: 400, lineHeight: 1.2 }}>
               {m.value}
             </Typography>
-            <Typography variant="caption" color="text.secondary" sx={{ textTransform: 'uppercase', letterSpacing: '.06em', fontWeight: 600 }}>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
               {m.label}
             </Typography>
-          </Paper>
+          </CardContent>
         )
-        return m.to ? (
-          <Box key={m.label} component={RouterLink} to={m.to} sx={{ textDecoration: 'none', color: 'inherit' }}>
-            {inner}
-          </Box>
-        ) : (
-          <Box key={m.label}>{inner}</Box>
+
+        return (
+          <Grid key={m.label} size={{ xs: 6, sm: 4, md: 3, lg: 2 }}>
+            <Card variant="outlined" sx={{ height: '100%' }}>
+              {m.to ? (
+                <CardActionArea component={RouterLink} to={m.to} sx={{ height: '100%' }}>
+                  {content}
+                </CardActionArea>
+              ) : (
+                content
+              )}
+            </Card>
+          </Grid>
         )
       })}
-    </Box>
+    </Grid>
   )
 }

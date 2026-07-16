@@ -69,6 +69,24 @@ module KafkaBatch
           return true
         end
 
+        # Operator delete (single/multi cancel set or delete-all skip watermark).
+        # Must run before pause() so delete-all is not blocked behind a not-due head.
+        if KafkaBatch::RetryCancel.should_skip?(
+          topic: message.topic,
+          partition: message.partition,
+          offset: message.offset,
+          job_id: data["job_id"]
+        )
+          KafkaBatch.logger.info(
+            "[KafkaBatch][RetryConsumer] Skipping cancelled/watermarked retry " \
+            "job_id=#{data['job_id']} #{message.topic}/#{message.partition}@#{message.offset}"
+          )
+          emit_failed_event(data, message)
+          KafkaBatch::RetryCancel.acknowledge!(data["job_id"])
+          mark_as_consumed!(message)
+          return true
+        end
+
         retry_after = parse_time(data["retry_after"])
         retry_to    = data["retry_to"]
 

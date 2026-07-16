@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Link as RouterLink, useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router-dom'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Chip from '@mui/material/Chip'
-import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
+import TableContainer from '@mui/material/TableContainer'
 import TableHead from '@mui/material/TableHead'
 import TableRow from '@mui/material/TableRow'
 import Typography from '@mui/material/Typography'
@@ -17,6 +17,8 @@ import { EmptyState } from '../components/EmptyState'
 import { LoadingBlock } from '../components/LoadingBlock'
 import { MetricCards } from '../components/MetricCards'
 import { PageHeader } from '../components/PageHeader'
+import { SectionCard } from '../components/SectionCard'
+import { MonoLink, monoSx } from '../components/MonoLink'
 import { useLiveRefresh } from '../hooks/useLiveRefresh'
 
 export function DeadLetterPage() {
@@ -45,7 +47,7 @@ export function DeadLetterPage() {
 
   if (!data && !error) return <LoadingBlock />
   if (error) return <Alert severity="error">{error}</Alert>
-  if (!data.available) return <EmptyState title="Dead letter topic" message={data.message} />
+  if (!data.available) return <EmptyState title="Dead letter" message={data.message} />
 
   const byType = data.stats.by_type || {}
   const chips = [
@@ -57,9 +59,6 @@ export function DeadLetterPage() {
 
   return (
     <Box>
-      <Button component={RouterLink} to="/" sx={{ mb: 1 }}>
-        ← All batches
-      </Button>
       <PageHeader title="Dead letter" subtitle={`Topic ${data.stats.topic}. Newest first.`} />
       <MetricCards
         metrics={[
@@ -68,79 +67,78 @@ export function DeadLetterPage() {
           { label: 'Sample size', value: data.stats.sample_size },
         ]}
       />
-      <Stack direction="row" spacing={1} sx={{ mb: 2 }} flexWrap="wrap" useFlexGap>
-        {chips.map((c) => (
-          <Chip
-            key={c.label}
-            label={c.label}
-            clickable
-            color={type === c.value ? 'primary' : 'default'}
-            onClick={() => setParams(c.value ? { type: c.value } : {})}
-          />
-        ))}
-      </Stack>
-      <Paper sx={{ overflow: 'auto' }}>
-        <Table size="small">
-          <TableHead>
-            <TableRow>
-              <TableCell>When</TableCell>
-              <TableCell>Type</TableCell>
-              <TableCell>Worker</TableCell>
-              <TableCell>Batch / Job</TableCell>
-              <TableCell>Source</TableCell>
-              <TableCell>Error</TableCell>
-              <TableCell>Part:Off</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {data.messages.length === 0 ? (
+      <SectionCard noPadding>
+        <Stack direction="row" spacing={1} sx={{ px: 2, pt: 2, pb: 1 }} flexWrap="wrap" useFlexGap>
+          {chips.map((c) => (
+            <Chip
+              key={c.label}
+              label={c.label}
+              clickable
+              color={type === c.value ? 'primary' : 'default'}
+              variant={type === c.value ? 'filled' : 'outlined'}
+              onClick={() => setParams(c.value ? { type: c.value } : {})}
+            />
+          ))}
+        </Stack>
+        <TableContainer>
+          <Table size="small">
+            <TableHead>
               <TableRow>
-                <TableCell colSpan={7} align="center" sx={{ py: 4, color: 'text.secondary' }}>
-                  No dead-letter messages.
-                </TableCell>
+                <TableCell>When</TableCell>
+                <TableCell>Type</TableCell>
+                <TableCell>Worker</TableCell>
+                <TableCell>Batch / job</TableCell>
+                <TableCell>Source</TableCell>
+                <TableCell>Error</TableCell>
+                <TableCell>Part:off</TableCell>
               </TableRow>
-            ) : (
-              data.messages.map((m: any, i: number) => (
-                <TableRow key={`${m.partition}:${m.offset}:${i}`}>
-                  <TableCell>{m.dlt_at_label}</TableCell>
-                  <TableCell>
-                    <Chip size="small" label={m.dlt_type} />
-                  </TableCell>
-                  <TableCell sx={{ fontFamily: 'JetBrains Mono, monospace' }}>{m.worker_class}</TableCell>
-                  <TableCell>
-                    {m.batch_id ? (
-                      <Typography component={RouterLink} to={`/batches/${m.batch_id}`} sx={{ fontFamily: 'JetBrains Mono, monospace', textDecoration: 'none' }}>
-                        {String(m.batch_id).slice(0, 8)}
-                      </Typography>
-                    ) : (
-                      '—'
-                    )}{' '}
-                    / <span style={{ fontFamily: 'JetBrains Mono, monospace' }}>{m.job_id ? String(m.job_id).slice(0, 8) : '—'}</span>
-                  </TableCell>
-                  <TableCell sx={{ fontFamily: 'JetBrains Mono, monospace' }}>{m.source_topic}</TableCell>
-                  <TableCell sx={{ fontFamily: 'JetBrains Mono, monospace' }}>{m.error}</TableCell>
-                  <TableCell sx={{ fontFamily: 'JetBrains Mono, monospace' }}>
-                    {m.partition}:{m.offset}
+            </TableHead>
+            <TableBody>
+              {data.messages.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={7} align="center" sx={{ py: 5 }}>
+                    <Typography color="text.secondary">No dead-letter messages.</Typography>
                   </TableCell>
                 </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-      </Paper>
-      {data.has_older ? (
-        <Stack direction="row" justifyContent="center" sx={{ mt: 2 }}>
-          <Button
-            onClick={() => {
-              const next: Record<string, string> = { before: data.cursor_older }
-              if (type) next.type = type
-              setParams(next)
-            }}
-          >
-            Older →
-          </Button>
-        </Stack>
-      ) : null}
+              ) : (
+                data.messages.map((m: any, i: number) => (
+                  <TableRow key={`${m.partition}:${m.offset}:${i}`} hover>
+                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{m.dlt_at_label}</TableCell>
+                    <TableCell>
+                      <Chip size="small" variant="outlined" label={m.dlt_type} />
+                    </TableCell>
+                    <TableCell sx={monoSx}>{m.worker_class}</TableCell>
+                    <TableCell>
+                      {m.batch_id ? <MonoLink to={`/batches/${m.batch_id}`}>{String(m.batch_id).slice(0, 8)}</MonoLink> : '—'} /{' '}
+                      <Typography component="span" sx={monoSx}>
+                        {m.job_id ? String(m.job_id).slice(0, 8) : '—'}
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={monoSx}>{m.source_topic}</TableCell>
+                    <TableCell sx={{ ...monoSx, maxWidth: 280 }}>{m.error}</TableCell>
+                    <TableCell sx={monoSx}>
+                      {m.partition}:{m.offset}
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+        {data.has_older ? (
+          <Stack direction="row" justifyContent="center" sx={{ p: 2 }}>
+            <Button
+              onClick={() => {
+                const next: Record<string, string> = { before: data.cursor_older }
+                if (type) next.type = type
+                setParams(next)
+              }}
+            >
+              Older
+            </Button>
+          </Stack>
+        ) : null}
+      </SectionCard>
     </Box>
   )
 }

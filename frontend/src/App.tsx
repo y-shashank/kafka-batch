@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { CssBaseline, ThemeProvider } from '@mui/material'
+import type { PaletteMode } from '@mui/material/styles'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import CircularProgress from '@mui/material/CircularProgress'
 import { loadBootstrap, mountBase, type Bootstrap } from './api/client'
 import { AppLayout } from './components/AppLayout'
-import { theme } from './theme'
+import { createAppTheme, readStoredMode, storeMode } from './theme'
 import { BatchesPage } from './pages/BatchesPage'
 import { BatchDetailPage } from './pages/BatchDetailPage'
 import { FailuresPage } from './pages/FailuresPage'
@@ -22,7 +23,15 @@ import { AuditPage } from './pages/AuditPage'
 
 const LIVE_KEY = 'kafka_batch_live'
 
-function AppRoutes({ bootstrap }: { bootstrap: Bootstrap }) {
+function AppRoutes({
+  bootstrap,
+  mode,
+  onToggleMode,
+}: {
+  bootstrap: Bootstrap
+  mode: PaletteMode
+  onToggleMode: () => void
+}) {
   const [live, setLive] = useState(() => localStorage.getItem(LIVE_KEY) === '1')
   const toggleLive = useCallback(() => {
     setLive((prev) => {
@@ -34,7 +43,17 @@ function AppRoutes({ bootstrap }: { bootstrap: Bootstrap }) {
 
   return (
     <Routes>
-      <Route element={<AppLayout bootstrap={bootstrap} live={live} onToggleLive={toggleLive} />}>
+      <Route
+        element={
+          <AppLayout
+            bootstrap={bootstrap}
+            live={live}
+            onToggleLive={toggleLive}
+            mode={mode}
+            onToggleMode={onToggleMode}
+          />
+        }
+      >
         <Route index element={<BatchesPage />} />
         <Route path="batches/:id" element={<BatchDetailPage />} />
         <Route path="failures" element={<FailuresPage />} />
@@ -58,6 +77,16 @@ function AppRoutes({ bootstrap }: { bootstrap: Bootstrap }) {
 export default function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [mode, setMode] = useState<PaletteMode>(() => readStoredMode())
+  const theme = useMemo(() => createAppTheme(mode), [mode])
+
+  const toggleMode = useCallback(() => {
+    setMode((prev) => {
+      const next: PaletteMode = prev === 'dark' ? 'light' : 'dark'
+      storeMode(next)
+      return next
+    })
+  }, [])
 
   useEffect(() => {
     loadBootstrap()
@@ -93,7 +122,7 @@ export default function App() {
     <ThemeProvider theme={theme}>
       <CssBaseline />
       <BrowserRouter basename={basename === '/' ? undefined : basename}>
-        <AppRoutes bootstrap={bootstrap} />
+        <AppRoutes bootstrap={bootstrap} mode={mode} onToggleMode={toggleMode} />
       </BrowserRouter>
     </ThemeProvider>
   )

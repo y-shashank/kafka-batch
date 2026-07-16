@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Link as RouterLink } from 'react-router-dom'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
-import Button from '@mui/material/Button'
-import Paper from '@mui/material/Paper'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
+import TableContainer from '@mui/material/TableContainer'
 import TableHead from '@mui/material/TableHead'
 import TableRow from '@mui/material/TableRow'
 import Typography from '@mui/material/Typography'
@@ -14,6 +12,8 @@ import { apiGet } from '../api/client'
 import { LoadingBlock } from '../components/LoadingBlock'
 import { MetricCards } from '../components/MetricCards'
 import { PageHeader } from '../components/PageHeader'
+import { SectionCard } from '../components/SectionCard'
+import { MonoLink } from '../components/MonoLink'
 import { useLiveRefresh } from '../hooks/useLiveRefresh'
 
 export function ReconcilerPage() {
@@ -38,9 +38,6 @@ export function ReconcilerPage() {
 
   return (
     <Box>
-      <Button component={RouterLink} to="/" sx={{ mb: 1 }}>
-        ← All batches
-      </Button>
       <PageHeader title="Reconciler" subtitle="Last sweep that recovered stuck batches and refired lost callbacks." />
       {!last ? (
         <Alert severity="info" sx={{ mb: 2 }}>
@@ -64,83 +61,75 @@ export function ReconcilerPage() {
         </Alert>
       ) : null}
       {last ? (
-        <Paper sx={{ p: 2, mb: 2 }}>
-          <Typography variant="h6" sx={{ mb: 1 }}>
-            Last sweep
-          </Typography>
+        <SectionCard title="Last sweep">
+          <TableContainer>
+            <Table size="small">
+              <TableBody>
+                <TableRow>
+                  <TableCell sx={{ width: 280, color: 'text.secondary', fontWeight: 500 }}>Stuck-running found / processed</TableCell>
+                  <TableCell>
+                    {last.found_stale}/{last.processed_stale}
+                    {String(last.capped_stale) === '1' ? ' (capped)' : ''}
+                  </TableCell>
+                </TableRow>
+                <TableRow>
+                  <TableCell sx={{ color: 'text.secondary', fontWeight: 500 }}>Lost-callback found / processed</TableCell>
+                  <TableCell>
+                    {last.found_lost}/{last.processed_lost}
+                    {String(last.capped_lost) === '1' ? ' (capped)' : ''}
+                  </TableCell>
+                </TableRow>
+                <TableRow>
+                  <TableCell sx={{ color: 'text.secondary', fontWeight: 500 }}>Skipped</TableCell>
+                  <TableCell>{last.skipped_stale}</TableCell>
+                </TableRow>
+                <TableRow>
+                  <TableCell sx={{ color: 'text.secondary', fontWeight: 500 }}>Interval / max per run</TableCell>
+                  <TableCell>
+                    {data.reconciliation_interval}s / {data.max_reconcile_per_run}
+                  </TableCell>
+                </TableRow>
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </SectionCard>
+      ) : null}
+      <SectionCard title="Last run detail" noPadding>
+        <TableContainer>
           <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell>Batch</TableCell>
+                <TableCell>Action</TableCell>
+                <TableCell>Outcome</TableCell>
+                <TableCell align="right">Total</TableCell>
+                <TableCell align="right">Failed</TableCell>
+              </TableRow>
+            </TableHead>
             <TableBody>
-              <TableRow>
-                <TableCell sx={{ width: 280, color: 'text.secondary' }}>Stuck-running found / processed</TableCell>
-                <TableCell>
-                  {last.found_stale}/{last.processed_stale}
-                  {String(last.capped_stale) === '1' ? ' (capped)' : ''}
-                </TableCell>
-              </TableRow>
-              <TableRow>
-                <TableCell sx={{ color: 'text.secondary' }}>Lost-callback found / processed</TableCell>
-                <TableCell>
-                  {last.found_lost}/{last.processed_lost}
-                  {String(last.capped_lost) === '1' ? ' (capped)' : ''}
-                </TableCell>
-              </TableRow>
-              <TableRow>
-                <TableCell sx={{ color: 'text.secondary' }}>Skipped</TableCell>
-                <TableCell>{last.skipped_stale}</TableCell>
-              </TableRow>
-              <TableRow>
-                <TableCell sx={{ color: 'text.secondary' }}>Interval / max per run</TableCell>
-                <TableCell>
-                  {data.reconciliation_interval}s / {data.max_reconcile_per_run}
-                </TableCell>
-              </TableRow>
+              {(data.details || []).length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={5} align="center" sx={{ py: 4 }}>
+                    <Typography color="text.secondary">No per-batch actions on the last run.</Typography>
+                  </TableCell>
+                </TableRow>
+              ) : (
+                data.details.map((d: any, i: number) => (
+                  <TableRow key={i} hover>
+                    <TableCell>
+                      {d.batch_id ? <MonoLink to={`/batches/${d.batch_id}`}>{String(d.batch_id).slice(0, 8)}…</MonoLink> : '—'}
+                    </TableCell>
+                    <TableCell>{d.action}</TableCell>
+                    <TableCell>{d.outcome}</TableCell>
+                    <TableCell align="right">{d.total_jobs}</TableCell>
+                    <TableCell align="right">{d.failed_count}</TableCell>
+                  </TableRow>
+                ))
+              )}
             </TableBody>
           </Table>
-        </Paper>
-      ) : null}
-      <Paper sx={{ p: 2, overflow: 'auto' }}>
-        <Typography variant="h6" sx={{ mb: 1 }}>
-          Last run detail
-        </Typography>
-        <Table size="small">
-          <TableHead>
-            <TableRow>
-              <TableCell>Batch</TableCell>
-              <TableCell>Action</TableCell>
-              <TableCell>Outcome</TableCell>
-              <TableCell>Total</TableCell>
-              <TableCell>Failed</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {(data.details || []).length === 0 ? (
-              <TableRow>
-                <TableCell colSpan={5} align="center" sx={{ py: 3, color: 'text.secondary' }}>
-                  No per-batch actions on the last run.
-                </TableCell>
-              </TableRow>
-            ) : (
-              data.details.map((d: any, i: number) => (
-                <TableRow key={i}>
-                  <TableCell>
-                    {d.batch_id ? (
-                      <Typography component={RouterLink} to={`/batches/${d.batch_id}`} sx={{ fontFamily: 'JetBrains Mono, monospace', textDecoration: 'none' }}>
-                        {String(d.batch_id).slice(0, 8)}…
-                      </Typography>
-                    ) : (
-                      '—'
-                    )}
-                  </TableCell>
-                  <TableCell>{d.action}</TableCell>
-                  <TableCell>{d.outcome}</TableCell>
-                  <TableCell>{d.total_jobs}</TableCell>
-                  <TableCell>{d.failed_count}</TableCell>
-                </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-      </Paper>
+        </TableContainer>
+      </SectionCard>
     </Box>
   )
 }

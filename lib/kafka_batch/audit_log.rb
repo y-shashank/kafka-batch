@@ -153,6 +153,8 @@ module KafkaBatch
         when %r{\A/batches/bulk\z} then "batches.bulk"
         when %r{\A/batches/[^/]+/cancel\z} then "batches.cancel"
         when %r{\A/batches/[^/]+/delete\z}, %r{\A/batches/[^/]+\z} then "batches.delete"
+        when %r{\A/retries/delete_all\z} then "retries.delete_all"
+        when %r{\A/retries/delete\z} then "retries.delete"
         else "web.#{path.delete_prefix('/').tr('/', '.')}"
         end
       end

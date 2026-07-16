@@ -123,15 +123,13 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       expect(retry_topic_used("tp1")).to eq(KafkaBatch.config.retry_topic_for(:large))
     end
 
-    it "records the failure as 'retrying' on the first failed attempt" do
+    it "does not cache retrying failures in Redis (listed from Kafka retry topics)" do
       consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 0, job_id: "jr"))
 
-      f = KafkaBatch.store.list_failures("b1").first
-      expect(f).not_to be_nil
-      expect(f[:status]).to eq("retrying")
-      expect(f[:job_id]).to eq("jr")
-      expect(f[:error_class]).to eq("RuntimeError")
-      expect(f[:next_retry_at]).not_to be_nil  # tiered retry schedule
+      expect(KafkaBatch.store.list_failures("b1")).to be_empty
+      msg = retry_for("jr")
+      expect(msg).not_to be_nil
+      expect(msg.payload["retry_after"]).not_to be_nil
     end
 
     it "schedules the first retry within the short tier (~30s)" do
