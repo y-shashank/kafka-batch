@@ -8,9 +8,12 @@ module KafkaBatch
   #
   # Listener thread: Claim (Redis) → mark_as_consumed! → enqueue perform.
   # Pool threads: run the existing JobConsumer pipeline without marking; Complete
-  # the workset on success, or leave it for Go daemon reclaim on apply failure.
+  # the workset on success, or leave it for control-plane reclaim on apply failure.
   #
-  # Requires shared Redis with kafka-batch-go `kbatch daemon` reclaim.
+  # Two limits (Go parity):
+  #   claim_window — max Claimed∨Queued∨Performing (gates Claim+Mark)
+  #   concurrency  — max concurrent #perform
+  # Renew starts at Claim so leases stay alive while waiting for a perform slot.
   module SuperFetch
     class Executor
       def initialize(store: nil)
@@ -18,7 +21,8 @@ module KafkaBatch
         @mutex          = Mutex.new
         @in_flight      = Set.new
         @accepting      = true
-        @sem            = nil # SizedQueue of tokens, rebuilt when concurrency changes
+        @claim_window   = nil # SizedQueue
+        @perform_sem    = nil # SizedQueue
         @active_threads = 0
         @shutdown       = false
       end
@@ -27,24 +31,24 @@ module KafkaBatch
         messages.each { |message| dispatch_one(consumer, message) }
       end
 
-      # Claim → mark → pool. Blocks when the concurrency pool is full (backpressure).
+      # Claim → mark → pool. Blocks on claim_window when full (not perform pool).
       def dispatch_one(consumer, message)
-        acquire_slot!
+        acquire_claim_window!
         job_id = extract_job_id(message)
 
         if job_id.empty?
           begin
             consumer.send(:process_message, message)
           ensure
-            release_slot!
+            release_claim_window!
           end
           return
         end
 
         unless track_in_flight(job_id)
-          # Already performing in this process (Kafka redelivery).
+          # Already claimed/performing in this process (Kafka redelivery).
           consumer.mark_as_consumed!(message)
-          release_slot!
+          release_claim_window!
           return
         end
 
@@ -65,7 +69,7 @@ module KafkaBatch
             "[KafkaBatch][SuperFetch] claim error job_id=#{job_id}: #{e.class}: #{e.message} — leaving unacked"
           )
           untrack_in_flight(job_id)
-          release_slot!
+          release_claim_window!
           return
         end
 
@@ -75,16 +79,19 @@ module KafkaBatch
           )
           consumer.mark_as_consumed!(message)
           untrack_in_flight(job_id)
-          release_slot!
+          release_claim_window!
           return
         end
 
         # Durability: Redis owns the job before Kafka forgets it.
         consumer.mark_as_consumed!(message)
 
+        # Renew from claim time so lease cannot expire while waiting for perform.
+        stop_renew = start_renew(job_id, claim.fence)
+
         Thread.new do
           Thread.current.name = "kafka-batch-superfetch-#{job_id[0, 8]}" if Thread.current.respond_to?(:name=)
-          perform(consumer, message, job_id, claim.fence)
+          perform(consumer, message, job_id, claim.fence, stop_renew)
         end
       end
 
@@ -112,7 +119,8 @@ module KafkaBatch
           @in_flight.clear
           @accepting = true
           @shutdown  = false
-          @sem       = nil
+          @claim_window = nil
+          @perform_sem  = nil
         end
       end
 
@@ -128,28 +136,53 @@ module KafkaBatch
 
       def concurrency
         n = KafkaBatch.config.super_fetch_concurrency.to_i
-        n.positive? ? n : 32
+        n.positive? ? n : 1
       end
 
-      def acquire_slot!
-        q = semaphore
-        q.pop
+      def claim_window_size
+        n = KafkaBatch.config.super_fetch_claim_window.to_i
+        return n if n >= concurrency
+
+        concurrency * 2
+      end
+
+      def acquire_claim_window!
+        claim_window_queue.pop
+      end
+
+      def release_claim_window!
+        claim_window_queue << true
+      end
+
+      def acquire_perform_slot!
+        perform_sem_queue.pop
         @mutex.synchronize { @active_threads += 1 }
       end
 
-      def release_slot!
+      def release_perform_slot!
         @mutex.synchronize { @active_threads -= 1 if @active_threads.positive? }
-        semaphore << true
+        perform_sem_queue << true
       end
 
-      def semaphore
+      def claim_window_queue
         @mutex.synchronize do
-          return @sem if @sem
+          return @claim_window if @claim_window
+
+          n = claim_window_size
+          @claim_window = SizedQueue.new(n)
+          n.times { @claim_window << true }
+          @claim_window
+        end
+      end
+
+      def perform_sem_queue
+        @mutex.synchronize do
+          return @perform_sem if @perform_sem
 
           n = concurrency
-          @sem = SizedQueue.new(n)
-          n.times { @sem << true }
-          @sem
+          @perform_sem = SizedQueue.new(n)
+          n.times { @perform_sem << true }
+          @perform_sem
         end
       end
 
@@ -166,8 +199,8 @@ module KafkaBatch
         @mutex.synchronize { @in_flight.delete(job_id) }
       end
 
-      def perform(consumer, message, job_id, fence)
-        stop_renew = start_renew(job_id, fence)
+      def perform(consumer, message, job_id, fence, stop_renew)
+        acquire_perform_slot!
         begin
           Thread.current[:kafka_batch_sf_acked] = true
           consumer.send(:process_message, message)
@@ -187,9 +220,10 @@ module KafkaBatch
           )
         ensure
           Thread.current[:kafka_batch_sf_acked] = nil
-          stop_renew.call
+          stop_renew.call if stop_renew
           untrack_in_flight(job_id)
-          release_slot!
+          release_perform_slot!
+          release_claim_window!
         end
       end
 
@@ -240,7 +274,11 @@ module KafkaBatch
 
         -> {
           stop = true
-          thread.join(0.5) rescue nil
+          begin
+            thread.join(0.5)
+          rescue StandardError
+            nil
+          end
         }
       end
 

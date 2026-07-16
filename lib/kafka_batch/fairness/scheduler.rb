@@ -142,12 +142,9 @@ module KafkaBatch
           if shint > 0 then
             sum_w = shint
           else
-            local all = redis.call('ZRANGE', ring, 0, -1)
-            for i = 1, #all do
-              local wi = tonumber(redis.call('HGET', wh, all[i]) or dw)
-              if wi == nil or wi <= 0 then wi = dw end
-              sum_w = sum_w + wi
-            end
+            -- Cheap approx instead of full-ring ZRANGE (O(tenants) Redis CPU).
+            -- Callers should pass shint; this is a safety net only.
+            sum_w = dw * active
             if sum_w <= 0 then sum_w = dw end
           end
         end
@@ -275,12 +272,9 @@ module KafkaBatch
           if shint > 0 then
             sum_w = shint
           else
-            local all = redis.call('ZRANGE', ring, 0, -1)
-            for i = 1, #all do
-              local wi = tonumber(redis.call('HGET', wh, all[i]) or dw)
-              if wi == nil or wi <= 0 then wi = dw end
-              sum_w = sum_w + wi
-            end
+            -- Cheap approx instead of full-ring ZRANGE (O(tenants) Redis CPU).
+            -- Callers should pass shint; this is a safety net only.
+            sum_w = dw * active
             if sum_w <= 0 then sum_w = dw end
           end
         end
@@ -941,19 +935,32 @@ module KafkaBatch
 
       # ── Active-tenant view ─────────────────────────────────────────────────
       def compute_active_view
+        ring_view = compute_ring_lease_view
         if @active_count_source == :ingest_lag
-          { count: ingest_active_count, sum_weight: 0.0 }
+          n = ingest_active_count
+          sum_w = ring_view[:sum_weight].to_f
+          # Weighted checkout requires shint > 0 to avoid full-ring ZRANGE in Lua.
+          if @weighted == 1 && sum_w <= 0 && n.positive?
+            dw = @default_weight.to_f
+            dw = 1.0 if dw <= 0
+            sum_w = dw * n
+          end
+          { count: n, sum_weight: sum_w }
         else
-          # Active = tenants with ready jobs (ring) OR live in-flight leases. Two
-          # sequential calls (NOT nested `with`) so we never hold two pool conns.
-          ring_members = with { |r| r.zrange(@ring, 0, -1) }
-          active_ids   = (ring_members.to_a + inflight_by_tenant.keys).uniq
-          sum_w = @weighted == 1 ? active_ids.sum { |t| weight_for(t) } : 0.0
-          { count: active_ids.size, sum_weight: sum_w }
+          ring_view
         end
       rescue => e
         KafkaBatch.logger.warn("[KafkaBatch][Scheduler] active_view compute failed: #{e.message}")
         { count: 0, sum_weight: 0.0 }
+      end
+
+      def compute_ring_lease_view
+        # Active = tenants with ready jobs (ring) OR live in-flight leases. Two
+        # sequential calls (NOT nested `with`) so we never hold two pool conns.
+        ring_members = with { |r| r.zrange(@ring, 0, -1) }
+        active_ids   = (ring_members.to_a + inflight_by_tenant.keys).uniq
+        sum_w = @weighted == 1 ? active_ids.sum { |t| weight_for(t) } : 0.0
+        { count: active_ids.size, sum_weight: sum_w }
       end
 
       # Count of this lane's ingest-topic partitions with lag > 0.

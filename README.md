@@ -697,6 +697,9 @@ All options live on `KafkaBatch.config`. The install generator ships enterprise-
 | `track_running_jobs` | `true` | Set `false` at very high throughput (keeps heartbeats) |
 | `uniq_enabled` | `true` | Master switch for `uniq true` workers |
 | `super_fetch_concurrency` | `1` | Concurrent `#perform`s per consumer process (thread pool). Default `1` (MRI GVL); see [SuperFetch concurrency (Ruby)](#superfetch-concurrency-ruby) |
+| `super_fetch_claim_window` | `0` → `2×` SF | Max Claimed∨Queued∨Performing; Claim+ack gated here so the listener is not blocked on `#perform` |
+| `redis_pool_size` | `≥16` (auto) | Default scales with SF + claim window + Karafka floor; raise before raising SF |
+| `fairness_dynamic_tenant_partitions` | `true` | Exclusive ingest partitions for hot tenants (static `fairness_tenant_partitions` still wins). Set `false` to use murmur2 key-hash only. |
 | `super_fetch_lease_ttl` | `120` | Redis workset job key TTL (renewed during long jobs) |
 | `super_fetch_orphan_grace` | `40` | Seconds before a dead owner's job is stealable / reclaimable |
 | `super_fetch_reclaim_enabled` | `true` | Control-plane orphan reclaim loop (parity with Go daemon) |
@@ -1092,18 +1095,20 @@ Fair jobs should land on **one partition per tenant** so the Dispatcher processe
 
 | Mode | Config | Behavior |
 |---|---|---|
-| Hash (default) | neither set | `tenant_id` keyed via murmur2 — many tenants can collide on one partition |
-| Pinned | `fairness_tenant_partitions` | Static map; always wins |
-| Dynamic | `fairness_dynamic_tenant_partitions = true` | On first enqueue, checkout a free partition from Redis (per lane); cached 30s in-process |
+| Dynamic (default) | `fairness_dynamic_tenant_partitions = true` | On first enqueue, checkout a free partition from Redis (per lane); cached 30s in-process |
+| Pinned | `fairness_tenant_partitions` | Static map; always wins over dynamic |
+| Hash | `fairness_dynamic_tenant_partitions = false` | `tenant_id` keyed via murmur2 — many tenants can collide on one partition |
 
 ```ruby
-# Option A — pin VIP tenants, dynamic for the rest:
-config.fairness_tenant_partitions = { "acme" => 0 }
-config.fairness_dynamic_tenant_partitions = true
-
-# Option B — fully automatic (no big YAML map):
-config.fairness_dynamic_tenant_partitions = true
+# Default — automatic exclusive partitions (no big YAML map):
+# config.fairness_dynamic_tenant_partitions = true  # already the default
 config.fairness_tenant_partition_cache_ttl = 30
+
+# Pin VIP tenants; everyone else still gets dynamic checkout:
+config.fairness_tenant_partitions = { "acme" => 0 }
+
+# Opt out — murmur2 key-hash only:
+# config.fairness_dynamic_tenant_partitions = false
 ```
 
 On boot the system reads each lane's ingest topic partition count and seeds a Redis free-pool (`kafka_batch:tenant_partitions:time`, etc.). When all partitions are assigned, new tenants log a warning and fall back to hash until you add partitions.

@@ -97,6 +97,8 @@ module KafkaBatch
     # IO-wait overlap and keep karafka_concurrency × super_fetch_concurrency ≤ 10
     # in production. See README "SuperFetch concurrency (Ruby)".
     attr_accessor :super_fetch_concurrency     # Integer – default 1
+    # Max Claimed∨Queued∨Performing per process. 0 → 2× super_fetch_concurrency.
+    attr_accessor :super_fetch_claim_window    # Integer – default 0 (auto 2×)
     attr_accessor :super_fetch_lease_ttl       # Integer – seconds; default 120
     # Steal/orphan grace after claim before a missing heartbeat is stealable.
     # Align with Go daemon reclaim (default 40 ≈ 2× heartbeat interval).
@@ -371,10 +373,12 @@ module KafkaBatch
     # assigned exclusively at first use via Redis (see Fairness::TenantPartitions).
     attr_accessor :fairness_tenant_partitions       # Hash{String => Integer}
 
-    # When true, new tenants checkout a dedicated ingest partition from Redis on
-    # first enqueue (per fairness lane). Config map entries always win. Requires
-    # Redis and a warmed partition pool (boot / first checkout).
-    attr_accessor :fairness_dynamic_tenant_partitions  # Boolean – default false
+    # When true (default), new tenants checkout a dedicated ingest partition from
+    # Redis on first enqueue (per fairness lane). Config map entries always win.
+    # Requires Redis and a warmed partition pool (boot / first checkout).
+    # Disable with config.fairness_dynamic_tenant_partitions = false or
+    # KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS=false.
+    attr_accessor :fairness_dynamic_tenant_partitions  # Boolean – default true
 
     # In-process TTL for tenant → partition lookups (config + Redis). Default 30s.
     attr_accessor :fairness_tenant_partition_cache_ttl  # Integer – seconds
@@ -502,6 +506,7 @@ module KafkaBatch
       @liveness_heartbeat_interval    = env_positive_int("KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL", 20)
       @liveness_stats_interval        = 15
       @super_fetch_concurrency        = env_positive_int("KAFKA_BATCH_SUPER_FETCH_CONCURRENCY", 1)
+      @super_fetch_claim_window       = env_positive_int("KAFKA_BATCH_SUPER_FETCH_CLAIM_WINDOW", 0)
       @super_fetch_lease_ttl          = env_positive_int("KAFKA_BATCH_SUPER_FETCH_LEASE_TTL", 120)
       @super_fetch_orphan_grace       = env_positive_int("KAFKA_BATCH_SUPER_FETCH_ORPHAN_GRACE", 40)
       @super_fetch_reclaim_enabled    = !truthy_env?("KAFKA_BATCH_SUPER_FETCH_RECLAIM_DISABLED")
@@ -530,7 +535,12 @@ module KafkaBatch
       @event_emit_backoff       = 1
       @redis_url                = "redis://localhost:6379/0"
       @redis                    = nil
-      @redis_pool_size          = 5
+      # SF + renewers (~claim_window) + Karafka floor. Override via redis_pool_size /
+      # KAFKA_BATCH_REDIS_POOL_SIZE. See recommended_redis_pool_size.
+      @redis_pool_size          = env_positive_int(
+        "KAFKA_BATCH_REDIS_POOL_SIZE",
+        recommended_redis_pool_size_for(@super_fetch_concurrency, @super_fetch_claim_window)
+      )
       @batch_ttl                = 7 * 24 * 3600  # 7 days
       @failures_ttl             = 24 * 3600      # 1 day (metadata only; Kafka is the source of truth)
       @max_failures_per_batch   = 1000           # cap tracked failing jobs per batch (0 = unlimited)
@@ -544,7 +554,14 @@ module KafkaBatch
       @fairness_weight_cache_ttl        = 60
       @fairness_forwarder_idle_sleep    = 0.05
       @fairness_tenant_partitions       = {}
-      @fairness_dynamic_tenant_partitions = false
+      # Exclusive ingest partitions for hot tenants (static map still wins).
+      # Default on; set KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS=false to disable.
+      @fairness_dynamic_tenant_partitions =
+        if ENV.key?("KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS")
+          truthy_env?("KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS")
+        else
+          true
+        end
       @fairness_tenant_partition_cache_ttl = 30
       @fairness_dispatcher_batch_size   = 50
       @fairness_dispatcher_concurrency  = 5
@@ -705,6 +722,24 @@ module KafkaBatch
       @daemon_mode == true
     end
 
+    # Recommended ConnectionPool size for SuperFetch + renewers + Karafka.
+    # Floor 16; scales with SF concurrency and claim window.
+    def recommended_redis_pool_size
+      self.class.recommended_redis_pool_size_for(
+        @super_fetch_concurrency,
+        @super_fetch_claim_window
+      )
+    end
+
+    def self.recommended_redis_pool_size_for(sf, claim_window)
+      sf = sf.to_i
+      sf = 1 if sf < 1
+      win = claim_window.to_i
+      win = sf * 2 if win < sf
+      # perform slots + renewers (~window) + Karafka floor + misc
+      [sf + win + 12, 16].max
+    end
+
     private
 
     def truthy_env?(key)
@@ -719,6 +754,10 @@ module KafkaBatch
       n.positive? ? n : default
     rescue ArgumentError, TypeError
       default
+    end
+
+    def recommended_redis_pool_size_for(sf, claim_window)
+      self.class.recommended_redis_pool_size_for(sf, claim_window)
     end
 
     # Apply topic_prefix to a base name: "" → base, "myapp" → "myapp.base".

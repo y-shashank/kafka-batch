@@ -54,7 +54,9 @@ KafkaBatch.configure do |config|
   # config.redis = { host: "localhost", port: 6379, db: 0 }
   # Size for ~150 consumer pods (each doing concurrent Redis work). Raise if you
   # see pool checkout timeouts under load.
-  config.redis_pool_size = 10
+  # Scales with SuperFetch (SF + renewers + Karafka). Override if you raise SF.
+  # config.redis_pool_size = KafkaBatch.config.recommended_redis_pool_size
+  config.redis_pool_size = 16
 
   # ── Topic namespace ─────────────────────────────────────────────────────────
   # All topic names AND the consumer group derive from this prefix, so a single
@@ -105,13 +107,11 @@ KafkaBatch.configure do |config|
   # config.fairness_weighted_concurrency = false
   # config.fairness_weight_cache_ttl = 60   # secs before a weight change propagates across pods
 
-  # Pin specific tenants to ingest partitions (common to both lanes):
+  # Dynamic exclusive ingest partitions are ON by default (one partition per tenant
+  # until the ingest topic is full). Pin whales explicitly if you want fixed mapping:
   # config.fairness_tenant_partitions = { "acme" => 0, "globex" => 1 }
-  #
-  # Or let the system assign partitions automatically on first enqueue (Redis-backed,
-  # one dedicated partition per tenant until the ingest topic is full):
-  # config.fairness_dynamic_tenant_partitions = true
-  # config.fairness_tenant_partition_cache_ttl = 30  # in-process lookup cache (seconds)
+  # config.fairness_dynamic_tenant_partitions = false  # murmur2 key-hash only
+  # config.fairness_tenant_partition_cache_ttl = 30    # in-process lookup cache (seconds)
 
   # ── Priority queues (Sidekiq.yml-style, optional) ─────────────────────────────
   # One YAML file per consumer group; topics listed highest-priority first.

@@ -190,7 +190,7 @@ RSpec.describe KafkaBatch::Web do
       allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
       allow(KafkaBatch::Lag).to receive(:partitions).and_return([])
       allow(KafkaBatch).to receive(:fairness_ingest_partition_count).and_return(12)
-      allow(KafkaBatch::Partition).to receive(:for_key).with("acme", 12).and_return(7)
+      allow(KafkaBatch).to receive(:tenant_ingest_partition).with("acme", :time).and_return(7)
 
       html = get("/lag", query: "tenant_id=acme").last.join
       expect(html).to include("partition 7")

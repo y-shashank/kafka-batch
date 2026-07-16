@@ -4,7 +4,9 @@ require "base64"
 require "connection_pool"
 require "oj"
 require "securerandom"
+require "stringio"
 require "time"
+require "zlib"
 require_relative "workset/reclaim_scheduler"
 
 module KafkaBatch
@@ -125,10 +127,13 @@ module KafkaBatch
     LUA
 
     Entry = Struct.new(
-      :job_id, :payload, :topic, :partition, :offset,
+      :job_id, :payload, :encoding, :topic, :partition, :offset,
       :consumer_id, :fence, :claimed_at, :claimed_at_unix, :runtime,
       keyword_init: true
     )
+
+    ENCODING_GZIP = "gzip"
+    COMPRESS_MIN_BYTES = 256
 
     ClaimResult = Struct.new(:won, :fence, :entry, keyword_init: true)
 
@@ -362,7 +367,7 @@ module KafkaBatch
           return
         end
 
-        body = Workset.mark_reclaim_payload(entry.payload)
+        body = Workset.mark_reclaim_payload(Workset.payload_for_reclaim(entry))
         if entry.topic.to_s.empty?
           abort_reclaim(entry.job_id)
           raise ArgumentError, "workset: reclaim missing topic job_id=#{entry.job_id}"
@@ -447,22 +452,27 @@ module KafkaBatch
       end
 
       def dump_entry(entry)
-        Oj.dump(
-          {
-            "job_id"          => entry.job_id,
-            # Match Go encoding/json []byte → base64 so daemon reclaim can decode.
-            "payload"         => Base64.strict_encode64(entry.payload),
-            "topic"           => entry.topic,
-            "partition"       => entry.partition,
-            "offset"          => entry.offset,
-            "consumer_id"     => entry.consumer_id,
-            "fence"           => entry.fence,
-            "claimed_at"      => entry.claimed_at,
-            "claimed_at_unix" => entry.claimed_at_unix,
-            "runtime"         => entry.runtime
-          },
-          mode: :compat
-        )
+        payload = entry.payload.to_s.b
+        encoding = entry.encoding.to_s
+        if encoding.empty? && payload.bytesize >= COMPRESS_MIN_BYTES
+          payload = gzip_deflate(payload)
+          encoding = ENCODING_GZIP
+        end
+        h = {
+          "job_id"          => entry.job_id,
+          # Match Go encoding/json []byte → base64 so daemon reclaim can decode.
+          "payload"         => Base64.strict_encode64(payload),
+          "topic"           => entry.topic,
+          "partition"       => entry.partition,
+          "offset"          => entry.offset,
+          "consumer_id"     => entry.consumer_id,
+          "fence"           => entry.fence,
+          "claimed_at"      => entry.claimed_at,
+          "claimed_at_unix" => entry.claimed_at_unix,
+          "runtime"         => entry.runtime
+        }
+        h["encoding"] = encoding unless encoding.empty?
+        Oj.dump(h, mode: :compat)
       end
 
       def parse_entry(raw)
@@ -479,6 +489,7 @@ module KafkaBatch
         Entry.new(
           job_id:          h["job_id"].to_s,
           payload:         payload,
+          encoding:        h["encoding"].to_s,
           topic:           h["topic"].to_s,
           partition:       h["partition"].to_i,
           offset:          h["offset"].to_i,
@@ -488,6 +499,14 @@ module KafkaBatch
           claimed_at_unix: h["claimed_at_unix"].to_i,
           runtime:         h["runtime"].to_s
         )
+      end
+
+      def gzip_deflate(bytes)
+        io = StringIO.new
+        gz = Zlib::GzipWriter.new(io)
+        gz.write(bytes)
+        gz.close
+        io.string.b
       end
 
       def redis_with
@@ -510,6 +529,18 @@ module KafkaBatch
       def store
         @mutex ||= Mutex.new
         @mutex.synchronize { @store ||= Store.new }
+      end
+
+      def payload_for_reclaim(entry)
+        raw = entry.payload.to_s.b
+        return raw unless entry.encoding.to_s == ENCODING_GZIP
+
+        gz = Zlib::GzipReader.new(StringIO.new(raw))
+        begin
+          gz.read.b
+        ensure
+          gz.close
+        end
       end
 
       def mark_reclaim_payload(raw)

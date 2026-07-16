@@ -131,6 +131,24 @@ RSpec.describe KafkaBatch::Workset::Store do
       expect(store.get_entry("j5")).to be_nil
     end
 
+    it "gzip-compresses large workset payloads and reclaim expands them" do
+      big = ({ "job_id" => "j-gz", "worker_class" => "W", "pad" => ("x" * 300) }).to_json
+      claim!(job_id: "j-gz", consumer_id: "gone", payload: big)
+      entry = store.get_entry("j-gz")
+      expect(entry.encoding).to eq("gzip")
+      expect(entry.payload.bytesize).to be < big.bytesize
+
+      kill_consumer!("gone")
+      age_claim!("j-gz", 60)
+      produced = []
+      producer = ->(topic, key, body) { produced << body }
+      res = store.reclaim_orphans(producer: producer, limit: 10, grace: -1)
+      expect(res.reclaimed).to eq(1)
+      parsed = Oj.load(produced.first)
+      expect(parsed["_reclaim"]).to eq(true)
+      expect(parsed["job_id"]).to eq("j-gz")
+    end
+
     it "finish-only path does not double-produce after MarkProduced" do
       claim_res = claim!(job_id: "j-idem", consumer_id: "gone")
       kill_consumer!("gone")

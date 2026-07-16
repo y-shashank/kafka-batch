@@ -200,8 +200,14 @@ RSpec.describe KafkaBatch::Batch do
 
       ingest = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic(:time))
       expect(ingest.size).to eq(1)
-      expect(ingest.first.key).to eq("acme")
-      expect(ingest.first.payload["tenant_id"]).to eq("acme")
+      msg = ingest.first
+      expect(msg.payload["tenant_id"]).to eq("acme")
+      # Dynamic/static pin → explicit partition (key nil); else murmur2 key = tenant.
+      if msg.partition
+        expect(msg.partition).to be >= 0
+      else
+        expect(msg.key).to eq("acme")
+      end
       expect(FakeProducer.for_topic("test.fair")).to be_empty  # not the worker topic
     end
 
@@ -308,8 +314,12 @@ RSpec.describe KafkaBatch::Batch do
       batch.push(FairWorker, {})
 
       msg = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic(:time)).first
-      expect(msg.key).to eq("batch-tenant")
       expect(msg.payload["tenant_id"]).to eq("batch-tenant")
+      if msg.partition
+        expect(msg.partition).to be >= 0
+      else
+        expect(msg.key).to eq("batch-tenant")
+      end
     end
 
     it "embeds tenant_id in every job message on the fair lane" do
