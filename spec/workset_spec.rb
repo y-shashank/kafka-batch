@@ -116,6 +116,21 @@ RSpec.describe KafkaBatch::Workset::Store do
       expect(orphans.map(&:job_id)).to eq(["j5g"])
     end
 
+    it "list_orphans pipelines mixed live/dead owners and prunes missing keys" do
+      claim!(job_id: "o1", consumer_id: "dead-pod")
+      claim!(job_id: "o2", consumer_id: "dead-pod")
+      claim!(job_id: "o3", consumer_id: "live-pod")
+      %w[o1 o2 o3].each { |id| age_claim!(id, 60) }
+      kill_consumer!("dead-pod")
+
+      r = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      r.zadd(KafkaBatch::Workset::INDEX_KEY, Time.now.to_i - 60, "ghost")
+
+      orphans = store.list_orphans(limit: 10, grace: 40)
+      expect(orphans.map(&:job_id)).to match_array(%w[o1 o2])
+      expect(r.zscore(KafkaBatch::Workset::INDEX_KEY, "ghost")).to be_nil
+    end
+
     it "reclaim_orphans re-produces with _reclaim and drops ownership" do
       claim!(job_id: "j5", consumer_id: "gone", payload: %({"job_id":"j5","worker_class":"W"}))
       kill_consumer!("gone")

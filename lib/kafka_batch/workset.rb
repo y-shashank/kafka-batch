@@ -242,6 +242,7 @@ module KafkaBatch
       end
 
       # Working-set entries older than grace whose consumer heartbeat is missing.
+      # Pipelines GET + EXISTS (deduped by consumer_id) to keep reclaim storms cheap.
       def list_orphans(limit: 100, grace: nil)
         lim = limit.to_i
         lim = 100 if lim < 1
@@ -251,21 +252,41 @@ module KafkaBatch
         ids = redis_with do |r|
           r.zrangebyscore(INDEX_KEY, "-inf", max_score, limit: [0, lim * 3])
         end
+        return [] if ids.nil? || ids.empty?
 
-        out = []
-        Array(ids).each do |id|
-          break if out.size >= lim
+        raws = redis_with do |r|
+          r.pipelined { |pipe| ids.each { |id| pipe.get(job_key(id)) } }
+        end
 
-          raw = redis_with { |r| r.get(job_key(id)) }
+        candidates = []
+        missing = []
+        ids.zip(Array(raws)).each do |id, raw|
           if raw.nil? || raw.empty?
-            redis_with { |r| r.zrem(INDEX_KEY, id) }
+            missing << id
             next
           end
           entry = parse_entry(raw)
-          next unless entry
+          candidates << entry if entry
+        end
 
-          alive = redis_with { |r| r.exists(live_key(entry.consumer_id)).to_i }
-          out << entry if alive.zero?
+        if missing.any?
+          redis_with { |r| r.pipelined { |pipe| missing.each { |id| pipe.zrem(INDEX_KEY, id) } } }
+        end
+        return [] if candidates.empty?
+
+        unique_cids = candidates.map(&:consumer_id).uniq
+        alive_flags = redis_with do |r|
+          r.pipelined { |pipe| unique_cids.each { |cid| pipe.exists(live_key(cid)) } }
+        end
+        alive_by = {}
+        unique_cids.zip(Array(alive_flags)).each do |cid, flag|
+          alive_by[cid] = flag.to_i > 0
+        end
+
+        out = []
+        candidates.each do |entry|
+          break if out.size >= lim
+          out << entry unless alive_by[entry.consumer_id]
         end
         out
       end
