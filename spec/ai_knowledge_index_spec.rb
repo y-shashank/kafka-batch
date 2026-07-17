@@ -102,14 +102,13 @@ RSpec.describe KafkaBatch::Ai::KnowledgeIndex do
       expect(snap["super_fetch_concurrency"]).to eq(3)
       expect(snap["topic_inventory"]).to be_a(Hash)
       expect(snap["topic_inventory"]["topics"]).to be_an(Array)
-      expect(snap["topic_inventory"]["topics"]).not_to be_empty
-      expect(snap["topic_inventory"]["topics"].first).to include(
-        "name", "category", "configured_partitions", "status"
-      )
+      expect(snap["routing"]).to be_a(Hash)
+      expect(snap["routing"]).to include("handlers", "priority_groups")
 
       live = described_class.fetch_chunk(described_class::LIVE_CONFIG_CHUNK_ID)
       expect(live["text"]).to include("super_fetch_concurrency: 3")
       expect(live["text"]).to include("AUTHORITATIVE LIVE TOPIC PARTITIONS")
+      expect(live["text"]).to include("AUTHORITATIVE LIVE ROUTING")
       expect(live["text"]).to include("live_broker_partitions=")
       expect(live["text"]).to include("create_default_partitions=")
 

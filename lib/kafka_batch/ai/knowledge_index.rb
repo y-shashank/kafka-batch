@@ -8,6 +8,7 @@ require "socket"
 require "time"
 require_relative "../redis_client"
 require_relative "../system_info"
+require_relative "routing_snapshot"
 
 module KafkaBatch
   module Ai
@@ -232,29 +233,16 @@ module KafkaBatch
         def build_live_config_chunk(snapshot)
           lines = ["Live configuration snapshot (this deploy)", ""]
           inventory = snapshot["topic_inventory"]
+          routing = snapshot["routing"]
           snapshot.each do |key, value|
-            next if key == "topic_inventory"
+            next if key == "topic_inventory" || key == "routing"
 
             lines << "#{key}: #{value}"
           end
-          if inventory.is_a?(Hash)
-            lines << ""
-            lines << "AUTHORITATIVE LIVE TOPIC PARTITIONS (from Kafka broker)"
-            lines << "Rule: broker_partitions = actual cluster count. " \
-                     "configured_partitions = create_topics DEFAULT only — never report it as live."
-            lines << "topic_inventory_available: #{inventory['available']}"
-            lines << "topic_count: #{inventory['topic_count']}"
-            lines << "broker_known_count: #{inventory['broker_known_count']}"
-            lines << "topics_refreshed_at: #{inventory['refreshed_at']}"
-            Array(inventory["topics"]).each do |t|
-              next unless t.is_a?(Hash)
 
-              broker = t["broker_partitions"].nil? ? "n/a" : t["broker_partitions"]
-              lines << "- #{t['name']}: live_broker_partitions=#{broker} " \
-                       "create_default_partitions=#{t['configured_partitions']} " \
-                       "category=#{t['category']} status=#{t['status']} rf=#{t['replication_factor']}"
-            end
-          end
+          append_routing_lines!(lines, routing)
+          append_inventory_lines!(lines, inventory)
+
           text = lines.join("\n")
           {
             "id"           => LIVE_CONFIG_CHUNK_ID,
@@ -265,6 +253,69 @@ module KafkaBatch
             "text"         => text,
             "char_count"   => text.length
           }
+        end
+
+        def append_routing_lines!(lines, routing)
+          return unless routing.is_a?(Hash)
+
+          lines << ""
+          lines << "AUTHORITATIVE LIVE ROUTING (handler manifest + priority queue YAML)"
+          lines << "Rule: use this for job_type → topic, runtime, fairness, and priority queue order."
+          lines << "handlers_source: #{routing['handlers_source']}"
+          lines << "handler_manifest_path: #{routing['handler_manifest_path']}"
+          lines << "handler_count: #{routing['handler_count']}"
+          Array(routing["handlers"]).each do |h|
+            next unless h.is_a?(Hash)
+
+            fair =
+              if h["fairness"]
+                " fairness_type=#{h['fairness_type']} ingest=#{h['ingest_topic']} " \
+                  "ready_ruby=#{h['ready_topic_ruby']} ready_go=#{h['ready_topic_go']}"
+              else
+                ""
+              end
+            tier = h["retry_tier"] ? " retry_tier=#{h['retry_tier']}" : ""
+            lines << "- handler job_type=#{h['job_type']} runtime=#{h['runtime']} " \
+                     "topic=#{h['topic']} worker_class=#{h['worker_class']} " \
+                     "max_retries=#{h['max_retries']}#{fair}#{tier}"
+          end
+
+          lines << "priority_group_count: #{routing['priority_group_count']}"
+          if routing["priority_error"]
+            lines << "priority_error: #{routing['priority_error']}"
+          end
+          Array(routing["priority_groups"]).each do |g|
+            next unless g.is_a?(Hash)
+
+            lines << "- priority_group #{g['consumer_group']} suffix=#{g['consumer_group_suffix']} " \
+                     "mode=#{g['mode']} weighted_interleave=#{g['weighted_interleave']} " \
+                     "topics(highest_first)=#{Array(g['topics']).join(' > ')}"
+          end
+          extras = Array(routing["extra_job_topics"])
+          jobs = Array(routing["jobs_topics"])
+          lines << "extra_job_topics: #{extras.empty? ? '(none)' : extras.join(', ')}"
+          lines << "jobs_topics: #{jobs.empty? ? '(none)' : jobs.join(', ')}"
+        end
+
+        def append_inventory_lines!(lines, inventory)
+          return unless inventory.is_a?(Hash)
+
+          lines << ""
+          lines << "AUTHORITATIVE LIVE TOPIC PARTITIONS (from Kafka broker)"
+          lines << "Rule: broker_partitions = actual cluster count. " \
+                   "configured_partitions = create_topics DEFAULT only — never report it as live."
+          lines << "topic_inventory_available: #{inventory['available']}"
+          lines << "topic_count: #{inventory['topic_count']}"
+          lines << "broker_known_count: #{inventory['broker_known_count']}"
+          lines << "topics_refreshed_at: #{inventory['refreshed_at']}"
+          Array(inventory["topics"]).each do |t|
+            next unless t.is_a?(Hash)
+
+            broker = t["broker_partitions"].nil? ? "n/a" : t["broker_partitions"]
+            lines << "- #{t['name']}: live_broker_partitions=#{broker} " \
+                     "create_default_partitions=#{t['configured_partitions']} " \
+                     "category=#{t['category']} status=#{t['status']} rf=#{t['replication_factor']}"
+          end
         end
 
         # Masked, flat snapshot of operator-facing knobs for RAG.
@@ -281,6 +332,22 @@ module KafkaBatch
                 "topic_count" => 0,
                 "broker_known_count" => 0,
                 "topics" => [],
+                "error" => e.message
+              }
+            end
+
+          routing =
+            begin
+              RoutingSnapshot.build(c)
+            rescue StandardError => e
+              KafkaBatch.logger.warn("[KafkaBatch][Ai::KnowledgeIndex] routing snapshot failed: #{e.message}")
+              {
+                "refreshed_at" => Time.now.utc.iso8601,
+                "handlers_source" => "error",
+                "handler_count" => 0,
+                "handlers" => [],
+                "priority_group_count" => 0,
+                "priority_groups" => [],
                 "error" => e.message
               }
             end
@@ -345,6 +412,7 @@ module KafkaBatch
             "performance_metrics_enabled" => c.performance_metrics_enabled,
             "ai_knowledge_enabled" => c.ai_knowledge_enabled,
             "topics_replication_factor" => c.topics_replication_factor,
+            "routing" => routing,
             "topic_inventory" => inventory
           }
         end

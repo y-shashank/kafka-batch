@@ -847,6 +847,9 @@ Requires `performance_metrics_enabled`; otherwise explains disabled.
 ### AI chat partition answers wrong (always 768)?
 Docs cite create defaults. Live snapshot must include `topic_inventory` with `live_broker_partitions`. Force sync after deploy; assistant must prefer live broker counts over DEFAULT_PARTITIONS.
 
+### Does RAG know my handlers.yml and priority queues?
+Yes — on the same 24h NX-locked config sync, `routing` embeds parsed `kafka_batch_handlers.yml` (job_type → runtime/topic/fairness) and priority YAML groups (ordered topics + consumer group). Ask “what topic does X use?” / “what’s the jobs-fast priority order?” from LIVE ROUTING, not docs examples.
+
 ---
 
 ## AK. Topics CLI and rake

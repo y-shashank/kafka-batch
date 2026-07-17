@@ -13,7 +13,7 @@ artifact `knowledge_chunks.json` (next to this README) into Redis.
 | What | When |
 |------|------|
 | Knowledge chunks | Only if packaged `corpus_version` ≠ Redis `meta.corpus_version` |
-| Live config snapshot (`config` + `config:live` chunk) | At most every **24 hours** on pod boot (`CONFIG_REFRESH_SECONDS`), so knobs can change without a docs release |
+| Live config snapshot (`config` + `config:live` chunk) | At most every **24 hours** on pod boot (`CONFIG_REFRESH_SECONDS`): knobs, broker `topic_inventory`, and `routing` (handler manifest + priority YAML) |
 
 Many UI pods call `sync!`; a short NX lock ensures only one writer runs.
 

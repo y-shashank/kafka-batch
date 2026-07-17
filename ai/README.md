@@ -1271,7 +1271,7 @@ Editable source lives in `ai/*.md`. Clients do **not** re-chunk markdown at boot
 | Data | Refresh rule |
 |------|----------------|
 | Knowledge chunks | Only when packaged `corpus_version` ≠ Redis meta |
-| Config snapshot + topic inventory | At most every **24 hours** on boot (`config_refreshed_at`); NX lock so only one pod writes. Includes masked knobs + `Topics.inventory` (broker partitions merged with create defaults). |
+| Config snapshot + topic inventory + routing | At most every **24 hours** on boot (`config_refreshed_at`); NX lock so only one pod writes. Includes masked knobs, `Topics.inventory` (broker partitions), and `Ai::RoutingSnapshot` (handler manifest + priority queue YAML). |
 
 ```ruby
 config.ai_knowledge_enabled = true
@@ -1280,7 +1280,9 @@ config.ai_knowledge_enabled = true
 
 Force full re-sync: `FORCE=1 bundle exec rake kafka_batch:sync_ai_knowledge`
 
-Live RAG chunk (`config:live`) is injected first for chat. For partition questions prefer `live_broker_partitions` over docs that cite DEFAULT_PARTITIONS (768, etc.).
+Live RAG chunk (`config:live`) is injected first for chat. Prefer:
+- `live_broker_partitions` over DEFAULT_PARTITIONS docs for partition counts
+- AUTHORITATIVE LIVE ROUTING (handlers / priority groups) over example YAML in docs
 
 This file intentionally expands beyond the root README so the assistant has a self-contained corpus without live cluster operational state.
 

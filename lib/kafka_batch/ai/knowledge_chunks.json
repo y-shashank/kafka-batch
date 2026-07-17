@@ -1,10 +1,10 @@
 {
   "format": 1,
-  "built_at": "2026-07-17T12:00:56Z",
+  "built_at": "2026-07-17T12:18:21Z",
   "max_chars": 2800,
-  "readme_sha256": "7efbf433d18559ca84fb799c73925efa0ee5f0774d0edce8289f104424320eec",
-  "faq_sha256": "d8e0a823207d2c655f63f1f55d97898ef780e536ded30c598715ce0c59832dba",
-  "chunk_count": 386,
+  "readme_sha256": "65e51ec8e6c66b901e374073b1c3cd24fa2969b0fe906c1a6f027517d924d457",
+  "faq_sha256": "46cd5c2055c834e23c1bc63b4eb9c76cb5ba782ab963f46d6580e3b1e3d2acce",
+  "chunk_count": 387,
   "chunks": [
     {
       "id": "readme-introduction-939750e33df47b89",
@@ -1344,8 +1344,8 @@
         "Packaged chunks + Redis sync (boot)"
       ],
       "section": "36. Document maintenance",
-      "text": "36. Document maintenance › Packaged chunks + Redis sync (boot)\n\nEditable source lives in `ai/*.md`. Clients do **not** re-chunk markdown at boot.\n\n| Artifact | Role |\n|----------|------|\n| `lib/kafka_batch/ai/knowledge_chunks.json` | Prebuilt chunks (shipped in the gem) |\n| `kafka_batch:ai:knowledge:chunks` | Redis HASH id → chunk JSON |\n| `kafka_batch:ai:knowledge:config` | Live masked config snapshot |\n| `kafka_batch:ai:knowledge:meta` | `corpus_version`, `config_refreshed_at`, … |\n| `kafka_batch:ai:knowledge:lock` | Short NX lock during write only |\n\n**Many UI pods:** every pod calls `sync!` after Rails init; only one writer wins the lock.\n\n| Data | Refresh rule |\n|------|----------------|\n| Knowledge chunks | Only when packaged `corpus_version` ≠ Redis meta |\n| Config snapshot + topic inventory | At most every **24 hours** on boot (`config_refreshed_at`); NX lock so only one pod writes. Includes masked knobs + `Topics.inventory` (broker partitions merged with create defaults). |\n\n```ruby\nconfig.ai_knowledge_enabled = true\n# ENV: KAFKA_BATCH_AI_KNOWLEDGE_ENABLED=false to disable\n```\n\nForce full re-sync: `FORCE=1 bundle exec rake kafka_batch:sync_ai_knowledge`\n\nLive RAG chunk (`config:live`) is injected first for chat. For partition questions prefer `live_broker_partitions` over docs that cite DEFAULT_PARTITIONS (768, etc.).\n\nThis file intentionally expands beyond the root README so the assistant has a self-contained corpus without live cluster operational state.\n\n\n---",
-      "char_count": 1495
+      "text": "36. Document maintenance › Packaged chunks + Redis sync (boot)\n\nEditable source lives in `ai/*.md`. Clients do **not** re-chunk markdown at boot.\n\n| Artifact | Role |\n|----------|------|\n| `lib/kafka_batch/ai/knowledge_chunks.json` | Prebuilt chunks (shipped in the gem) |\n| `kafka_batch:ai:knowledge:chunks` | Redis HASH id → chunk JSON |\n| `kafka_batch:ai:knowledge:config` | Live masked config snapshot |\n| `kafka_batch:ai:knowledge:meta` | `corpus_version`, `config_refreshed_at`, … |\n| `kafka_batch:ai:knowledge:lock` | Short NX lock during write only |\n\n**Many UI pods:** every pod calls `sync!` after Rails init; only one writer wins the lock.\n\n| Data | Refresh rule |\n|------|----------------|\n| Knowledge chunks | Only when packaged `corpus_version` ≠ Redis meta |\n| Config snapshot + topic inventory + routing | At most every **24 hours** on boot (`config_refreshed_at`); NX lock so only one pod writes. Includes masked knobs, `Topics.inventory` (broker partitions), and `Ai::RoutingSnapshot` (handler manifest + priority queue YAML). |\n\n```ruby\nconfig.ai_knowledge_enabled = true\n# ENV: KAFKA_BATCH_AI_KNOWLEDGE_ENABLED=false to disable\n```\n\nForce full re-sync: `FORCE=1 bundle exec rake kafka_batch:sync_ai_knowledge`\n\nLive RAG chunk (`config:live`) is injected first for chat. Prefer:\n- `live_broker_partitions` over DEFAULT_PARTITIONS docs for partition counts\n- AUTHORITATIVE LIVE ROUTING (handlers / priority groups) over example YAML in docs\n\nThis file intentionally expands beyond the root README so the assistant has a self-contained corpus without live cluster operational state.\n\n\n---",
+      "char_count": 1605
     },
     {
       "id": "readme-37-batch-hash-fields-redis-3c89a3927c68a4a7",
@@ -4145,8 +4145,20 @@
         "AI chat partition answers wrong (always 768)?"
       ],
       "section": "AJ. Web API surface (detailed)",
-      "text": "FAQ: AI chat partition answers wrong (always 768)?\n\nDocs cite create defaults. Live snapshot must include `topic_inventory` with `live_broker_partitions`. Force sync after deploy; assistant must prefer live broker counts over DEFAULT_PARTITIONS.\n\n---",
-      "char_count": 250
+      "text": "FAQ: AI chat partition answers wrong (always 768)?\n\nDocs cite create defaults. Live snapshot must include `topic_inventory` with `live_broker_partitions`. Force sync after deploy; assistant must prefer live broker counts over DEFAULT_PARTITIONS.",
+      "char_count": 245
+    },
+    {
+      "id": "faq-aj-web-api-surface-detailed-does-rag-know-my-han-c0c4ad577995cbe7",
+      "source": "faq",
+      "title": "Does RAG know my handlers.yml and priority queues?",
+      "heading_path": [
+        "AJ. Web API surface (detailed)",
+        "Does RAG know my handlers.yml and priority queues?"
+      ],
+      "section": "AJ. Web API surface (detailed)",
+      "text": "FAQ: Does RAG know my handlers.yml and priority queues?\n\nYes — on the same 24h NX-locked config sync, `routing` embeds parsed `kafka_batch_handlers.yml` (job_type → runtime/topic/fairness) and priority YAML groups (ordered topics + consumer group). Ask “what topic does X use?” / “what’s the jobs-fast priority order?” from LIVE ROUTING, not docs examples.\n\n---",
+      "char_count": 361
     },
     {
       "id": "faq-ak-topics-cli-and-rake-ruby-dry-run-topics-3362e11a7b323108",
@@ -4605,5 +4617,5 @@
       "char_count": 58
     }
   ],
-  "corpus_version": "fb18a2db30bf009dd624cfc9c9a5cbe7"
+  "corpus_version": "86a3b82643cb785f110bf724cb530fa1"
 }
