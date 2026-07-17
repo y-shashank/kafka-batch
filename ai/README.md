@@ -2,7 +2,7 @@
 
 > **Purpose.** Canonical corpus for the kafka-batch Web UI assistant (RAG). Covers architecture, every major subsystem, Redis/Kafka contracts, configuration knobs (Ruby gem + Go companion), SuperFetch, fairness, batches, retries, delayed jobs, and how each piece preserves **atomicity** and **idempotency**.
 >
-> **Assistant safety rule.** Answers must be derived only from this knowledge base and `ai/FAQ.md`. The assistant must **never** read, write, or mutate live Redis keys used by the batch ledger, fairness scheduler, workset, uniqueness locks, schedule index, liveness, consumption pause, retry-cancel, reconciler, or performance counters. Separate assistant Redis keys (API-key ciphertext, vector index) are not operational kafka-batch state.
+> **Assistant safety rule.** Answers must be derived from this knowledge base, `ai/FAQ.md`, and the **live configuration snapshot** (`config:live` / `topic_inventory`) when present. The assistant must **never** read, write, or mutate live Redis keys used by the batch ledger, fairness scheduler, workset, uniqueness locks, schedule index, liveness, consumption pause, retry-cancel, reconciler, or performance counters. Separate assistant Redis keys (API-key ciphertext, knowledge chunks, chat history) are not operational kafka-batch state. For live partition counts use `live_broker_partitions` from the snapshot — not DEFAULT_PARTITIONS documentation.
 
 Companion repos:
 
@@ -339,11 +339,26 @@ Go: `pkg/client`, `pkg/store`
 | `on_success` | `completed_count >= total` |
 | Terminal status | `completed + failed >= total` |
 
-### Push / push_many
+### Push / push_many (inside a batch)
 
 - `push_many` / bulk: single `add_jobs`, chunked produce (`push_many_chunk_size` default 500) preserves gap-free `batch_seq`
 - Push into completed/cancelled → `BatchClosedError`
 - Block that raises still seals so already-pushed jobs can finalize
+
+### Standalone bulk — `enqueue_many` / `perform_bulk` (no batch ledger)
+
+For fire-and-forget throughput (no Redis batch hash, no completion events, no callbacks):
+
+| API | Role |
+|-----|------|
+| `Batch.enqueue_many(Worker, payloads, tenant_id:, valid_till:)` | Chunked produce of N standalone jobs |
+| `Worker.perform_bulk(payloads, …)` | Same, Sidekiq-style alias on the Worker |
+| `Batch.enqueue_many_in` / `enqueue_many_at` | Delayed standalone bulk via schedule index |
+| Go `EnqueueMany` / `EnqueueManyJobs` | Same shapes in kafka-batch-go |
+
+**Do not confuse with** `Batch.create { b.push_many(...) }` — that creates a batch ledger and emits completion events. Use `enqueue_many` when you only need Kafka delivery (e.g. load tests, HelloWorker benches).
+
+Optional `tenant_id:` applies to fair workers (ingest partitioning / WFQ). Chunk size follows `push_many_chunk_size`.
 
 ### meta vs callback_args
 
@@ -895,8 +910,11 @@ Go: `kbatch topics create|validate`.
 
 ### DEFAULT_PARTITIONS (Ruby)
 
-| Category | Partitions |
-|----------|------------|
+These are **create_topics defaults only** — not necessarily what exists on a live cluster.
+Kafka cannot shrink partitions; ops often create smaller topics for local/dev (e.g. 10).
+
+| Category | Create default |
+|----------|----------------|
 | jobs / priority / ready | 768 |
 | events | 48 |
 | callbacks | 6 |
@@ -910,6 +928,20 @@ Env: `REPLICATION_FACTOR` (default 3), `PARTITIONS` uniform override.
 Scheduled retention ≥ `max_schedule_horizon` (+1 day buffer). DLT retention 30 days at creation. Existing topics skipped, never altered.
 
 **Manifest plain Go topics** are not always auto-discovered by Ruby `create_topics` — create them explicitly or via Go topics CLI.
+
+### Live broker inventory (AI + ops)
+
+On AI knowledge sync (NX-locked, at most every 24h with the config snapshot), `KafkaBatch::Topics.inventory` merges:
+
+| Field | Meaning |
+|-------|---------|
+| `live_broker_partitions` / `broker_partitions` | Actual count from `Karafka::Admin.cluster_info` |
+| `create_default_partitions` / `configured_partitions` | `DEFAULT_PARTITIONS` / create_topics intent |
+| `status` | `matches_default` / `differs_from_default` / `missing_on_broker` / `broker_unavailable` |
+
+Always includes both fairness lanes’ ingest + ready (`.ruby` / `.go`) even when Worker classes are not loaded (UI-only pods). Stored in Redis `kafka_batch:ai:knowledge:config` → `topic_inventory` and the `config:live` RAG chunk.
+
+**Assistant rule:** when asked “how many partitions does topic X have?”, answer from `live_broker_partitions`. Never report 768 / DEFAULT_PARTITIONS as the live count unless broker metadata is unavailable (then say so).
 
 ---
 
@@ -959,13 +991,32 @@ Mount `KafkaBatch::Web` at `/kafka_batch` behind host auth.
 
 ### Pages
 
-`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/reconciler`, `/system`, `/audit`, `/performance`
+`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/reconciler`, `/system`, `/audit`, `/performance`, `/ai`
 
 Live refresh: localStorage `kafka_batch_live`, 5s.
 
+### Dashboard metrics (`GET /api/dashboard`)
+
+| Field | Meaning |
+|-------|---------|
+| `counts` / `total` | Batch status counters from Redis ledger |
+| `pending_jobs` | Untouched jobs in **running batches** (ledger) — UI label “Pending in batches” |
+| `topic_pending` | Sum of Kafka consumer-group lag across gem topics **excluding** scheduled log-archive rows — UI label “Jobs pending” (links to `/lag`) |
+| `liveness` | Live consumers + running jobs when liveness is on |
+
+Do not conflate `pending_jobs` (batch ledger) with `topic_pending` (Kafka lag). Fair ingest + ready can both count the same logical job mid-pipeline in the lag sum.
+
+### System page
+
+Read-only `KafkaBatch::SystemInfo` sections: Overview, Kafka, Redis, MySQL (if store), SuperFetch, Uniqueness, Liveness, Fairness, Scheduled jobs, Retry, Reconciliation, Cancellation, Priority, Retention, Performance metrics, Instrumentation metrics, Audit, AI, optional rdkafka overrides. Secrets masked.
+
+### AI assistant
+
+Settings + shared chat at `/ai`. RAG over packaged `knowledge_chunks.json` + live config snapshot (`config:live`). OpenRouter key encrypted in Redis (`kafka_batch:ai:settings`). Never touches operational ledger/fairness/workset keys.
+
 ### Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)
 
-Batch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all.
+Batch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all; AI settings/chat/history.
 
 Optional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets masked on `/system`.
 
@@ -1220,7 +1271,7 @@ Editable source lives in `ai/*.md`. Clients do **not** re-chunk markdown at boot
 | Data | Refresh rule |
 |------|----------------|
 | Knowledge chunks | Only when packaged `corpus_version` ≠ Redis meta |
-| Config snapshot | At most every **24 hours** on boot (`config_refreshed_at`) — knobs can change without a docs release |
+| Config snapshot + topic inventory | At most every **24 hours** on boot (`config_refreshed_at`); NX lock so only one pod writes. Includes masked knobs + `Topics.inventory` (broker partitions merged with create defaults). |
 
 ```ruby
 config.ai_knowledge_enabled = true
@@ -1228,6 +1279,8 @@ config.ai_knowledge_enabled = true
 ```
 
 Force full re-sync: `FORCE=1 bundle exec rake kafka_batch:sync_ai_knowledge`
+
+Live RAG chunk (`config:live`) is injected first for chat. For partition questions prefer `live_broker_partitions` over docs that cite DEFAULT_PARTITIONS (768, etc.).
 
 This file intentionally expands beyond the root README so the assistant has a self-contained corpus without live cluster operational state.
 

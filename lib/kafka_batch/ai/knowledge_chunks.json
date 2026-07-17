@@ -1,10 +1,10 @@
 {
   "format": 1,
-  "built_at": "2026-07-17T05:40:19Z",
+  "built_at": "2026-07-17T12:00:56Z",
   "max_chars": 2800,
-  "readme_sha256": "368c93b4b2593414f1b2c493770f3f5e16d6aef44ec5ca7e1e4c83fa4f9a121d",
-  "faq_sha256": "c49ccb51330018143506f0f75827e46e38f414e8654974ed9e9f43a9aef7a62d",
-  "chunk_count": 375,
+  "readme_sha256": "7efbf433d18559ca84fb799c73925efa0ee5f0774d0edce8289f104424320eec",
+  "faq_sha256": "d8e0a823207d2c655f63f1f55d97898ef780e536ded30c598715ce0c59832dba",
+  "chunk_count": 386,
   "chunks": [
     {
       "id": "readme-introduction-939750e33df47b89",
@@ -14,8 +14,8 @@
         "Introduction"
       ],
       "section": "Introduction",
-      "text": "Introduction\n\n# kafka-batch AI knowledge base\n\n> **Purpose.** Canonical corpus for the kafka-batch Web UI assistant (RAG). Covers architecture, every major subsystem, Redis/Kafka contracts, configuration knobs (Ruby gem + Go companion), SuperFetch, fairness, batches, retries, delayed jobs, and how each piece preserves **atomicity** and **idempotency**.\n>\n> **Assistant safety rule.** Answers must be derived only from this knowledge base and `ai/FAQ.md`. The assistant must **never** read, write, or mutate live Redis keys used by the batch ledger, fairness scheduler, workset, uniqueness locks, schedule index, liveness, consumption pause, retry-cancel, reconciler, or performance counters. Separate assistant Redis keys (API-key ciphertext, vector index) are not operational kafka-batch state.\n\nCompanion repos:\n\n| Repo | Role |\n|------|------|\n| [kafka-batch](https://github.com/y-shashank/kafka-batch) | Ruby client, Karafka control + Ruby execution, Web UI |\n| [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go) | Go client, `kbatch daemon` (control), `kbatch worker` (Go execution) |\n\nBoth runtimes share **Kafka topics** and **Redis** contracts. Pick one language per tier; tiers talk only through Kafka + Redis.\n\n**Critical deployment rule:** never run Go `kbatch daemon` and Ruby `{CG}-control` / `{CG}-dispatch-*` on the **same** events/retry/fair-ingest topics — that double-consumes. One control plane per cluster (or carefully partitioned topic sets).\n\n---",
-      "char_count": 1483
+      "text": "Introduction\n\n# kafka-batch AI knowledge base\n\n> **Purpose.** Canonical corpus for the kafka-batch Web UI assistant (RAG). Covers architecture, every major subsystem, Redis/Kafka contracts, configuration knobs (Ruby gem + Go companion), SuperFetch, fairness, batches, retries, delayed jobs, and how each piece preserves **atomicity** and **idempotency**.\n>\n> **Assistant safety rule.** Answers must be derived from this knowledge base, `ai/FAQ.md`, and the **live configuration snapshot** (`config:live` / `topic_inventory`) when present. The assistant must **never** read, write, or mutate live Redis keys used by the batch ledger, fairness scheduler, workset, uniqueness locks, schedule index, liveness, consumption pause, retry-cancel, reconciler, or performance counters. Separate assistant Redis keys (API-key ciphertext, knowledge chunks, chat history) are not operational kafka-batch state. For live partition counts use `live_broker_partitions` from the snapshot — not DEFAULT_PARTITIONS documentation.\n\nCompanion repos:\n\n| Repo | Role |\n|------|------|\n| [kafka-batch](https://github.com/y-shashank/kafka-batch) | Ruby client, Karafka control + Ruby execution, Web UI |\n| [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go) | Go client, `kbatch daemon` (control), `kbatch worker` (Go execution) |\n\nBoth runtimes share **Kafka topics** and **Redis** contracts. Pick one language per tier; tiers talk only through Kafka + Redis.\n\n**Critical deployment rule:** never run Go `kbatch daemon` and Ruby `{CG}-control` / `{CG}-dispatch-*` on the **same** events/retry/fair-ingest topics — that double-consumes. One control plane per cluster (or carefully partitioned topic sets).\n\n---",
+      "char_count": 1696
     },
     {
       "id": "readme-1-what-kafka-batch-is-84a4ce9d6fcc4a58",
@@ -350,16 +350,28 @@
       "char_count": 463
     },
     {
-      "id": "readme-7-batches-create-open-seal-push-cancel-push-push-a8fcc91dcb93f1f8",
+      "id": "readme-7-batches-create-open-seal-push-cancel-push-push-36a5e485f5ccc854",
       "source": "readme",
-      "title": "Push / push_many",
+      "title": "Push / push_many (inside a batch)",
       "heading_path": [
         "7. Batches — create, open, seal, push, cancel",
-        "Push / push_many"
+        "Push / push_many (inside a batch)"
       ],
       "section": "7. Batches — create, open, seal, push, cancel",
-      "text": "7. Batches — create, open, seal, push, cancel › Push / push_many\n\n- `push_many` / bulk: single `add_jobs`, chunked produce (`push_many_chunk_size` default 500) preserves gap-free `batch_seq`\n- Push into completed/cancelled → `BatchClosedError`\n- Block that raises still seals so already-pushed jobs can finalize",
-      "char_count": 311
+      "text": "7. Batches — create, open, seal, push, cancel › Push / push_many (inside a batch)\n\n- `push_many` / bulk: single `add_jobs`, chunked produce (`push_many_chunk_size` default 500) preserves gap-free `batch_seq`\n- Push into completed/cancelled → `BatchClosedError`\n- Block that raises still seals so already-pushed jobs can finalize",
+      "char_count": 328
+    },
+    {
+      "id": "readme-7-batches-create-open-seal-push-cancel-standalon-bee871a36bfd8031",
+      "source": "readme",
+      "title": "Standalone bulk — `enqueue_many` / `perform_bulk` (no batch ledger)",
+      "heading_path": [
+        "7. Batches — create, open, seal, push, cancel",
+        "Standalone bulk — `enqueue_many` / `perform_bulk` (no batch ledger)"
+      ],
+      "section": "7. Batches — create, open, seal, push, cancel",
+      "text": "7. Batches — create, open, seal, push, cancel › Standalone bulk — `enqueue_many` / `perform_bulk` (no batch ledger)\n\nFor fire-and-forget throughput (no Redis batch hash, no completion events, no callbacks):\n\n| API | Role |\n|-----|------|\n| `Batch.enqueue_many(Worker, payloads, tenant_id:, valid_till:)` | Chunked produce of N standalone jobs |\n| `Worker.perform_bulk(payloads, …)` | Same, Sidekiq-style alias on the Worker |\n| `Batch.enqueue_many_in` / `enqueue_many_at` | Delayed standalone bulk via schedule index |\n| Go `EnqueueMany` / `EnqueueManyJobs` | Same shapes in kafka-batch-go |\n\n**Do not confuse with** `Batch.create { b.push_many(...) }` — that creates a batch ledger and emits completion events. Use `enqueue_many` when you only need Kafka delivery (e.g. load tests, HelloWorker benches).\n\nOptional `tenant_id:` applies to fair workers (ingest partitioning / WFQ). Chunk size follows `push_many_chunk_size`.",
+      "char_count": 923
     },
     {
       "id": "readme-7-batches-create-open-seal-push-cancel-meta-vs-c-dab8014e4d154f1c",
@@ -971,8 +983,20 @@
         "DEFAULT_PARTITIONS (Ruby)"
       ],
       "section": "25. Topics, partitions, create_all",
-      "text": "25. Topics, partitions, create_all › DEFAULT_PARTITIONS (Ruby)\n\n| Category | Partitions |\n|----------|------------|\n| jobs / priority / ready | 768 |\n| events | 48 |\n| callbacks | 6 |\n| retry per tier | 12 |\n| scheduled | 48 |\n| dead_letter | 3 |\n| fair ingest per lane | 300 |\n\nEnv: `REPLICATION_FACTOR` (default 3), `PARTITIONS` uniform override.\n\nScheduled retention ≥ `max_schedule_horizon` (+1 day buffer). DLT retention 30 days at creation. Existing topics skipped, never altered.\n\n**Manifest plain Go topics** are not always auto-discovered by Ruby `create_topics` — create them explicitly or via Go topics CLI.\n\n---",
-      "char_count": 623
+      "text": "25. Topics, partitions, create_all › DEFAULT_PARTITIONS (Ruby)\n\nThese are **create_topics defaults only** — not necessarily what exists on a live cluster.\nKafka cannot shrink partitions; ops often create smaller topics for local/dev (e.g. 10).\n\n| Category | Create default |\n|----------|----------------|\n| jobs / priority / ready | 768 |\n| events | 48 |\n| callbacks | 6 |\n| retry per tier | 12 |\n| scheduled | 48 |\n| dead_letter | 3 |\n| fair ingest per lane | 300 |\n\nEnv: `REPLICATION_FACTOR` (default 3), `PARTITIONS` uniform override.\n\nScheduled retention ≥ `max_schedule_horizon` (+1 day buffer). DLT retention 30 days at creation. Existing topics skipped, never altered.\n\n**Manifest plain Go topics** are not always auto-discovered by Ruby `create_topics` — create them explicitly or via Go topics CLI.",
+      "char_count": 807
+    },
+    {
+      "id": "readme-25-topics-partitions-create-all-live-broker-inve-9a59239ae9fb0494",
+      "source": "readme",
+      "title": "Live broker inventory (AI + ops)",
+      "heading_path": [
+        "25. Topics, partitions, create_all",
+        "Live broker inventory (AI + ops)"
+      ],
+      "section": "25. Topics, partitions, create_all",
+      "text": "25. Topics, partitions, create_all › Live broker inventory (AI + ops)\n\nOn AI knowledge sync (NX-locked, at most every 24h with the config snapshot), `KafkaBatch::Topics.inventory` merges:\n\n| Field | Meaning |\n|-------|---------|\n| `live_broker_partitions` / `broker_partitions` | Actual count from `Karafka::Admin.cluster_info` |\n| `create_default_partitions` / `configured_partitions` | `DEFAULT_PARTITIONS` / create_topics intent |\n| `status` | `matches_default` / `differs_from_default` / `missing_on_broker` / `broker_unavailable` |\n\nAlways includes both fairness lanes’ ingest + ready (`.ruby` / `.go`) even when Worker classes are not loaded (UI-only pods). Stored in Redis `kafka_batch:ai:knowledge:config` → `topic_inventory` and the `config:live` RAG chunk.\n\n**Assistant rule:** when asked “how many partitions does topic X have?”, answer from `live_broker_partitions`. Never report 768 / DEFAULT_PARTITIONS as the live count unless broker metadata is unavailable (then say so).\n\n---",
+      "char_count": 992
     },
     {
       "id": "readme-26-deployment-consumer-groups-kb-role-daemon-mod-c4602c3d116b4c6b",
@@ -1053,8 +1077,44 @@
         "Pages"
       ],
       "section": "27. Web UI and JSON API",
-      "text": "27. Web UI and JSON API › Pages\n\n`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/reconciler`, `/system`, `/audit`, `/performance`\n\nLive refresh: localStorage `kafka_batch_live`, 5s.",
-      "char_count": 245
+      "text": "27. Web UI and JSON API › Pages\n\n`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/reconciler`, `/system`, `/audit`, `/performance`, `/ai`\n\nLive refresh: localStorage `kafka_batch_live`, 5s.",
+      "char_count": 252
+    },
+    {
+      "id": "readme-27-web-ui-and-json-api-dashboard-metrics-get-api-f8603375ee58c62f",
+      "source": "readme",
+      "title": "Dashboard metrics (`GET /api/dashboard`)",
+      "heading_path": [
+        "27. Web UI and JSON API",
+        "Dashboard metrics (`GET /api/dashboard`)"
+      ],
+      "section": "27. Web UI and JSON API",
+      "text": "27. Web UI and JSON API › Dashboard metrics (`GET /api/dashboard`)\n\n| Field | Meaning |\n|-------|---------|\n| `counts` / `total` | Batch status counters from Redis ledger |\n| `pending_jobs` | Untouched jobs in **running batches** (ledger) — UI label “Pending in batches” |\n| `topic_pending` | Sum of Kafka consumer-group lag across gem topics **excluding** scheduled log-archive rows — UI label “Jobs pending” (links to `/lag`) |\n| `liveness` | Live consumers + running jobs when liveness is on |\n\nDo not conflate `pending_jobs` (batch ledger) with `topic_pending` (Kafka lag). Fair ingest + ready can both count the same logical job mid-pipeline in the lag sum.",
+      "char_count": 662
+    },
+    {
+      "id": "readme-27-web-ui-and-json-api-system-page-9c43dc8a28ab3bc9",
+      "source": "readme",
+      "title": "System page",
+      "heading_path": [
+        "27. Web UI and JSON API",
+        "System page"
+      ],
+      "section": "27. Web UI and JSON API",
+      "text": "27. Web UI and JSON API › System page\n\nRead-only `KafkaBatch::SystemInfo` sections: Overview, Kafka, Redis, MySQL (if store), SuperFetch, Uniqueness, Liveness, Fairness, Scheduled jobs, Retry, Reconciliation, Cancellation, Priority, Retention, Performance metrics, Instrumentation metrics, Audit, AI, optional rdkafka overrides. Secrets masked.",
+      "char_count": 344
+    },
+    {
+      "id": "readme-27-web-ui-and-json-api-ai-assistant-462897ec63ff9d3f",
+      "source": "readme",
+      "title": "AI assistant",
+      "heading_path": [
+        "27. Web UI and JSON API",
+        "AI assistant"
+      ],
+      "section": "27. Web UI and JSON API",
+      "text": "27. Web UI and JSON API › AI assistant\n\nSettings + shared chat at `/ai`. RAG over packaged `knowledge_chunks.json` + live config snapshot (`config:live`). OpenRouter key encrypted in Redis (`kafka_batch:ai:settings`). Never touches operational ledger/fairness/workset keys.",
+      "char_count": 273
     },
     {
       "id": "readme-27-web-ui-and-json-api-mutating-api-csrf-cookie-bb64e73717f60ae5",
@@ -1065,8 +1125,8 @@
         "Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)"
       ],
       "section": "27. Web UI and JSON API",
-      "text": "27. Web UI and JSON API › Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)\n\nBatch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all.\n\nOptional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets masked on `/system`.\n\n---",
-      "char_count": 273
+      "text": "27. Web UI and JSON API › Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)\n\nBatch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all; AI settings/chat/history.\n\nOptional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets masked on `/system`.\n\n---",
+      "char_count": 299
     },
     {
       "id": "readme-28-redis-key-namespace-catalog-36119c6edc8a8024",
@@ -1284,8 +1344,8 @@
         "Packaged chunks + Redis sync (boot)"
       ],
       "section": "36. Document maintenance",
-      "text": "36. Document maintenance › Packaged chunks + Redis sync (boot)\n\nEditable source lives in `ai/*.md`. Clients do **not** re-chunk markdown at boot.\n\n| Artifact | Role |\n|----------|------|\n| `lib/kafka_batch/ai/knowledge_chunks.json` | Prebuilt chunks (shipped in the gem) |\n| `kafka_batch:ai:knowledge:chunks` | Redis HASH id → chunk JSON |\n| `kafka_batch:ai:knowledge:config` | Live masked config snapshot |\n| `kafka_batch:ai:knowledge:meta` | `corpus_version`, `config_refreshed_at`, … |\n| `kafka_batch:ai:knowledge:lock` | Short NX lock during write only |\n\n**Many UI pods:** every pod calls `sync!` after Rails init; only one writer wins the lock.\n\n| Data | Refresh rule |\n|------|----------------|\n| Knowledge chunks | Only when packaged `corpus_version` ≠ Redis meta |\n| Config snapshot | At most every **24 hours** on boot (`config_refreshed_at`) — knobs can change without a docs release |\n\n```ruby\nconfig.ai_knowledge_enabled = true\n# ENV: KAFKA_BATCH_AI_KNOWLEDGE_ENABLED=false to disable\n```\n\nForce full re-sync: `FORCE=1 bundle exec rake kafka_batch:sync_ai_knowledge`\n\nThis file intentionally expands beyond the root README so the assistant has a self-contained corpus without live cluster operational state.\n\n\n---",
-      "char_count": 1226
+      "text": "36. Document maintenance › Packaged chunks + Redis sync (boot)\n\nEditable source lives in `ai/*.md`. Clients do **not** re-chunk markdown at boot.\n\n| Artifact | Role |\n|----------|------|\n| `lib/kafka_batch/ai/knowledge_chunks.json` | Prebuilt chunks (shipped in the gem) |\n| `kafka_batch:ai:knowledge:chunks` | Redis HASH id → chunk JSON |\n| `kafka_batch:ai:knowledge:config` | Live masked config snapshot |\n| `kafka_batch:ai:knowledge:meta` | `corpus_version`, `config_refreshed_at`, … |\n| `kafka_batch:ai:knowledge:lock` | Short NX lock during write only |\n\n**Many UI pods:** every pod calls `sync!` after Rails init; only one writer wins the lock.\n\n| Data | Refresh rule |\n|------|----------------|\n| Knowledge chunks | Only when packaged `corpus_version` ≠ Redis meta |\n| Config snapshot + topic inventory | At most every **24 hours** on boot (`config_refreshed_at`); NX lock so only one pod writes. Includes masked knobs + `Topics.inventory` (broker partitions merged with create defaults). |\n\n```ruby\nconfig.ai_knowledge_enabled = true\n# ENV: KAFKA_BATCH_AI_KNOWLEDGE_ENABLED=false to disable\n```\n\nForce full re-sync: `FORCE=1 bundle exec rake kafka_batch:sync_ai_knowledge`\n\nLive RAG chunk (`config:live`) is injected first for chat. For partition questions prefer `live_broker_partitions` over docs that cite DEFAULT_PARTITIONS (768, etc.).\n\nThis file intentionally expands beyond the root README so the assistant has a self-contained corpus without live cluster operational state.\n\n\n---",
+      "char_count": 1495
     },
     {
       "id": "readme-37-batch-hash-fields-redis-3c89a3927c68a4a7",
@@ -1915,6 +1975,30 @@
       "section": "E. Batches and callbacks",
       "text": "FAQ: What is the difference between `meta` and `callback_args`?\n\nBoth stored on the batch. Only `callback_args` go to callback handlers. `meta` is for dashboard/API labeling.",
       "char_count": 174
+    },
+    {
+      "id": "faq-e-batches-and-callbacks-how-do-i-enqueue-many-jo-daf46634757cbb49",
+      "source": "faq",
+      "title": "How do I enqueue many jobs without a batch?",
+      "heading_path": [
+        "E. Batches and callbacks",
+        "How do I enqueue many jobs without a batch?"
+      ],
+      "section": "E. Batches and callbacks",
+      "text": "FAQ: How do I enqueue many jobs without a batch?\n\n`KafkaBatch::Batch.enqueue_many(Worker, payloads, tenant_id: …)` or `Worker.perform_bulk(payloads, …)`. Chunked Kafka produce; **no** Redis batch ledger, completion events, or callbacks. Use for throughput / fire-and-forget. Delayed: `enqueue_many_in` / `enqueue_many_at`. Go: `EnqueueMany` / `EnqueueManyJobs`.",
+      "char_count": 361
+    },
+    {
+      "id": "faq-e-batches-and-callbacks-when-should-i-use-enqueu-ade803b674ab0af1",
+      "source": "faq",
+      "title": "When should I use `enqueue_many` vs `Batch.create { push_many }`?",
+      "heading_path": [
+        "E. Batches and callbacks",
+        "When should I use `enqueue_many` vs `Batch.create { push_many }`?"
+      ],
+      "section": "E. Batches and callbacks",
+      "text": "FAQ: When should I use `enqueue_many` vs `Batch.create { push_many }`?\n\n`enqueue_many` = standalone delivery only. `Batch.create` + `push_many` = tracked batch with completion counting and optional `on_success` / `on_complete`.",
+      "char_count": 227
     },
     {
       "id": "faq-e-batches-and-callbacks-can-a-batch-mix-ruby-and-6646cc731a7783de",
@@ -2861,8 +2945,20 @@
         "Default partition targets?"
       ],
       "section": "P. Topics and partitions",
-      "text": "FAQ: Default partition targets?\n\nExecution/ready 768, events 48, fair ingest 300, scheduled 48, retry 12/tier, callbacks 6, DLT 3.",
-      "char_count": 130
+      "text": "FAQ: Default partition targets?\n\n**create_topics defaults only:** execution/ready 768, events 48, fair ingest 300, scheduled 48, retry 12/tier, callbacks 6, DLT 3. Live clusters often differ (Kafka cannot shrink).",
+      "char_count": 213
+    },
+    {
+      "id": "faq-p-topics-and-partitions-how-many-partitions-does-7e985b875e98b524",
+      "source": "faq",
+      "title": "How many partitions does my live topic have?",
+      "heading_path": [
+        "P. Topics and partitions",
+        "How many partitions does my live topic have?"
+      ],
+      "section": "P. Topics and partitions",
+      "text": "FAQ: How many partitions does my live topic have?\n\nUse the AI live config snapshot `topic_inventory` → `live_broker_partitions` for that topic name (e.g. `kafka_batch.fair_time_ready.ruby`). Do **not** answer with 768 from DEFAULT_PARTITIONS docs unless broker metadata is unavailable — then say so. Refresh: boot NX sync every 24h, or `FORCE=1 rake kafka_batch:sync_ai_knowledge`.",
+      "char_count": 381
     },
     {
       "id": "faq-p-topics-and-partitions-can-i-shrink-partitions-c6211fe3caf31f58",
@@ -2925,6 +3021,18 @@
       "char_count": 93
     },
     {
+      "id": "faq-q-web-ui-pending-in-batches-vs-jobs-pending-on-t-e83d80065e6e3d0e",
+      "source": "faq",
+      "title": "Pending in batches vs Jobs pending on the home page?",
+      "heading_path": [
+        "Q. Web UI",
+        "Pending in batches vs Jobs pending on the home page?"
+      ],
+      "section": "Q. Web UI",
+      "text": "FAQ: Pending in batches vs Jobs pending on the home page?\n\n**Pending in batches** (`pending_jobs`) = untouched jobs in running Redis batches. **Jobs pending** (`topic_pending`) = sum of Kafka lag across gem topics excluding the scheduled topic’s log-size rows. Different signals.",
+      "char_count": 279
+    },
+    {
       "id": "faq-q-web-ui-why-is-performance-empty-436e53e79102b2a6",
       "source": "faq",
       "title": "Why is Performance empty?",
@@ -2945,8 +3053,8 @@
         "Why does System hide secrets?"
       ],
       "section": "Q. Web UI",
-      "text": "FAQ: Why does System hide secrets?\n\nBy design — masks passwords/tokens/api keys. Future AI settings keys will be encrypted + masked similarly.",
-      "char_count": 142
+      "text": "FAQ: Why does System hide secrets?\n\nBy design — masks passwords/tokens/api keys. AI encryption salt is masked; OpenRouter keys are encrypted in Redis.",
+      "char_count": 150
     },
     {
       "id": "faq-q-web-ui-which-ui-actions-need-csrf-ad72fbe63ccffd67",
@@ -2957,8 +3065,8 @@
         "Which UI actions need CSRF?"
       ],
       "section": "Q. Web UI",
-      "text": "FAQ: Which UI actions need CSRF?\n\nCancel/delete/bulk, pause/resume, weight edits, retry deletes — cookie `_kb_csrf` + `X-CSRF-Token` from bootstrap.\n\n---",
-      "char_count": 153
+      "text": "FAQ: Which UI actions need CSRF?\n\nCancel/delete/bulk, pause/resume, weight edits, retry deletes, AI settings/chat — cookie `_kb_csrf` + `X-CSRF-Token` from bootstrap.\n\n---",
+      "char_count": 171
     },
     {
       "id": "faq-r-metrics-and-instrumentation-does-the-gem-ship-71b0c024e76cd5d0",
@@ -4013,8 +4121,32 @@
         "Performance API?"
       ],
       "section": "AJ. Web API surface (detailed)",
-      "text": "FAQ: Performance API?\n\nRequires `performance_metrics_enabled`; otherwise explains disabled.\n\n---",
-      "char_count": 96
+      "text": "FAQ: Performance API?\n\nRequires `performance_metrics_enabled`; otherwise explains disabled.",
+      "char_count": 91
+    },
+    {
+      "id": "faq-aj-web-api-surface-detailed-dashboard-topic-pend-27338d1ca6eedb3d",
+      "source": "faq",
+      "title": "Dashboard `topic_pending`?",
+      "heading_path": [
+        "AJ. Web API surface (detailed)",
+        "Dashboard `topic_pending`?"
+      ],
+      "section": "AJ. Web API surface (detailed)",
+      "text": "FAQ: Dashboard `topic_pending`?\n\n`GET /api/dashboard` → sum of `Lag.pending_total` (consumer lag, excludes scheduled log-archive). Separate from `pending_jobs` (batch ledger).",
+      "char_count": 175
+    },
+    {
+      "id": "faq-aj-web-api-surface-detailed-ai-chat-partition-an-8c6a1df6213dd6d8",
+      "source": "faq",
+      "title": "AI chat partition answers wrong (always 768)?",
+      "heading_path": [
+        "AJ. Web API surface (detailed)",
+        "AI chat partition answers wrong (always 768)?"
+      ],
+      "section": "AJ. Web API surface (detailed)",
+      "text": "FAQ: AI chat partition answers wrong (always 768)?\n\nDocs cite create defaults. Live snapshot must include `topic_inventory` with `live_broker_partitions`. Force sync after deploy; assistant must prefer live broker counts over DEFAULT_PARTITIONS.\n\n---",
+      "char_count": 250
     },
     {
       "id": "faq-ak-topics-cli-and-rake-ruby-dry-run-topics-3362e11a7b323108",
@@ -4473,5 +4605,5 @@
       "char_count": 58
     }
   ],
-  "corpus_version": "b9945142542654e764dc61f82294ea0c"
+  "corpus_version": "fb18a2db30bf009dd624cfc9c9a5cbe7"
 }

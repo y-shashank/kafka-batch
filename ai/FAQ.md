@@ -148,6 +148,12 @@ Batch already completed or cancelled (or otherwise closed to new jobs).
 ### What is the difference between `meta` and `callback_args`?
 Both stored on the batch. Only `callback_args` go to callback handlers. `meta` is for dashboard/API labeling.
 
+### How do I enqueue many jobs without a batch?
+`KafkaBatch::Batch.enqueue_many(Worker, payloads, tenant_id: …)` or `Worker.perform_bulk(payloads, …)`. Chunked Kafka produce; **no** Redis batch ledger, completion events, or callbacks. Use for throughput / fire-and-forget. Delayed: `enqueue_many_in` / `enqueue_many_at`. Go: `EnqueueMany` / `EnqueueManyJobs`.
+
+### When should I use `enqueue_many` vs `Batch.create { push_many }`?
+`enqueue_many` = standalone delivery only. `Batch.create` + `push_many` = tracked batch with completion counting and optional `on_success` / `on_complete`.
+
 ### Can a batch mix Ruby and Go jobs?
 Yes. Callbacks fire when the whole batch finishes.
 
@@ -427,7 +433,10 @@ Native go-sql-driver **or** `mysql2://` / `mysql://` URLs (converted at connect)
 Roughly peak_pods × (concurrency or members) × SuperFetch concurrency on each scaled execution topic. Fair ingest often hundreds for exclusive tenants.
 
 ### Default partition targets?
-Execution/ready 768, events 48, fair ingest 300, scheduled 48, retry 12/tier, callbacks 6, DLT 3.
+**create_topics defaults only:** execution/ready 768, events 48, fair ingest 300, scheduled 48, retry 12/tier, callbacks 6, DLT 3. Live clusters often differ (Kafka cannot shrink).
+
+### How many partitions does my live topic have?
+Use the AI live config snapshot `topic_inventory` → `live_broker_partitions` for that topic name (e.g. `kafka_batch.fair_time_ready.ruby`). Do **not** answer with 768 from DEFAULT_PARTITIONS docs unless broker metadata is unavailable — then say so. Refresh: boot NX sync every 24h, or `FORCE=1 rake kafka_batch:sync_ai_knowledge`.
 
 ### Can I shrink partitions later?
 No — Kafka cannot shrink. Oversizing is safer than undersizing.
@@ -448,14 +457,17 @@ No. Mount behind app authentication. CSRF protects mutating APIs; `web_authentic
 ### What does Live refresh do?
 Toolbar toggle (`kafka_batch_live`) refetches APIs every 5s.
 
+### Pending in batches vs Jobs pending on the home page?
+**Pending in batches** (`pending_jobs`) = untouched jobs in running Redis batches. **Jobs pending** (`topic_pending`) = sum of Kafka lag across gem topics excluding the scheduled topic’s log-size rows. Different signals.
+
 ### Why is Performance empty?
 Need `performance_metrics_enabled` on processes that emit job metrics (and retention window). Shared Redis bucket schema for Ruby+Go.
 
 ### Why does System hide secrets?
-By design — masks passwords/tokens/api keys. Future AI settings keys will be encrypted + masked similarly.
+By design — masks passwords/tokens/api keys. AI encryption salt is masked; OpenRouter keys are encrypted in Redis.
 
 ### Which UI actions need CSRF?
-Cancel/delete/bulk, pause/resume, weight edits, retry deletes — cookie `_kb_csrf` + `X-CSRF-Token` from bootstrap.
+Cancel/delete/bulk, pause/resume, weight edits, retry deletes, AI settings/chat — cookie `_kb_csrf` + `X-CSRF-Token` from bootstrap.
 
 ---
 
@@ -828,6 +840,12 @@ Requires `audit_enabled`; otherwise explains disabled.
 
 ### Performance API?
 Requires `performance_metrics_enabled`; otherwise explains disabled.
+
+### Dashboard `topic_pending`?
+`GET /api/dashboard` → sum of `Lag.pending_total` (consumer lag, excludes scheduled log-archive). Separate from `pending_jobs` (batch ledger).
+
+### AI chat partition answers wrong (always 768)?
+Docs cite create defaults. Live snapshot must include `topic_inventory` with `live_broker_partitions`. Force sync after deploy; assistant must prefer live broker counts over DEFAULT_PARTITIONS.
 
 ---
 
