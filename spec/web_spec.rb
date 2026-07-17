@@ -123,6 +123,22 @@ RSpec.describe KafkaBatch::Web do
       expect(second).to be > first
     end
 
+    it "exposes batch pending and topic lag pending separately" do
+      seed(total: 5)
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      allow(KafkaBatch::Lag).to receive(:pending_total).and_return(42)
+
+      payload = json_body(get("/api/dashboard"))
+      expect(payload["pending_jobs"]).to eq(5)
+      expect(payload["topic_pending"]).to eq(42)
+    end
+
+    it "returns null topic_pending when lag is unavailable" do
+      payload = json_body(get("/api/dashboard"))
+      expect(payload).to have_key("topic_pending")
+      expect(payload["topic_pending"]).to be_nil
+    end
+
     it "lists batches with metrics fields" do
       id = seed(on_complete: "RecordingCallback", description: "Important nightly batch")
       status, _h, body = get("/api/batches")
@@ -366,6 +382,17 @@ RSpec.describe KafkaBatch::Web do
     it "returns reconciler summary" do
       payload = json_body(get("/api/reconciler"))
       expect(payload["ok"]).to eq(true)
+    end
+
+    it "formats last run time as human-readable UTC" do
+      KafkaBatch::Reconciler::RunSummary.save_last!(
+        ran_at: "2026-07-17T11:09:03.123Z",
+        triggered_by: "rake",
+        duration: "0.5",
+        details: []
+      )
+      payload = json_body(get("/api/reconciler"))
+      expect(payload["last"]["ran_at_label"]).to eq("2026-07-17 11:09:03 UTC")
     end
   end
 

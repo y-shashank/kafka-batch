@@ -111,6 +111,7 @@ module KafkaBatch
           counts: counts,
           total: counts.values.sum,
           pending_jobs: @web.safe_pending_jobs,
+          topic_pending: @web.safe_topic_pending,
           liveness: @web.safe_liveness_snapshot
         )
       end
@@ -584,10 +585,18 @@ module KafkaBatch
             failed_count: d["failed_count"] || d[:failed_count]
           }
         end
+        last_payload =
+          if last
+            last.merge(ran_at_label: @web.fmt_time(last[:ran_at]))
+          end
+        skip_payload =
+          if skip
+            skip.merge(at_label: @web.fmt_time(skip[:at]))
+          end
         Json.ok(
           ok: true,
-          last: last,
-          skip: skip,
+          last: last_payload,
+          skip: skip_payload,
           details: details,
           reconciliation_interval: cfg.reconciliation_interval,
           max_reconcile_per_run: cfg.max_reconcile_per_run,

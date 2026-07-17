@@ -94,6 +94,12 @@ RSpec.describe KafkaBatch::Ai::Retriever do
     expect(hits).not_to be_empty
     expect(hits.first).to include("id", "title", "text")
   end
+
+  it "puts the live config chunk first so broker partitions beat DEFAULT_PARTITIONS docs" do
+    hits = described_class.search("how many partitions fair time ready")
+    expect(hits.first["id"]).to eq(KafkaBatch::Ai::KnowledgeIndex::LIVE_CONFIG_CHUNK_ID)
+    expect(hits.first["text"]).to include("live_broker_partitions=")
+  end
 end
 
 RSpec.describe KafkaBatch::Ai::Chat do

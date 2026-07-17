@@ -78,9 +78,15 @@ module KafkaBatch
         .sort_by { |r| [r[:group], r[:topic]] }
     end
 
-    # Total pending messages across everything.
+    # Total pending messages across everything (includes scheduled log-size rows).
     def total(rows = partitions)
       rows.sum { |r| r[:lag] }
+    end
+
+    # Consumer-group lag only — excludes scheduled-topic watermark rows
+    # ({log_archive: true}), which are log size rather than unconsumed work.
+    def pending_total(rows = partitions)
+      rows.reject { |r| r[:log_archive] }.sum { |r| r[:lag].to_i }
     end
 
     # Read committed lag for a specific consumer group + topics.

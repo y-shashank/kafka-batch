@@ -117,6 +117,54 @@ RSpec.describe KafkaBatch::Topics do
     end
   end
 
+  describe ".inventory" do
+    it "merges create_topics defaults with broker partition counts" do
+      jobs = KafkaBatch.config.jobs_topic
+      allow(KafkaBatch).to receive(:workers).and_return([])
+      info = double(
+        "cluster_info",
+        topics: [
+          { topic_name: jobs, partition_count: 10 },
+          { topic_name: KafkaBatch.config.events_topic, partitions: Array.new(48) },
+          { topic_name: KafkaBatch.config.fair_time_ready_ruby_topic, partition_count: 12 }
+        ]
+      )
+      allow(Karafka::Admin).to receive(:cluster_info).and_return(info)
+
+      inv = described_class.inventory
+      expect(inv["available"]).to eq(true)
+      expect(inv["topic_count"]).to be > 0
+
+      job_row = inv["topics"].find { |t| t["name"] == jobs }
+      expect(job_row["broker_partitions"]).to eq(10)
+      expect(job_row["configured_partitions"]).to eq(KafkaBatch::Topics::DEFAULT_PARTITIONS[:jobs])
+      expect(job_row["status"]).to eq("differs_from_default")
+
+      events = inv["topics"].find { |t| t["name"] == KafkaBatch.config.events_topic }
+      expect(events["broker_partitions"]).to eq(48)
+      expect(events["status"]).to eq("matches_default")
+
+      # Fair ready topics are inventoried even with no fair workers loaded.
+      ready = inv["topics"].find { |t| t["name"] == KafkaBatch.config.fair_time_ready_ruby_topic }
+      expect(ready).not_to be_nil
+      expect(ready["broker_partitions"]).to eq(12)
+      expect(ready["configured_partitions"]).to eq(768)
+      expect(ready["status"]).to eq("differs_from_default")
+    end
+
+    it "keeps configured defaults when the broker is unreachable" do
+      allow(KafkaBatch).to receive(:workers).and_return([])
+      allow(Karafka::Admin).to receive(:cluster_info).and_raise(StandardError, "down")
+
+      inv = described_class.inventory
+      expect(inv["available"]).to eq(false)
+      expect(inv["topics"]).not_to be_empty
+      expect(inv["topics"]).to all(include("status" => "broker_unavailable"))
+      expect(inv["topics"].first["configured_partitions"]).to be > 0
+      expect(inv["topics"].first["broker_partitions"]).to be_nil
+    end
+  end
+
   describe ".create_all!" do
 
     it "creates only the missing topics and skips the existing ones" do

@@ -183,10 +183,151 @@ module KafkaBatch
     # Names of topics that already exist on the cluster.
     # @return [Array<String>]
     def existing_topic_names
-      Karafka::Admin.cluster_info.topics.map { |t| t[:topic_name] }
+      return [] unless defined?(Karafka) && defined?(Karafka::Admin)
+
+      KafkaBatch.ensure_karafka_configured! if KafkaBatch.respond_to?(:ensure_karafka_configured!)
+      topics = Karafka::Admin.cluster_info.topics
+      list = topics.is_a?(Hash) ? topics.values : Array(topics)
+      list.map { |t| topic_name_of(t) }.reject(&:empty?).uniq
     rescue StandardError => e
       KafkaBatch.logger&.warn("[KafkaBatch::Topics] could not list existing topics: #{e.message}")
       []
     end
+
+    # Partition counts for every topic on the cluster (best-effort).
+    # Topics with unknown partition metadata are omitted.
+    # @return [Hash{String => Integer}] topic name → partition count
+    def broker_partition_counts
+      return {} unless defined?(Karafka) && defined?(Karafka::Admin)
+
+      KafkaBatch.ensure_karafka_configured! if KafkaBatch.respond_to?(:ensure_karafka_configured!)
+      info = Karafka::Admin.cluster_info
+      topics = info.topics
+      list =
+        if topics.is_a?(Hash)
+          topics.values
+        else
+          Array(topics)
+        end
+
+      list.each_with_object({}) do |t, h|
+        name = topic_name_of(t)
+        next if name.nil? || name.empty?
+
+        count = partition_count_of(t)
+        next if count.nil?
+
+        h[name] = count.to_i
+      end
+    rescue StandardError => e
+      KafkaBatch.logger&.warn("[KafkaBatch::Topics] broker_partition_counts failed: #{e.message}")
+      {}
+    end
+
+    # Merge create_topics defaults (config) with live broker partition counts.
+    # Used by the AI knowledge config snapshot so chat has actual cluster sizing.
+    # Always includes both fairness lanes (ingest + ready + .go/.ruby) even when
+    # no fair workers are loaded in this process (typical for UI-only pods).
+    #
+    # @return [Hash] {
+    #   available:, refreshed_at:, topics: [ { name:, category:, configured_partitions:,
+    #     broker_partitions:, replication_factor:, status: } ],
+    #   topic_count:, broker_known_count:
+    # }
+    def inventory(partitions: nil, replication_factor: nil)
+      broker = broker_partition_counts
+      available = !broker.empty?
+      rows = inventory_specs(partitions: partitions, replication_factor: replication_factor).map do |s|
+        name = s[:name].to_s
+        configured = s[:partitions].to_i
+        bp = broker[name]
+        status =
+          if !available
+            "broker_unavailable"
+          elsif bp.nil?
+            "missing_on_broker"
+          elsif bp == configured
+            "matches_default"
+          else
+            "differs_from_default"
+          end
+        {
+          "name" => name,
+          "category" => s[:category].to_s,
+          "configured_partitions" => configured,
+          "broker_partitions" => bp,
+          "replication_factor" => s[:replication_factor].to_i,
+          "status" => status
+        }
+      end
+
+      {
+        "available" => available,
+        "refreshed_at" => Time.now.utc.iso8601,
+        "topic_count" => rows.size,
+        "broker_known_count" => rows.count { |r| !r["broker_partitions"].nil? },
+        "topics" => rows
+      }
+    end
+
+    # Like specs, but always lists both fairness lanes so AI/UI inventory is
+    # complete even when Worker classes are not loaded in this process.
+    def inventory_specs(partitions: nil, replication_factor: nil)
+      cfg = KafkaBatch.config
+      rf  = resolved_replication_factor(replication_factor)
+      by_name = specs(partitions: partitions, replication_factor: replication_factor)
+                .each_with_object({}) { |s, h| h[s[:name].to_s] = s }
+
+      add = lambda do |name, category|
+        n = name.to_s
+        return if n.empty?
+        return if by_name.key?(n)
+
+        by_name[n] = {
+          name:               n,
+          partitions:         (partitions || DEFAULT_PARTITIONS.fetch(category)).to_i,
+          replication_factor: rf,
+          category:           category,
+          config:             topic_config_for(category, cfg)
+        }
+      end
+
+      KafkaBatch::Configuration::FAIRNESS_TYPES.each do |ft|
+        add.call(cfg.fairness_ingest_topic(ft), :ingest)
+        add.call(cfg.fairness_ready_topic(ft), :ready)
+        add.call(cfg.fairness_ready_topic(ft, :go), :ready)
+        add.call(cfg.fairness_ready_topic(ft, :ruby), :ready)
+      end
+      add.call(cfg.jobs_topic, :jobs)
+      Array(cfg.extra_job_topics).each { |t| add.call(t, :jobs) }
+      Array(cfg.jobs_topics).each { |t| add.call(t, :jobs) }
+
+      by_name.values.sort_by { |s| s[:name].to_s }
+    end
+
+    # @api private
+    def topic_name_of(t)
+      if t.respond_to?(:topic_name)
+        t.topic_name.to_s
+      elsif t.is_a?(Hash)
+        (t[:topic_name] || t["topic_name"]).to_s
+      else
+        ""
+      end
+    end
+    module_function :topic_name_of
+
+    # @api private
+    def partition_count_of(t)
+      if t.respond_to?(:partition_count) && !t.partition_count.nil?
+        t.partition_count
+      elsif t.respond_to?(:partitions)
+        t.partitions.size
+      elsif t.is_a?(Hash)
+        t[:partition_count] || t["partition_count"] ||
+          (t[:partitions] || t["partitions"]).then { |p| p.respond_to?(:size) ? p.size : nil }
+      end
+    end
+    module_function :partition_count_of
   end
 end

@@ -44,21 +44,22 @@ module KafkaBatch
             }
           end
 
-          # Always include live config when present (low weight boost via prepend after sort)
+          # Always include live config first — authoritative for this cluster
+          # (broker partition counts, knobs). Docs alone often cite create defaults.
           live = KnowledgeIndex.fetch_chunk(KnowledgeIndex::LIVE_CONFIG_CHUNK_ID)
           scored.sort_by! { |c| -c["score"] }
           top = scored.first(limit)
           if live.is_a?(Hash) && !live["text"].to_s.empty?
             top = top.reject { |c| c["id"] == KnowledgeIndex::LIVE_CONFIG_CHUNK_ID }
-            top = top.first(limit - 1) if top.size >= limit
-            top << {
+            top = top.first([limit - 1, 0].max)
+            top.unshift(
               "id" => KnowledgeIndex::LIVE_CONFIG_CHUNK_ID,
               "title" => live["title"],
               "source" => "config",
               "section" => "Live configuration",
-              "score" => 0,
+              "score" => 1_000_000,
               "text" => live["text"]
-            }
+            )
           end
           top
         end

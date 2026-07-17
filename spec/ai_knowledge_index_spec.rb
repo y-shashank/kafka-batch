@@ -100,9 +100,18 @@ RSpec.describe KafkaBatch::Ai::KnowledgeIndex do
 
       snap = described_class.config_snapshot
       expect(snap["super_fetch_concurrency"]).to eq(3)
+      expect(snap["topic_inventory"]).to be_a(Hash)
+      expect(snap["topic_inventory"]["topics"]).to be_an(Array)
+      expect(snap["topic_inventory"]["topics"]).not_to be_empty
+      expect(snap["topic_inventory"]["topics"].first).to include(
+        "name", "category", "configured_partitions", "status"
+      )
 
       live = described_class.fetch_chunk(described_class::LIVE_CONFIG_CHUNK_ID)
       expect(live["text"]).to include("super_fetch_concurrency: 3")
+      expect(live["text"]).to include("AUTHORITATIVE LIVE TOPIC PARTITIONS")
+      expect(live["text"]).to include("live_broker_partitions=")
+      expect(live["text"]).to include("create_default_partitions=")
 
       expect(described_class.sync!).to eq(:skipped_fresh)
     end
@@ -122,6 +131,7 @@ RSpec.describe KafkaBatch::Ai::KnowledgeIndex do
       expect(described_class.config_snapshot["super_fetch_concurrency"]).to eq(9)
       expect(described_class.fetch_chunk(described_class::LIVE_CONFIG_CHUNK_ID)["text"])
         .to include("super_fetch_concurrency: 9")
+      expect(described_class.meta["topics_refreshed_at"]).to be_a(String)
     end
 
     it "rewrites corpus when meta is cleared (simulates new corpus_version)" do

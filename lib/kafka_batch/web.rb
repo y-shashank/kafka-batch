@@ -137,6 +137,17 @@ module KafkaBatch
       nil
     end
 
+    # Sum of Kafka consumer-group lag across gem topics (jobs, fair, retry, …),
+    # excluding the scheduled topic's log-size rows. Nil when lag is unavailable.
+    def safe_topic_pending
+      return nil unless KafkaBatch::Lag.available?
+
+      KafkaBatch::Lag.pending_total
+    rescue StandardError => e
+      KafkaBatch.logger.warn("[KafkaBatch::Web] topic_pending failed: #{e.message}")
+      nil
+    end
+
     def safe_liveness_snapshot
       return nil unless KafkaBatch::Liveness.available?
 

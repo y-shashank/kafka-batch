@@ -47,6 +47,7 @@ type Dashboard = {
   counts: Record<string, number>
   total: number
   pending_jobs: number | null
+  topic_pending: number | null
   liveness: { consumers: number; running_jobs: number } | null
 }
 
@@ -142,7 +143,12 @@ export function BatchesPage() {
           { label: 'Success', value: counts.success || 0, color: 'success.main' },
           { label: 'Complete', value: counts.complete || 0, color: 'warning.main' },
           { label: 'Cancelled', value: counts.cancelled || 0 },
-          ...(dashboard?.pending_jobs != null ? [{ label: 'Pending jobs', value: dashboard.pending_jobs }] : []),
+          ...(dashboard?.pending_jobs != null
+            ? [{ label: 'Pending in batches', value: dashboard.pending_jobs }]
+            : []),
+          ...(dashboard?.topic_pending != null
+            ? [{ label: 'Jobs pending', value: dashboard.topic_pending, to: '/lag' }]
+            : []),
           ...(dashboard?.liveness
             ? [
                 { label: 'Consumers', value: dashboard.liveness.consumers, to: '/live' },

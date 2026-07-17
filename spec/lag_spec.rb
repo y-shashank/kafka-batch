@@ -64,6 +64,18 @@ RSpec.describe KafkaBatch::Lag do
     end
   end
 
+  describe ".pending_total" do
+    it "sums lag but excludes scheduled log-archive rows" do
+      rows = [
+        { group: "g-jobs", topic: "jobs", partition: 0, lag: 10 },
+        { group: "g-jobs", topic: "jobs", partition: 1, lag: 5 },
+        { group: "g-schedule", topic: "scheduled", partition: 0, lag: 100, log_archive: true }
+      ]
+      expect(described_class.total(rows)).to eq(115)
+      expect(described_class.pending_total(rows)).to eq(15)
+    end
+  end
+
   describe ".gem_groups_with_topics" do
     def fake_cg(id, topics)
       double(id: id, topics: topics.map { |t| double(name: t) })

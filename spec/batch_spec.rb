@@ -240,6 +240,41 @@ RSpec.describe KafkaBatch::Batch do
     end
   end
 
+  describe ".enqueue_many" do
+    it "produces many standalone jobs with nil batch_id via chunked produce" do
+      ids = described_class.enqueue_many(SuccessfulWorker, [{ "n" => 1 }, { "n" => 2 }, { "n" => 3 }])
+
+      expect(ids.size).to eq(3)
+      expect(ids).to all(be_a(String))
+      produced = FakeProducer.for_topic("test.success")
+      expect(produced.size).to eq(3)
+      expect(produced.map { |m| m.payload["batch_id"] }).to all(be_nil)
+      expect(produced.map { |m| m.payload["job_id"] }).to match_array(ids)
+    end
+
+    it "returns [] for an empty payload list" do
+      expect(described_class.enqueue_many(SuccessfulWorker, [])).to eq([])
+    end
+
+    it "routes fair workers to the ingest topic with tenant_id" do
+      ids = described_class.enqueue_many(FairWorker, [{ "n" => 1 }, { "n" => 2 }], tenant_id: "acme")
+
+      expect(ids.size).to eq(2)
+      produced = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic(:time))
+      expect(produced.size).to eq(2)
+      expect(produced.map { |m| m.payload["tenant_id"] }).to all(eq("acme"))
+      expect(produced.map { |m| m.payload["batch_id"] }).to all(be_nil)
+      expect(FakeProducer.for_topic("test.fair")).to be_empty
+    end
+
+    it "Worker.perform_bulk delegates to Batch.enqueue_many" do
+      expect(KafkaBatch::Batch).to receive(:enqueue_many)
+        .with(SuccessfulWorker, [{ "id" => 1 }], tenant_id: "t1", valid_till: nil)
+        .and_return(["j1"])
+      expect(SuccessfulWorker.perform_bulk([{ "id" => 1 }], tenant_id: "t1")).to eq(["j1"])
+    end
+  end
+
   describe ".reenqueue" do
     it "re-produces the message with the next attempt number" do
       described_class.reenqueue(

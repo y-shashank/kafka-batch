@@ -17,16 +17,22 @@ module KafkaBatch
           kafka_section(config),
           redis_section(config),
           mysql_section(config),
+          super_fetch_section(config),
+          uniqueness_section(config),
           liveness_section(config),
           fairness_section(config),
+          schedule_section(config),
           retry_section(config),
           reconciliation_section(config),
           cancellation_section(config),
           priority_section(config),
           retention_section(config),
+          performance_section(config),
+          metrics_section(config),
+          audit_section(config),
+          ai_section(config),
           rdkafka_section("Producer", config.producer_config, accent: "#8b5cf6"),
-          rdkafka_section("Consumer", config.consumer_config, accent: "#ec4899"),
-          misc_section(config)
+          rdkafka_section("Consumer", config.consumer_config, accent: "#ec4899")
         ].compact
       end
 
@@ -88,7 +94,12 @@ module KafkaBatch
           rows: [
             row("Gem version", KafkaBatch::VERSION),
             row("Store", config.store),
-            row("Topic prefix", config.topic_prefix.to_s.empty? ? "(none)" : config.topic_prefix)
+            row("Store DB connection", fmt_connection(config.store_database_connection)),
+            row("Topic prefix", config.topic_prefix.to_s.empty? ? "(none)" : config.topic_prefix),
+            row("Execution mode", config.execution_mode),
+            row("Daemon mode", fmt_bool(config.daemon_mode)),
+            row("Handler manifest", blank_or(config.handler_manifest_path)),
+            row("Web authenticator", config.web_authenticator ? "set" : "none")
           ]
         )
       end
@@ -103,7 +114,65 @@ module KafkaBatch
           rows: [
             row("Brokers", Array(config.brokers).join(", ")),
             *topic_rows,
+            row("Extra job topics", list_or_none(config.extra_job_topics)),
+            row("Jobs topics (Go lag)", list_or_none(config.jobs_topics)),
+            row("Topics replication factor", config.topics_replication_factor),
             row("Validate topics on boot", fmt_bool(config.validate_topics_on_boot))
+          ]
+        )
+      end
+
+      def super_fetch_section(config)
+        claim = config.super_fetch_claim_window.to_i
+        claim_label =
+          if claim <= 0
+            "auto (2× concurrency = #{config.super_fetch_concurrency.to_i * 2})"
+          else
+            claim
+          end
+        Section.new(
+          id: "super_fetch", title: "SuperFetch", icon: "⚡", accent: "#ea580c",
+          rows: [
+            row("Concurrency", config.super_fetch_concurrency),
+            row("Claim window", claim_label),
+            row("Recommended Redis pool", config.recommended_redis_pool_size),
+            row("Lease TTL", fmt_duration(config.super_fetch_lease_ttl)),
+            row("Orphan grace", fmt_duration(config.super_fetch_orphan_grace)),
+            row("Reclaim enabled", fmt_bool(config.super_fetch_reclaim_enabled)),
+            row("Reclaim interval", fmt_duration(config.super_fetch_reclaim_interval)),
+            row("Reclaim limit", config.super_fetch_reclaim_limit),
+            row("Drain timeout", fmt_duration(config.super_fetch_drain_timeout))
+          ]
+        )
+      end
+
+      def uniqueness_section(config)
+        Section.new(
+          id: "uniqueness", title: "Uniqueness", icon: "➀", accent: "#4f46e5",
+          rows: [
+            row("Enabled", fmt_bool(config.uniq_enabled)),
+            row("Lock TTL", fmt_duration(config.uniq_lock_ttl)),
+            row("On duplicate", config.uniq_on_duplicate)
+          ]
+        )
+      end
+
+      def schedule_section(config)
+        Section.new(
+          id: "schedule", title: "Scheduled jobs", icon: "⏱", accent: "#0d9488",
+          rows: [
+            row("Schedule store", config.schedule_store),
+            row("Schedule DB connection", fmt_connection(config.schedule_store_database_connection)),
+            row("Poller enabled", fmt_bool(config.schedule_poller_enabled)),
+            row("Poll interval", "#{config.schedule_poll_interval}s"),
+            row("Poll max interval", "#{config.schedule_poll_max_interval}s"),
+            row("Poll jitter", "±#{(config.schedule_poll_jitter.to_f * 100).round}%"),
+            row("Batch size", config.schedule_batch_size),
+            row("Lease seconds", fmt_duration(config.schedule_lease_seconds)),
+            row("Reclaim interval", fmt_duration(config.schedule_reclaim_interval)),
+            row("Max schedule horizon", fmt_duration(config.max_schedule_horizon)),
+            row("Index write retries", config.schedule_index_write_retries),
+            row("Index write backoff", "#{config.schedule_index_write_backoff}s")
           ]
         )
       end
@@ -183,13 +252,33 @@ module KafkaBatch
       end
 
       def fairness_section(config)
+        slot_dedup = config.fairness_slot_dedup_ttl.to_i
+        slot_dedup_label =
+          if slot_dedup <= 0
+            "lease TTL (#{fmt_duration(config.fairness_lease_ttl)})"
+          else
+            fmt_duration(slot_dedup)
+          end
+        pinned = config.fairness_tenant_partitions
+        pinned_label =
+          if pinned.nil? || pinned.empty?
+            "none"
+          else
+            pinned.map { |k, v| "#{k}→#{v}" }.join(", ")
+          end
+
         Section.new(
           id: "fairness", title: "Fairness", icon: "⚖", accent: "#7c3aed", wide: true,
           rows: [
             row("Lanes", "per-worker fairness_type (:time / :throughput)"),
+            row("Runtime-split ready (time)", fmt_bool(config.runtime_split_fair_ready?(:time))),
+            row("Runtime-split ready (throughput)", fmt_bool(config.runtime_split_fair_ready?(:throughput))),
             row("Global concurrency (per lane)", config.fairness_global_concurrency),
             row("Max inflight / tenant", config.fairness_max_inflight_per_tenant.zero? ? "dynamic fair share" : config.fairness_max_inflight_per_tenant),
             row("Weighted concurrency", fmt_bool(config.fairness_weighted_concurrency)),
+            row("Lease TTL", fmt_duration(config.fairness_lease_ttl)),
+            row("Forwarding recovery grace", "#{config.fairness_forwarding_recovery_grace}s"),
+            row("Slot dedup TTL", slot_dedup_label),
             row("Active count TTL", fmt_duration(config.fairness_active_count_ttl)),
             row("Active count source", config.fairness_active_count_source),
             row("Ready window", config.fairness_ready_window),
@@ -201,7 +290,7 @@ module KafkaBatch
             row("Min ingest partitions", config.fairness_min_ingest_partitions),
             row("Dynamic tenant partitions", fmt_bool(config.fairness_dynamic_tenant_partitions)),
             row("Tenant partition cache TTL", fmt_duration(config.fairness_tenant_partition_cache_ttl)),
-            row("Pinned tenant partitions", config.fairness_tenant_partitions.empty? ? "none" : config.fairness_tenant_partitions.size)
+            row("Pinned tenant partitions", pinned_label)
           ]
         )
       end
@@ -269,12 +358,66 @@ module KafkaBatch
 
       def retention_section(config)
         Section.new(
-          id: "retention", title: "Retention & limits", icon: "⏱", accent: "#64748b",
+          id: "retention", title: "Retention & limits", icon: "📦", accent: "#64748b",
           rows: [
             row("Batch TTL", fmt_duration(config.batch_ttl)),
             row("Failures TTL", fmt_duration(config.failures_ttl)),
+            row("Max failures per batch", config.max_failures_per_batch.to_i.zero? ? "unlimited" : config.max_failures_per_batch),
+            row("Retry cancel TTL", fmt_duration(config.retry_cancel_ttl)),
             row("All-index max", config.all_index_max_size),
-            row("Max message bytes", config.max_message_bytes.to_i.zero? ? "disabled" : config.max_message_bytes)
+            row("Max message bytes", config.max_message_bytes.to_i.zero? ? "disabled" : config.max_message_bytes),
+            row("Push-many chunk size", config.push_many_chunk_size)
+          ]
+        )
+      end
+
+      def performance_section(config)
+        Section.new(
+          id: "performance", title: "Performance metrics", icon: "📈", accent: "#0284c7",
+          rows: [
+            row("Enabled", fmt_bool(config.performance_metrics_enabled)),
+            row("Retention", fmt_duration(config.performance_metrics_retention)),
+            row("Max job types", config.performance_metrics_max_job_types),
+            row("Bucket seconds", config.performance_metrics_bucket_seconds),
+            row("Sample rate", config.performance_metrics_sample_rate)
+          ]
+        )
+      end
+
+      def metrics_section(config)
+        Section.new(
+          id: "metrics", title: "Instrumentation metrics", icon: "📡", accent: "#9333ea",
+          rows: [
+            row("Enabled", fmt_bool(config.metrics_enabled)),
+            row("Adapter", config.metrics_adapter),
+            row("Prefix", config.metrics_prefix),
+            row("Client", config.metrics_client ? "set" : "none"),
+            row("Proc", config.metrics_proc ? "set" : "none")
+          ]
+        )
+      end
+
+      def audit_section(config)
+        Section.new(
+          id: "audit", title: "Audit log", icon: "✎", accent: "#a16207",
+          rows: [
+            row("Enabled", fmt_bool(config.audit_enabled)),
+            row("DB connection", fmt_connection(config.audit_database_connection)),
+            row("Actor", config.audit_actor ? "set" : "none")
+          ]
+        )
+      end
+
+      def ai_section(config)
+        salt = config.ai_encryption_salt.to_s
+        Section.new(
+          id: "ai", title: "AI assistant", icon: "✦", accent: "#be185d",
+          rows: [
+            row("Knowledge enabled", fmt_bool(config.ai_knowledge_enabled)),
+            row("Encryption salt", salt.empty? ? "unset" : MASK, masked: !salt.empty?),
+            row("Chat history max lines", config.ai_chat_history_max_lines),
+            row("Chat context chunks", config.ai_chat_context_chunks),
+            row("Default OpenRouter model", blank_or(config.ai_openrouter_default_model))
           ]
         )
       end
@@ -292,8 +435,24 @@ module KafkaBatch
         )
       end
 
-      def misc_section(config)
-        nil # folded into other sections; keep hook for future extras
+      def blank_or(value, empty: "(none)")
+        s = value.to_s.strip
+        s.empty? ? empty : s
+      end
+
+      def list_or_none(list)
+        arr = Array(list).map(&:to_s).reject(&:empty?)
+        arr.empty? ? "(none)" : arr.join(", ")
+      end
+
+      def fmt_connection(value)
+        case value
+        when nil then "default"
+        when Symbol then value.to_s
+        when Class then value.name
+        when Hash then mask_config_value("connection", value)
+        else value.to_s.empty? ? "default" : value.to_s
+        end
       end
     end
   end

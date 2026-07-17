@@ -39,9 +39,10 @@ module KafkaBatch
       IDS_KEY    = "kafka_batch:ai:knowledge:ids"
 
       LOCK_TTL_SECONDS = 120
-      # How often boot may refresh the live config snapshot when the knowledge
-      # corpus version is unchanged. Not a Redis key TTL — compared to
-      # meta["config_refreshed_at"].
+      # How often boot may refresh the live config snapshot (including broker
+      # topic partition inventory) when the knowledge corpus version is unchanged.
+      # Not a Redis key TTL — compared to meta["config_refreshed_at"].
+      # Only the pod that wins the NX lock performs the write.
       CONFIG_REFRESH_SECONDS = 24 * 3600
       LIVE_CONFIG_CHUNK_ID = "config:live"
 
@@ -161,6 +162,8 @@ module KafkaBatch
 
         def config_stale?(meta)
           return true if meta.nil? || meta.empty?
+          # One-shot after deploy of topic inventory: older meta has no stamp.
+          return true if meta["topics_refreshed_at"].to_s.empty?
 
           stamp = meta["config_refreshed_at"].to_s
           stamp = meta["refreshed_at"].to_s if stamp.empty?
@@ -192,6 +195,7 @@ module KafkaBatch
             "chunk_count"          => chunks.size.to_s,
             "refreshed_at"         => now,
             "config_refreshed_at"  => now,
+            "topics_refreshed_at"  => (snapshot.dig("topic_inventory", "refreshed_at").to_s.empty? ? now : snapshot.dig("topic_inventory", "refreshed_at").to_s),
             "refreshed_by"         => pod_id,
             "packaged_built"       => packaged["built_at"].to_s
           )
@@ -213,6 +217,7 @@ module KafkaBatch
           r.hset(
             META_KEY,
             "config_refreshed_at" => now,
+            "topics_refreshed_at" => (snapshot.dig("topic_inventory", "refreshed_at").to_s.empty? ? now : snapshot.dig("topic_inventory", "refreshed_at").to_s),
             "config_refreshed_by" => pod_id,
             # Preserve corpus fields; touch refreshed_at only for observability of last writer.
             "refreshed_by" => pod_id
@@ -226,8 +231,29 @@ module KafkaBatch
 
         def build_live_config_chunk(snapshot)
           lines = ["Live configuration snapshot (this deploy)", ""]
+          inventory = snapshot["topic_inventory"]
           snapshot.each do |key, value|
+            next if key == "topic_inventory"
+
             lines << "#{key}: #{value}"
+          end
+          if inventory.is_a?(Hash)
+            lines << ""
+            lines << "AUTHORITATIVE LIVE TOPIC PARTITIONS (from Kafka broker)"
+            lines << "Rule: broker_partitions = actual cluster count. " \
+                     "configured_partitions = create_topics DEFAULT only — never report it as live."
+            lines << "topic_inventory_available: #{inventory['available']}"
+            lines << "topic_count: #{inventory['topic_count']}"
+            lines << "broker_known_count: #{inventory['broker_known_count']}"
+            lines << "topics_refreshed_at: #{inventory['refreshed_at']}"
+            Array(inventory["topics"]).each do |t|
+              next unless t.is_a?(Hash)
+
+              broker = t["broker_partitions"].nil? ? "n/a" : t["broker_partitions"]
+              lines << "- #{t['name']}: live_broker_partitions=#{broker} " \
+                       "create_default_partitions=#{t['configured_partitions']} " \
+                       "category=#{t['category']} status=#{t['status']} rf=#{t['replication_factor']}"
+            end
           end
           text = lines.join("\n")
           {
@@ -244,6 +270,21 @@ module KafkaBatch
         # Masked, flat snapshot of operator-facing knobs for RAG.
         def build_config_snapshot
           c = KafkaBatch.config
+          inventory =
+            begin
+              KafkaBatch::Topics.inventory
+            rescue StandardError => e
+              KafkaBatch.logger.warn("[KafkaBatch][Ai::KnowledgeIndex] topic inventory failed: #{e.message}")
+              {
+                "available" => false,
+                "refreshed_at" => Time.now.utc.iso8601,
+                "topic_count" => 0,
+                "broker_known_count" => 0,
+                "topics" => [],
+                "error" => e.message
+              }
+            end
+
           {
             "brokers" => Array(c.brokers).join(","),
             "redis_url" => SystemInfo.mask_redis_url(c.redis_url),
@@ -302,7 +343,9 @@ module KafkaBatch
             "daemon_mode" => c.daemon_mode,
             "handler_manifest_path" => c.handler_manifest_path.to_s,
             "performance_metrics_enabled" => c.performance_metrics_enabled,
-            "ai_knowledge_enabled" => c.ai_knowledge_enabled
+            "ai_knowledge_enabled" => c.ai_knowledge_enabled,
+            "topics_replication_factor" => c.topics_replication_factor,
+            "topic_inventory" => inventory
           }
         end
 

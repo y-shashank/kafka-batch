@@ -46,7 +46,7 @@ export function ReconcilerPage() {
       ) : (
         <MetricCards
           metrics={[
-            { label: 'Last run', value: String(last.ran_at || '—') },
+            { label: 'Last run', value: String(last.ran_at_label || last.ran_at || '—') },
             { label: 'Triggered by', value: String(last.triggered_by || '—') },
             { label: 'Duration', value: `${last.duration ?? '—'}s` },
             { label: 'Stuck recovered', value: last.recovered_stale ?? 0 },
@@ -57,7 +57,7 @@ export function ReconcilerPage() {
       )}
       {data.skip?.at ? (
         <Alert severity="warning" sx={{ mb: 2 }}>
-          Last lock skip: {data.skip.at} ({data.skip.reason})
+          Last lock skip: {data.skip.at_label || data.skip.at} ({data.skip.reason})
         </Alert>
       ) : null}
       {last ? (

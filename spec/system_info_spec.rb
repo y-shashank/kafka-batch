@@ -33,6 +33,27 @@ RSpec.describe KafkaBatch::SystemInfo do
       expect(titles).to include("Overview", "Kafka", "Redis", "Fairness", "Liveness")
     end
 
+    it "includes SuperFetch, schedule, uniqueness, performance, and AI cards" do
+      titles = described_class.sections(config).map(&:title)
+      expect(titles).to include(
+        "SuperFetch",
+        "Uniqueness",
+        "Scheduled jobs",
+        "Performance metrics",
+        "Instrumentation metrics",
+        "Audit log",
+        "AI assistant"
+      )
+    end
+
+    it "surfaces SuperFetch concurrency and claim window" do
+      config.super_fetch_concurrency = 16
+      config.super_fetch_claim_window = 0
+      sf = described_class.sections(config).find { |s| s.id == "super_fetch" }
+      expect(sf.rows.find { |r| r.label == "Concurrency" }.value).to eq("16")
+      expect(sf.rows.find { |r| r.label == "Claim window" }.value).to include("auto")
+    end
+
     it "masks redis hash passwords" do
       config.redis_url = ""
       config.redis = { host: "localhost", port: 6379, db: 0, password: "hunter2" }

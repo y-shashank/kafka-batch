@@ -389,6 +389,56 @@ module KafkaBatch
       job_id
     end
 
+    # Bulk-enqueue many standalone jobs immediately (no batch ledger / no
+    # completion events). Chunked produce via +produce_many_sync+ — same path as
+    # +push_many+, without growing a batch. Pass +tenant_id:+ for fair workers.
+    #
+    #   payloads = 50.times.map { |i| { "id" => i } }
+    #   KafkaBatch::Batch.enqueue_many(FairWorker, payloads, tenant_id: "acme")
+    #
+    # @param payloads [Array<Hash>] one payload per job
+    # @return [Array<String, nil>] the job ids, in order (nil = uniq duplicate skipped)
+    def self.enqueue_many(worker_class, payloads, tenant_id: nil, valid_till: nil)
+      ensure_worker!(worker_class)
+      payloads = payloads.to_a
+      return [] if payloads.empty?
+
+      job_ids = bulk_uniq_job_ids(worker_class, payloads)
+      entries = []
+
+      payloads.zip(job_ids).each do |payload, job_id|
+        next if job_id.nil?
+
+        entries << [payload, job_id]
+      end
+      return job_ids if entries.empty?
+
+      messages = entries.map do |payload, job_id|
+        message = build_message(
+          worker_class: worker_class, payload: payload,
+          job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id,
+          valid_till: valid_till
+        )
+        route = route_for(worker_class, job_id: job_id, tenant_id: tenant_id)
+        msg   = { topic: route[:topic], payload: message }
+        if route[:partition]
+          msg[:partition] = route[:partition]
+        else
+          msg[:key] = route[:key]
+        end
+        msg
+      end
+
+      begin
+        produce_in_chunks!(messages)
+      rescue KafkaBatch::PartialProduceError => e
+        release_unproduced_enqueue_many!(entries, e.produced_count || 0, worker_class)
+        raise
+      end
+
+      job_ids
+    end
+
     # Enqueue a single job to run at an absolute time (Sidekiq perform_at).
     # The payload is produced to the durable scheduled_topic and a compact pointer
     # is stored in the delayed-job index; the SchedulePoller re-produces it onto
@@ -693,6 +743,14 @@ module KafkaBatch
         release_uniq!(worker_class, message["payload"] || {}, job_id: message["job_id"])
       end
     end
+
+    # +enqueue_many+ entries are [payload, job_id] (not full wire messages).
+    def self.release_unproduced_enqueue_many!(entries, produced_count, worker_class)
+      entries.drop(produced_count.to_i).each do |payload, job_id|
+        release_uniq!(worker_class, payload, job_id: job_id)
+      end
+    end
+    private_class_method :release_unproduced_enqueue_many!
 
     # Extract (partition, offset) from a WaterDrop/rdkafka delivery result.
     #

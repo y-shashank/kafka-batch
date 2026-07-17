@@ -403,6 +403,11 @@ Go handlers are **not** Ruby classes. Register them in kafka-batch-go with the s
 # Ruby — by Worker class
 KafkaBatch::Batch.enqueue(Orders::ProcessWorker, "order_id" => 42)
 
+# Many standalone jobs (no batch ledger / no completion events) — chunked produce:
+payloads = 50.times.map { |i| { "order_id" => i } }
+KafkaBatch::Batch.enqueue_many(Orders::ProcessWorker, payloads, tenant_id: "acme")
+# or: Orders::ProcessWorker.perform_bulk(payloads, tenant_id: "acme")
+
 # Go — by manifest job_type
 KafkaBatch::Batch.enqueue_job("segment.export", "segment_id" => 99)
 
@@ -416,6 +421,35 @@ KafkaBatch::Batch.enqueue_job(
   { "report_id" => 1 },
   tenant_id: "acme"
 )
+```
+
+**Bulk inside a batch** — preferred for N jobs (chunked produce; tracks completion):
+
+```ruby
+payloads = users.map { |u| { "user_id" => u.id } }
+
+KafkaBatch::Batch.create(tenant_id: "acme", description: "import") do |b|
+  b.push_many(ProcessUserWorker, payloads)
+  # or one-by-one: b.push(ProcessUserWorker, "user_id" => 1)
+end
+```
+
+**Delayed many** (schedule index + poller):
+
+```ruby
+payloads = 50.times.map { |i| { "order_id" => i } }
+KafkaBatch::Batch.enqueue_many_in(30.minutes, Orders::ProcessWorker, payloads, tenant_id: "acme")
+KafkaBatch::Batch.enqueue_many_at(1.hour.from_now, Orders::ProcessWorker, payloads, tenant_id: "acme")
+```
+
+**Go client** ([kafka-batch-go](https://github.com/y-shashank/kafka-batch-go)) — same shapes:
+
+```go
+payloads := []map[string]interface{}{{"id": 1}, {"id": 2}}
+// By job_type (manifest):
+c.EnqueueManyJobs(ctx, "orders.process", payloads, client.PushOptions{TenantID: "acme"})
+// By Ruby worker class:
+c.EnqueueMany(ctx, "Orders::ProcessWorker", payloads, client.PushOptions{TenantID: "acme"})
 ```
 
 **Mixed batch** — Ruby + Go jobs in one batch; `on_success` / `on_complete` fire when **all** jobs finish:
@@ -519,15 +553,28 @@ See **[Deployment](#deployment)** for how to run all three tiers together, stand
 ### Standalone jobs (no batch)
 
 ```ruby
-# Ruby handler
+# Ruby handler — single job (no batch_id, no completion events)
 KafkaBatch::Batch.enqueue(MyWorker, { "id" => 1 })
-KafkaBatch::Batch.enqueue_at(MyWorker, { "id" => 1 }, 1.hour.from_now)
-KafkaBatch::Batch.enqueue_in(MyWorker, { "id" => 1 }, 30.minutes)
+KafkaBatch::Batch.enqueue(MyWorker, { "id" => 1 }, tenant_id: "acme")  # fair / tenant routing
+KafkaBatch::Batch.enqueue_at(1.hour.from_now, MyWorker, { "id" => 1 })
+KafkaBatch::Batch.enqueue_in(30.minutes, MyWorker, { "id" => 1 })
+
+# Many standalone jobs — chunked produce (no batch ledger / events)
+payloads = 50.times.map { |i| { "id" => i } }
+KafkaBatch::Batch.enqueue_many(MyWorker, payloads, tenant_id: "acme")
+# or: MyWorker.perform_bulk(payloads, tenant_id: "acme")
+
+# Delayed many
+payloads = 50.times.map { |i| { "id" => i } }
+KafkaBatch::Batch.enqueue_many_in(30.minutes, MyWorker, payloads, tenant_id: "acme")
+KafkaBatch::Batch.enqueue_many_at(1.hour.from_now, MyWorker, payloads, tenant_id: "acme")
 
 # Go handler (manifest job_type)
 KafkaBatch::Batch.enqueue_job("segment.export", "segment_id" => 42)
 KafkaBatch::Batch.enqueue_job_at(1.hour.from_now, "segment.export", "segment_id" => 42)
 ```
+
+For bulk enqueue **with** batch tracking, use `Batch.create` + `push_many` (see [Batches & callbacks](#batches--callbacks)).
 
 ### Shared default queue
 
@@ -663,7 +710,11 @@ Legacy callbacks still route through `kafka_batch.callbacks` and `CallbackConsum
 | `Batch.open(id)` | Push more jobs into a running batch (jobs-adding-jobs) |
 | `Batch.find(id)` | Fetch batch hash from Redis |
 | `Batch.cancel(id)` | Mark cancelled; consumers skip within cache TTL |
-| `Batch.enqueue` | Single job, optional `batch_id:` for open batches |
+| `Batch.enqueue` | Single standalone job (no batch ledger); optional `tenant_id:` |
+| `Batch.enqueue_many` | Bulk standalone jobs (chunked produce); optional `tenant_id:` for fair workers |
+| `batch.push` / `push_job` | Add one job to an open batch |
+| `batch.push_many` | Bulk-add many jobs to an open batch (chunked produce) |
+| `Batch.enqueue_many_in` / `enqueue_many_at` | Schedule many delayed standalone jobs |
 | `KafkaBatch::Callback.job` | Build a job callback (`job_type` + optional `topic`) |
 | `KafkaBatch::Callback.worker` | Build a job callback from a Ruby `Worker` class |
 
@@ -1125,9 +1176,22 @@ Lookup a tenant's partition on `/kafka_batch/fairness/time` (partition lookup wi
 ### Enqueue
 
 ```ruby
+# Single fair job (inherits tenant from batch)
 KafkaBatch::Batch.create(tenant_id: "acme") do |b|
-  b.push(FairWorker, { "id" => 1 })   # tenant_id inherited from batch
+  b.push(FairWorker, { "id" => 1 })
 end
+
+# Many fair jobs in one batch (chunked)
+payloads = 50.times.map { |i| { "id" => i } }
+KafkaBatch::Batch.create(tenant_id: "acme") do |b|
+  b.push_many(FairWorker, payloads)
+end
+
+# Many standalone fair jobs (no batch events) — chunked produce
+payloads = 50.times.map { |i| { "id" => i } }
+KafkaBatch::Batch.enqueue_many(FairWorker, payloads, tenant_id: "acme")
+# or: FairWorker.perform_bulk(payloads, tenant_id: "acme")
+```
 ```
 
 ---
@@ -1137,8 +1201,8 @@ end
 `perform_in` / `perform_at` equivalent:
 
 ```ruby
-KafkaBatch::Batch.enqueue_in(MyWorker, payload, 30.minutes)
-KafkaBatch::Batch.enqueue_at(MyWorker, payload, run_at)
+KafkaBatch::Batch.enqueue_in(30.minutes, MyWorker, payload)
+KafkaBatch::Batch.enqueue_at(run_at, MyWorker, payload)
 ```
 
 - Payload stored in `kafka_batch.scheduled` topic

@@ -146,6 +146,14 @@ module KafkaBatch
         KafkaBatch::Batch.enqueue_at(time, self, payload)
       end
 
+      # Bulk-enqueue many standalone jobs immediately (no batch). Optional
+      # +tenant_id:+ for fair workers.
+      #   MyWorker.perform_bulk([{ "id" => 1 }, { "id" => 2 }], tenant_id: "acme")
+      # @return [Array<String, nil>] job ids
+      def perform_bulk(payloads, tenant_id: nil, valid_till: nil)
+        KafkaBatch::Batch.enqueue_many(self, payloads, tenant_id: tenant_id, valid_till: valid_till)
+      end
+
       # Bulk-schedule many jobs (same worker) to run at one time (Sidekiq
       # perform_bulk, delayed). One broker round-trip + one index write.
       #   MyWorker.perform_bulk_in(300, [{"id"=>1}, {"id"=>2}, …])
