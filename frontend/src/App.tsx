@@ -16,6 +16,7 @@ import { LagPage } from './pages/LagPage'
 import { FairnessPage } from './pages/FairnessPage'
 import { WeightsPage } from './pages/WeightsPage'
 import { ScheduledPage } from './pages/ScheduledPage'
+import { RecurringPage } from './pages/RecurringPage'
 import { SystemPage } from './pages/SystemPage'
 import { ReconcilerPage } from './pages/ReconcilerPage'
 import { DeadLetterPage } from './pages/DeadLetterPage'
@@ -62,6 +63,7 @@ function AppRoutes({
         <Route path="live" element={<LivePage />} />
         <Route path="lag" element={<LagPage />} />
         <Route path="scheduled" element={<ScheduledPage />} />
+        <Route path="recurring" element={<RecurringPage />} />
         <Route path="reconciler" element={<ReconcilerPage />} />
         <Route path="dead_letter" element={<DeadLetterPage />} />
         <Route path="audit" element={<AuditPage />} />

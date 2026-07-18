@@ -177,6 +177,26 @@ module KafkaBatch
     # seconds so a poller/process crash mid-dispatch cannot strand it (at-least-once).
     attr_accessor :schedule_lease_seconds    # Integer – default 60
     attr_accessor :schedule_reclaim_interval # Integer – seconds between reclaim sweeps; default 30
+
+    # ── Recurring (cron) scheduler ────────────────────────────────────────────
+    # Fires a registered manifest job on a repeating cron schedule. Shares the
+    # kafka_batch_recurring_schedules / _fires tables AND the Redis leader lock
+    # (kafka_batch:cron:leader_lock) with the Go daemon, so a Ruby and a Go
+    # ticker can run against the same cluster without double-firing: at most one
+    # holds the lock per window, and the (schedule_id, fire_at) ledger dedups
+    # regardless. Enable on exactly the pods that should run it.
+    attr_accessor :recurring_scheduler_enabled # Boolean – default false
+    attr_accessor :recurring_window            # Float   – resolution/poll seconds; default 30
+    attr_accessor :recurring_lock_ttl          # Integer – leader-lease TTL seconds; default 60
+    attr_accessor :recurring_batch_size        # Integer – schedules per tick; default 100
+    attr_accessor :recurring_misfire_grace     # Float   – within this of now always fires; default 60
+    attr_accessor :recurring_max_backfill      # Integer – cap fires/schedule/tick; default 1000
+    attr_accessor :recurring_recover_every     # Float   – pending-recovery sweep seconds; default 300
+    attr_accessor :recurring_recover_grace     # Float   – pending age before re-enqueue; default 120
+    attr_accessor :recurring_prune_every       # Float   – dispatched-ledger prune seconds; default 3600
+    attr_accessor :recurring_prune_retention   # Float   – keep dispatched rows seconds; default 604800
+    attr_accessor :recurring_heartbeat_every   # Float   – stale sweep seconds; default 60
+    attr_accessor :recurring_stale_factor      # Float   – stale if idle > factor×interval; default 2.0
     # Longest allowed delay. MUST be <= the scheduled_topic's retention.ms, else a
     # job could point at an offset already removed by log cleanup. Schedules beyond
     # this are clamped down to it. Default 7 days.
@@ -594,6 +614,18 @@ module KafkaBatch
       @schedule_batch_size      = 100
       @schedule_lease_seconds   = 60
       @schedule_reclaim_interval = 30
+      @recurring_scheduler_enabled = %w[1 true yes].include?(ENV["KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED"].to_s.strip.downcase)
+      @recurring_window          = env_positive_float("KAFKA_BATCH_RECURRING_WINDOW", 30.0)
+      @recurring_lock_ttl        = env_positive_int("KAFKA_BATCH_RECURRING_LOCK_TTL", 60)
+      @recurring_batch_size      = env_positive_int("KAFKA_BATCH_RECURRING_BATCH_SIZE", 100)
+      @recurring_misfire_grace   = env_positive_float("KAFKA_BATCH_RECURRING_MISFIRE_GRACE", 60.0)
+      @recurring_max_backfill    = env_positive_int("KAFKA_BATCH_RECURRING_MAX_BACKFILL", 1000)
+      @recurring_recover_every   = env_positive_float("KAFKA_BATCH_RECURRING_RECOVER_EVERY", 300.0)
+      @recurring_recover_grace   = env_positive_float("KAFKA_BATCH_RECURRING_RECOVER_GRACE", 120.0)
+      @recurring_prune_every     = env_positive_float("KAFKA_BATCH_RECURRING_PRUNE_EVERY", 3600.0)
+      @recurring_prune_retention = env_positive_float("KAFKA_BATCH_RECURRING_PRUNE_RETENTION", 7 * 24 * 3600.0)
+      @recurring_heartbeat_every = env_positive_float("KAFKA_BATCH_RECURRING_HEARTBEAT_EVERY", 60.0)
+      @recurring_stale_factor    = env_positive_float("KAFKA_BATCH_RECURRING_STALE_FACTOR", 2.0)
       @max_schedule_horizon     = 7 * 24 * 3600  # 7 days (match scheduled_topic retention)
       @topics_replication_factor = 3
       @event_emit_retries       = 3

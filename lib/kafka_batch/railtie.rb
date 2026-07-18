@@ -81,6 +81,18 @@ module KafkaBatch
             KafkaBatch.logger.warn("[KafkaBatch] schedule poller start skipped: #{e.message}")
           end
 
+          # Start the recurring (cron) scheduler when enabled. Loaded lazily so
+          # UI/producer-only processes never pull ActiveRecord for it. Shares the
+          # leader lock + fire ledger with the Go daemon, so both can run safely.
+          begin
+            if KafkaBatch.config.recurring_scheduler_enabled
+              require_relative "recurring/ticker"
+              KafkaBatch::Recurring::Ticker.ensure_running!
+            end
+          rescue => e
+            KafkaBatch.logger.warn("[KafkaBatch] recurring scheduler start skipped: #{e.message}")
+          end
+
           # Dedicated heartbeat loop (default every 20s, TTL 180s) so CPU-heavy
           # jobs that starve the consume path cannot look dead to reclaim/health.
           begin
@@ -138,6 +150,7 @@ module KafkaBatch
 
           KafkaBatch::Fairness::Forwarder.stop! if defined?(KafkaBatch::Fairness::Forwarder)
           KafkaBatch::SchedulePoller.stop!       if defined?(KafkaBatch::SchedulePoller)
+          KafkaBatch::Recurring::Ticker.stop!    if defined?(KafkaBatch::Recurring::Ticker)
           KafkaBatch::Producer.reset!            if defined?(KafkaBatch::Producer)
         end
       else
@@ -156,6 +169,29 @@ module KafkaBatch
         desc "Run the stuck-batch reconciler once"
         task reconcile: :environment do
           KafkaBatch::Reconciler.run
+        end
+
+        namespace :recurring do
+          desc "Run the recurring (cron) scheduler loop in the foreground " \
+               "(dedicated pod alternative to the Karafka-embedded ticker)."
+          task run: :environment do
+            require "kafka_batch/recurring/ticker"
+            ticker = KafkaBatch::Recurring::Ticker.new
+            trap("INT")  { exit }
+            trap("TERM") { exit }
+            KafkaBatch.logger.info("[KafkaBatch][Recurring] rake kafka_batch:recurring:run")
+            loop do
+              ticker.tick
+              sleep(KafkaBatch.config.recurring_window.to_f.clamp(1.0, 3600.0))
+            end
+          end
+
+          desc "Run a single recurring scheduler tick (one leader-gated pass) and exit."
+          task tick: :environment do
+            require "kafka_batch/recurring/ticker"
+            result = KafkaBatch::Recurring::Ticker.new.tick
+            puts "[KafkaBatch] recurring tick → #{result}"
+          end
         end
 
         desc "Create all KafkaBatch Kafka topics (idempotent). " \

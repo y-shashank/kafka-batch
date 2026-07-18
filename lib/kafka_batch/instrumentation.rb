@@ -164,6 +164,41 @@ module KafkaBatch
         })
       end
 
+      # ── Recurring (cron) scheduler events ──────────────────────────────
+      # Mirror the Go daemon's cron.* events so Datadog monitors work whichever
+      # runtime holds the leader lock.
+
+      # Fired per successfully enqueued recurring occurrence.
+      def cron_fired(schedule:, job_type:, job_id:, tenant_id: nil)
+        instrument("cron.fired", {
+          schedule: schedule, job_type: job_type, job_id: job_id, tenant_id: tenant_id
+        })
+      end
+
+      # Fired when a claimed occurrence could not be enqueued (left pending for recovery).
+      def cron_enqueue_failed(schedule:, job_type:, error:)
+        instrument("cron.enqueue_failed", {
+          schedule: schedule, job_type: job_type,
+          error_class: error.class.name, error_message: error.message
+        })
+      end
+
+      # Fired (per schedule) when an enabled schedule has been idle longer than its
+      # staleness threshold — the "scheduler silently stopped" alert.
+      def cron_stale(schedule:, job_type:, stale_seconds:, threshold_seconds:)
+        instrument("cron.stale", {
+          schedule: schedule, job_type: job_type,
+          stale_seconds: stale_seconds, threshold_seconds: threshold_seconds
+        })
+      end
+
+      # Fired once per heartbeat sweep as a liveness pulse.
+      def cron_heartbeat(enabled_count:, stale_count:, max_stale_seconds:)
+        instrument("cron.heartbeat", {
+          enabled_count: enabled_count, stale_count: stale_count, max_stale_seconds: max_stale_seconds
+        })
+      end
+
       # ── Batch events ───────────────────────────────────────────────────
 
       # Fired immediately after a new batch is persisted in the store. Useful

@@ -25,6 +25,7 @@ import ReportOutlinedIcon from '@mui/icons-material/ReportOutlined'
 import SensorsOutlinedIcon from '@mui/icons-material/SensorsOutlined'
 import SpeedOutlinedIcon from '@mui/icons-material/SpeedOutlined'
 import ScheduleOutlinedIcon from '@mui/icons-material/ScheduleOutlined'
+import EventRepeatOutlinedIcon from '@mui/icons-material/EventRepeatOutlined'
 import SyncOutlinedIcon from '@mui/icons-material/SyncOutlined'
 import HistoryOutlinedIcon from '@mui/icons-material/HistoryOutlined'
 import InsightsOutlinedIcon from '@mui/icons-material/InsightsOutlined'
@@ -107,6 +108,7 @@ export function AppLayout({
           { to: '/live', label: 'Consumers', icon: <SensorsOutlinedIcon fontSize="small" /> },
           { to: '/lag', label: 'Kafka lag', icon: <SpeedOutlinedIcon fontSize="small" /> },
           { to: '/scheduled', label: 'Scheduled', icon: <ScheduleOutlinedIcon fontSize="small" /> },
+          { to: '/recurring', label: 'Recurring', icon: <EventRepeatOutlinedIcon fontSize="small" /> },
           { to: '/performance', label: 'Performance', icon: <InsightsOutlinedIcon fontSize="small" />, performanceOnly: true },
         ] as NavItem[],
       },

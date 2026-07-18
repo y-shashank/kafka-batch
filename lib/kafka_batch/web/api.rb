@@ -7,6 +7,8 @@ require_relative "../weight_shares"
 require_relative "../reconciler/run_summary"
 require_relative "../dlt/stats"
 require_relative "../dlt/reader"
+require_relative "../recurring/reader"
+require_relative "../recurring/store"
 
 module KafkaBatch
   class Web
@@ -56,6 +58,16 @@ module KafkaBatch
           weights_reset(m[1].to_sym, CGI.unescape(m[2]))
         elsif method == "GET" && path == "/api/scheduled"
           scheduled(params)
+        elsif method == "GET" && path == "/api/recurring"
+          recurring(params)
+        elsif method == "POST" && path == "/api/recurring"
+          recurring_upsert(env, params)
+        elsif method == "POST" && (m = path.match(%r{\A/api/recurring/([^/]+)/run\z}))
+          recurring_run(CGI.unescape(m[1]))
+        elsif %w[PATCH POST].include?(method) && (m = path.match(%r{\A/api/recurring/([^/]+)\z}))
+          recurring_set_enabled(CGI.unescape(m[1]), env, params)
+        elsif method == "DELETE" && (m = path.match(%r{\A/api/recurring/([^/]+)\z}))
+          recurring_delete(CGI.unescape(m[1]))
         elsif method == "GET" && path == "/api/system"
           system_info
         elsif method == "GET" && path == "/api/reconciler"
@@ -550,6 +562,99 @@ module KafkaBatch
           q: query,
           jobs: Array(jobs).map { |j| serialize_scheduled(j) }
         )
+      end
+
+      # recurring lists cron schedules written by the Go control plane, with a
+      # health verdict (ok/stale/paused) mirroring the daemon's heartbeat sweep.
+      def recurring(_params)
+        unless KafkaBatch::Recurring::Reader.available?
+          return Json.ok(ok: true, available: false,
+                         message: "The recurring scheduler table is not present in this database.",
+                         schedules: [], summary: { total: 0, enabled: 0, stale: 0 })
+        end
+
+        schedules = KafkaBatch::Recurring::Reader.list
+        schedules = schedules.map do |s|
+          s.merge(
+            next_run_label: @web.fmt_time(s[:next_run_at]),
+            next_run_eta: @web.fmt_eta(s[:next_run_at]),
+            last_fire_label: s[:last_fire_at] ? @web.fmt_time(s[:last_fire_at]) : nil
+          )
+        end
+        Json.ok(
+          ok: true,
+          available: true,
+          schedules: schedules,
+          summary: KafkaBatch::Recurring::Reader.summary
+        )
+      rescue StandardError => e
+        Json.ok(ok: true, available: false, message: e.message,
+                schedules: [], summary: { total: 0, enabled: 0, stale: 0 })
+      end
+
+      # recurring_upsert registers or edits a schedule (name is the upsert key).
+      def recurring_upsert(env, params)
+        body = json_body(env).merge(@web.body_params(env)).merge(params)
+        result = KafkaBatch::Recurring::Store.upsert(
+          name: body["name"],
+          cron: body["cron"],
+          job_type: body["job_type"],
+          timezone: @web.non_empty(body["timezone"]) || "UTC",
+          args: body["args"],
+          tenant_id: @web.non_empty(body["tenant_id"]),
+          misfire_policy: @web.non_empty(body["misfire_policy"]) || "fire_once",
+          enabled: bool_param(body["enabled"], default: true)
+        )
+        return Json.error(400, result.error) unless result.ok
+
+        Json.ok(ok: true, schedule: result.schedule)
+      rescue StandardError => e
+        Json.error(500, e.message)
+      end
+
+      # recurring_set_enabled pauses (enabled=false) or resumes (enabled=true).
+      def recurring_set_enabled(name, env, params)
+        body = json_body(env).merge(@web.body_params(env)).merge(params)
+        enabled = bool_param(body["enabled"], default: nil)
+        return Json.error(400, "enabled (true|false) is required") if enabled.nil?
+        return Json.error(404, "Schedule not found") unless KafkaBatch::Recurring::Store.set_enabled(name, enabled)
+
+        Json.ok(ok: true, name: name, enabled: enabled)
+      rescue StandardError => e
+        Json.error(500, e.message)
+      end
+
+      def recurring_delete(name)
+        deleted = KafkaBatch::Recurring::Store.delete(name)
+        return Json.error(404, "Schedule not found") if deleted.zero?
+
+        Json.ok(ok: true, name: name, deleted: true)
+      rescue StandardError => e
+        Json.error(500, e.message)
+      end
+
+      # recurring_run enqueues one occurrence of a schedule immediately via the
+      # normal producer path (same routing the daemon uses).
+      def recurring_run(name)
+        rec = KafkaBatch::Recurring::Store.find(name)
+        return Json.error(404, "Schedule not found") unless rec
+
+        args = KafkaBatch::Recurring::Reader.parse_args(rec.args_json)
+        job_id = KafkaBatch::Batch.enqueue_job(
+          rec.job_type, args,
+          tenant_id: (rec.tenant_id.to_s.empty? ? nil : rec.tenant_id)
+        )
+        Json.ok(ok: true, name: name, job_type: rec.job_type, job_id: job_id)
+      rescue StandardError => e
+        Json.error(500, e.message)
+      end
+
+      def bool_param(v, default:)
+        case v
+        when true, "true", "1", 1 then true
+        when false, "false", "0", 0 then false
+        else default
+        end
       end
 
       def system_info
