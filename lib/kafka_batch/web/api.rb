@@ -640,11 +640,14 @@ module KafkaBatch
         return Json.error(404, "Schedule not found") unless rec
 
         args = KafkaBatch::Recurring::Reader.parse_args(rec.args_json)
+        # Canonicalize so legacy rows stored with a worker-class name (or any row
+        # written before normalization) still run: resolve to the manifest job_type.
+        job_type = KafkaBatch::Recurring::Store.canonical_job_type(rec.job_type) || rec.job_type
         job_id = KafkaBatch::Batch.enqueue_job(
-          rec.job_type, args,
+          job_type, args,
           tenant_id: (rec.tenant_id.to_s.empty? ? nil : rec.tenant_id)
         )
-        Json.ok(ok: true, name: name, job_type: rec.job_type, job_id: job_id)
+        Json.ok(ok: true, name: name, job_type: job_type, job_id: job_id)
       rescue StandardError => e
         Json.error(500, e.message)
       end

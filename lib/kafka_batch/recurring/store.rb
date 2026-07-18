@@ -17,6 +17,41 @@ module KafkaBatch
 
       Result = Struct.new(:ok, :error, :schedule, keyword_init: true)
 
+      # canonical_job_type maps a user-entered handler identifier to the canonical
+      # manifest job_type that enqueue_job / the daemon expect. It accepts either:
+      #   - a job_type already in the manifest (e.g. "hello.ruby", "hello.go") → as-is
+      #   - a Ruby worker CLASS name (e.g. "HelloRubyWorker")                  → its job_type
+      # Returns nil when the value resolves to neither (unknown). This is why a
+      # schedule registered with a worker-class name failed with
+      # "Unknown job_type: HelloRubyWorker": enqueue_job resolves job_types only.
+      def canonical_job_type(value)
+        v = value.to_s.strip
+        return nil if v.empty?
+        return v unless defined?(KafkaBatch::HandlerRegistry)
+
+        reg = KafkaBatch::HandlerRegistry
+        # Already a known manifest job_type? (non-binding existence check)
+        return v if reg.respond_to?(:registered?) && reg.registered?(v)
+
+        # Otherwise try to resolve it as a Ruby worker CLASS name → its job_type.
+        begin
+          handler = reg.resolve!("worker_class" => v)
+          return handler.job_type if handler&.job_type
+        rescue StandardError
+          # not a known worker class either
+        end
+        nil
+      end
+
+      # registry_populated? reports whether we can trust canonical_job_type to
+      # reject unknowns (the manifest/workers are loaded in this process). When
+      # false (e.g. a bare producer that never loaded the manifest) we store the
+      # value as given rather than risk a false-negative rejection.
+      def registry_populated?
+        defined?(KafkaBatch::HandlerManifest) && KafkaBatch::HandlerManifest.respond_to?(:loaded?) &&
+          KafkaBatch::HandlerManifest.loaded?
+      end
+
       # upsert creates or updates a schedule by name, recomputing next_run_at from
       # the cron expression so an edited cron takes effect immediately. Returns a
       # Result; ok=false carries a validation error message for a 400.
@@ -36,6 +71,18 @@ module KafkaBatch
         return err("job_type is required") if job_type.empty?
         unless MISFIRE_POLICIES.include?(misfire_policy)
           return err("misfire_policy must be one of #{MISFIRE_POLICIES.join(', ')}")
+        end
+
+        # Normalize a worker-class name (HelloRubyWorker) to its manifest job_type
+        # (hello.ruby) and reject a truly-unknown identifier early, so the schedule
+        # can actually be enqueued by run-now AND fired by the daemon (both resolve
+        # job_types, not class names) instead of failing later with
+        # "Unknown job_type: ...".
+        if (canonical = canonical_job_type(job_type))
+          job_type = canonical
+        elsif registry_populated?
+          return err("unknown job_type or worker class #{job_type.inspect} " \
+                     "(not found in the handler manifest)")
         end
 
         args = coerce_args(args)
