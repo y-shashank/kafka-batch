@@ -674,7 +674,7 @@ export function AlertsPage() {
           </Stack>
         </SectionCard>
 
-        <Stack direction="row" spacing={1} sx={{ position: 'sticky', bottom: 8, py: 1 }}>
+        <Stack direction="row" spacing={1} sx={{ pt: 1, pb: 2 }}>
           <Button variant="contained" onClick={() => void save()} disabled={saving || !redisAvailable}>
             {saving ? 'Saving…' : 'Save settings'}
           </Button>
