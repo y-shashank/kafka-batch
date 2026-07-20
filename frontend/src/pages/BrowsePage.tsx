@@ -172,7 +172,7 @@ export function BrowsePage() {
     <Box>
       <PageHeader
         title="Browse jobs"
-        subtitle="Unprocessed jobs only: messages at or after the consumer group's committed offset (nothing already consumed). Reads from the broker, 50 per page."
+        subtitle="Unprocessed jobs only (same consumer-group lag as Kafka lag). Messages at or after the committed offset, 50 per page from the broker."
       />
 
       {error ? (
@@ -186,14 +186,25 @@ export function BrowsePage() {
       ) : (
         <>
           <SectionCard title="Topic">
-            <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems={{ md: 'flex-start' }}>
-              <FormControl fullWidth size="small" sx={{ maxWidth: 560 }}>
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              spacing={1.5}
+              alignItems={{ xs: 'stretch', sm: 'center' }}
+              flexWrap="wrap"
+              useFlexGap
+            >
+              <FormControl size="small" sx={{ flex: '1 1 280px', minWidth: 200, maxWidth: 560 }}>
                 <InputLabel id="browse-topic-label">Topic</InputLabel>
                 <Select
                   labelId="browse-topic-label"
                   label="Topic"
                   value={selectedKey}
                   onChange={(e) => onSelectTopic(e.target.value)}
+                  renderValue={(key) => {
+                    const t = (topics || []).find((row) => topicKey(row) === key)
+                    if (!t) return key
+                    return `${t.topic} (${t.group} · lag ${t.lag})`
+                  }}
                 >
                   {(topics || []).map((t) => (
                     <MenuItem key={topicKey(t)} value={topicKey(t)}>
@@ -205,37 +216,48 @@ export function BrowsePage() {
                   ))}
                 </Select>
               </FormControl>
-              <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                <FormControl size="small" sx={{ minWidth: 140 }}>
-                  <InputLabel id="browse-part-label">Partition</InputLabel>
-                  <Select
-                    labelId="browse-part-label"
-                    label="Partition"
-                    value={partition}
-                    onChange={(e) => setPartition(e.target.value)}
-                  >
-                    <MenuItem value="">All</MenuItem>
-                    {partitionOptions.map((p) => (
-                      <MenuItem key={p.partition} value={String(p.partition)}>
-                        {p.partition}
-                        {p.lag != null ? ` (lag ${p.lag})` : ''}
-                      </MenuItem>
-                    ))}
-                  </Select>
-                </FormControl>
-                <TextField
+              <FormControl size="small" sx={{ width: { xs: '100%', sm: 140 } }}>
+                <InputLabel id="browse-part-label">Partition</InputLabel>
+                <Select
+                  labelId="browse-part-label"
+                  label="Partition"
+                  value={partition}
+                  onChange={(e) => setPartition(e.target.value)}
+                >
+                  <MenuItem value="">All</MenuItem>
+                  {partitionOptions.map((p) => (
+                    <MenuItem key={p.partition} value={String(p.partition)}>
+                      {p.partition}
+                      {p.lag != null ? ` (lag ${p.lag})` : ''}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <TextField
+                size="small"
+                label="Start offset"
+                placeholder="default: committed"
+                value={startOffset}
+                onChange={(e) => setStartOffset(e.target.value.replace(/[^\d]/g, ''))}
+                sx={{ width: { xs: '100%', sm: 168 } }}
+              />
+              <Stack direction="row" spacing={1} sx={{ flexShrink: 0 }}>
+                <Button
                   size="small"
-                  label="Start offset"
-                  placeholder="committed"
-                  value={startOffset}
-                  onChange={(e) => setStartOffset(e.target.value.replace(/[^\d]/g, ''))}
-                  sx={{ width: 160 }}
-                  helperText="Optional (default: committed)"
-                />
-                <Button variant="contained" onClick={applyFilters} disabled={!selected || loadingMessages}>
+                  variant="contained"
+                  onClick={applyFilters}
+                  disabled={!selected || loadingMessages}
+                  sx={{ height: 40, px: 2 }}
+                >
                   Apply
                 </Button>
-                <Button variant="outlined" onClick={resetFilters} disabled={loadingMessages}>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  onClick={resetFilters}
+                  disabled={loadingMessages}
+                  sx={{ height: 40, px: 2 }}
+                >
                   Reset
                 </Button>
               </Stack>

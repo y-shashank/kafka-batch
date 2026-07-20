@@ -65,11 +65,11 @@ RSpec.describe KafkaBatch::Browse::Reader do
     expect(page[:messages]).to eq([])
   end
 
-  it "does not scan from offset 0 when the group never committed and the log is empty (lag 0)" do
+  it "does not scan never-consumed partitions (lag page shows 0 even if the log has history)" do
     allow(KafkaBatch::Lag).to receive(:read_group).and_return(
       "cg" => { "jobs" => { 0 => { offset: -1, lag: -1 } } }
     )
-    allow(consumer).to receive(:query_watermark_offsets).with("jobs", 0, anything).and_return([0, 0])
+    allow(consumer).to receive(:query_watermark_offsets).with("jobs", 0, anything).and_return([0, 50])
     allow(consumer).to receive(:poll).and_raise("should not poll")
 
     page = reader.fetch_page(topic: "jobs", group: "cg", limit: 50)
@@ -86,6 +86,19 @@ RSpec.describe KafkaBatch::Browse::Reader do
 
     page = reader.fetch_page(topic: "jobs", group: "cg", limit: 50)
     expect(page[:messages]).to eq([])
+  end
+
+  it "lists topic lag from the same admin map as the Kafka lag page" do
+    allow(KafkaBatch::Lag).to receive(:partitions).and_return(
+      [
+        { group: "cg", topic: "jobs", partition: 0, committed: 10, end_offset: 10, lag: 0, never_consumed: false },
+        { group: "cg", topic: "jobs", partition: 1, committed: nil, end_offset: nil, lag: 0, never_consumed: true }
+      ]
+    )
+    topics = reader.list_topics
+    expect(topics.size).to eq(1)
+    expect(topics.first[:lag]).to eq(0)
+    expect(topics.first[:partition_meta].map { |p| p[:lag] }).to eq([0, 0])
   end
 
   it "honors partition + start_offset and paginates with a cursor" do

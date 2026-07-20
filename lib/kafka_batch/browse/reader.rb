@@ -19,23 +19,26 @@ module KafkaBatch
         @consumer = consumer
       end
 
-      # Topics known to the gem's lag map (group + topic + lag + partition meta).
-      # Lag is computed from live watermarks so "never consumed" (admin lag -1→0)
-      # does not look empty while the log still has messages — and vice versa.
+      # Topics from the same lag map as the Kafka lag page (admin committed lag).
       def list_topics
         return [] unless KafkaBatch::Lag.available?
 
         rows = KafkaBatch::Lag.partitions.reject { |r| r[:log_archive] }
         rows.group_by { |r| [r[:group], r[:topic]] }.map do |(group, topic), parts|
-          partition_meta = parts.map do |p|
-            live_partition_meta(topic, p)
-          end.sort_by { |p| p[:partition] }
           {
             group: group,
             topic: topic,
-            partitions: partition_meta.size,
-            lag: partition_meta.sum { |p| p[:lag].to_i },
-            partition_meta: partition_meta
+            partitions: parts.size,
+            lag: parts.sum { |p| p[:lag].to_i },
+            partition_meta: parts.map do |p|
+              {
+                partition: p[:partition],
+                committed: p[:committed],
+                end_offset: p[:end_offset],
+                lag: p[:lag],
+                never_consumed: p[:never_consumed]
+              }
+            end.sort_by { |p| p[:partition] }
           }
         end.sort_by { |t| [-t[:lag], t[:group], t[:topic]] }
       end
@@ -76,10 +79,10 @@ module KafkaBatch
           meta = commits[p] || {}
           advancing = advance.key?(p.to_s) || advance.key?(p)
 
-          # Default = unprocessed only. Pending count comes from live watermarks
-          # so lag-0 / caught-up partitions never scan from offset 0.
+          # Default = unprocessed only, using the same admin lag as the Kafka lag
+          # page (never-consumed / lag 0 ⇒ no rows, even if the log retains history).
           unless explicit_start || advancing
-            next if pending_count(meta, low, high) <= 0
+            next if admin_lag(meta) <= 0
           end
 
           start = start_offset_for(p, advance, explicit_start, meta, low, high)
@@ -120,47 +123,14 @@ module KafkaBatch
 
       private
 
-      # Live lag for browse UI (admin reports -1/0 for never-consumed).
-      def live_partition_meta(topic, row)
-        part = row[:partition].to_i
-        low, high = consumer.query_watermark_offsets(topic, part, POLL_TIMEOUT_MS)
-        if row[:never_consumed] || row[:committed].nil?
-          {
-            partition: part,
-            committed: nil,
-            end_offset: high,
-            lag: [high - low, 0].max,
-            never_consumed: true
-          }
-        else
-          committed = row[:committed].to_i
-          {
-            partition: part,
-            committed: committed,
-            end_offset: high,
-            lag: [high - committed, 0].max,
-            never_consumed: false
-          }
-        end
-      rescue StandardError
-        {
-          partition: row[:partition].to_i,
-          committed: row[:committed],
-          end_offset: row[:end_offset],
-          lag: row[:lag].to_i,
-          never_consumed: !!row[:never_consumed]
-        }
-      end
+      # Same lag semantics as KafkaBatch::Lag / the Kafka lag page.
+      def admin_lag(meta)
+        return 0 if meta.nil? || meta.empty?
+        return 0 if meta[:never_consumed]
+        return 0 unless meta[:offset] && meta[:offset] >= 0
 
-      # Unprocessed message count from watermarks + commit metadata.
-      def pending_count(meta, low, high)
-        if meta[:offset] && meta[:offset] >= 0
-          [high - meta[:offset], 0].max
-        elsif meta[:never_consumed]
-          [high - low, 0].max
-        else
-          0
-        end
+        lag = meta[:lag].to_i
+        lag.negative? ? 0 : lag
       end
 
       # @return [Integer, nil] nil means skip partition (nothing pending / unknown)
@@ -176,17 +146,14 @@ module KafkaBatch
         if committed && committed >= 0
           # Kafka committed = next offset to fetch → pending is offset >= committed.
           [[committed, low].max, high].min
-        elsif meta[:never_consumed]
-          # Only reached when pending_count > 0 (high > low).
-          low
         else
+          # never-consumed / unknown: lag page shows 0 — do not dump log history.
           nil
         end
       end
 
-      def pending_floor(meta, explicit_start, low)
+      def pending_floor(meta, explicit_start, _low)
         return explicit_start if explicit_start
-        return low if meta[:never_consumed]
         return meta[:offset] if meta[:offset] && meta[:offset] >= 0
 
         nil
@@ -195,11 +162,10 @@ module KafkaBatch
       # True when any partition still has broker messages after the last-read cursor.
       def more_remaining?(topic, parts, advance, explicit_start, commits, highs)
         parts.any? do |p|
-          low = 0
           high = highs[p]
           unless high
             begin
-              low, high = consumer.query_watermark_offsets(topic, p, POLL_TIMEOUT_MS)
+              _low, high = consumer.query_watermark_offsets(topic, p, POLL_TIMEOUT_MS)
             rescue StandardError
               next false
             end
@@ -213,10 +179,8 @@ module KafkaBatch
               last.to_i + 1
             elsif explicit_start
               explicit_start.to_i
-            elsif meta[:offset] && meta[:offset] >= 0
+            elsif meta[:offset] && meta[:offset] >= 0 && admin_lag(meta) > 0
               meta[:offset].to_i
-            elsif meta[:never_consumed]
-              low
             else
               next false
             end
