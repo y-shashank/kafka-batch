@@ -214,32 +214,22 @@ module KafkaBatch
     def fairness_ready_lag_partitions(type)
       cfg = KafkaBatch.config
       rows = []
-      if cfg.runtime_split_fair_ready?(type)
-        ruby_topic = cfg.fairness_ready_topic(type, :ruby)
-        lag_partitions(KafkaBatch.jobs_fair_consumer_group(type), ruby_topic).each do |p|
-          rows << p.merge(topic: ruby_topic, runtime: :ruby)
-        end
-        go_topic = cfg.fairness_ready_topic(type, :go)
-        go_group = KafkaBatch.go_worker_fair_ready_consumer_group(type)
-        lag_partitions(go_group, go_topic).each do |p|
-          rows << p.merge(topic: go_topic, runtime: :go)
-        end
-      else
-        ready_topic = cfg.fairness_ready_topic(type)
-        lag_partitions(KafkaBatch.jobs_fair_consumer_group(type), ready_topic).each do |p|
-          rows << p.merge(topic: ready_topic)
-        end
+      # Ready topics are always runtime-split (.go / .ruby).
+      ruby_topic = cfg.fairness_ready_topic(type, :ruby)
+      lag_partitions(KafkaBatch.jobs_fair_consumer_group(type), ruby_topic).each do |p|
+        rows << p.merge(topic: ruby_topic, runtime: :ruby)
+      end
+      go_topic = cfg.fairness_ready_topic(type, :go)
+      go_group = KafkaBatch.go_worker_fair_ready_consumer_group(type)
+      lag_partitions(go_group, go_topic).each do |p|
+        rows << p.merge(topic: go_topic, runtime: :go)
       end
       rows.sort_by { |p| -p[:lag] }
     end
 
     def fairness_ready_topics_description_text(type)
       cfg = KafkaBatch.config
-      if cfg.runtime_split_fair_ready?(type)
-        "#{cfg.fairness_ready_topic(type, :go)} (Go) and #{cfg.fairness_ready_topic(type, :ruby)} (Ruby)"
-      else
-        cfg.fairness_ready_topic(type).to_s
-      end
+      "#{cfg.fairness_ready_topic(type, :go)} (Go) and #{cfg.fairness_ready_topic(type, :ruby)} (Ruby)"
     end
 
     def schedule_log_group?(group)

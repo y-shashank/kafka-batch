@@ -2,9 +2,9 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
   let(:scheduler) { instance_double(KafkaBatch::Fairness::Scheduler) }
 
   before do
-    KafkaBatch.config.fair_time_ready_topic = "test.ready"
-    KafkaBatch.config.fair_time_ready_go_topic = ""
-    KafkaBatch.config.fair_time_ready_ruby_topic = ""
+    # Ready topics are always runtime-split; unregistered payloads default to .ruby.
+    KafkaBatch.config.fair_time_ready_go_topic = "test.ready.go"
+    KafkaBatch.config.fair_time_ready_ruby_topic = "test.ready.ruby"
     allow(KafkaBatch).to receive(:scheduler).and_return(scheduler)
     allow(scheduler).to receive(:confirm_forward)
     allow(scheduler).to receive(:reclaim_expired_leases!).and_return(0)
@@ -16,9 +16,7 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
   describe "#forward_once" do
     subject(:forwarder) { described_class.new }
 
-    it "routes go handlers to the .go ready topic when runtime split is enabled" do
-      KafkaBatch.config.fair_time_ready_go_topic = "test.ready.go"
-      KafkaBatch.config.fair_time_ready_ruby_topic = "test.ready.ruby"
+    it "routes go handlers to the .go ready topic" do
       raw = Oj.dump({ "job_id" => "j-go", "job_type" => "segment.export", "tenant_id" => "acme", "payload" => {} }, mode: :compat)
       definition = KafkaBatch::HandlerDefinition.new(job_type: "segment.export", runtime: :go, topic: "segment.exports")
       KafkaBatch::HandlerRegistry.register_definition(definition)
@@ -35,7 +33,7 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
 
       expect(forwarder.forward_once).to be(true)
 
-      produced = FakeProducer.for_topic("test.ready")
+      produced = FakeProducer.for_topic("test.ready.ruby")
       expect(produced.size).to eq(1)
       decoded = Oj.load(produced.first.payload)
       expect(decoded["_fair_slot"]).to be(true)
@@ -49,7 +47,7 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
 
       forwarder.forward_once
 
-      decoded = Oj.load(FakeProducer.for_topic("test.ready").first.payload)
+      decoded = Oj.load(FakeProducer.for_topic("test.ready.ruby").first.payload)
       expect(decoded["tenant_id"]).to eq("globex")
     end
 
@@ -57,7 +55,7 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
       allow(scheduler).to receive(:checkout).and_return(nil)
 
       expect(forwarder.forward_once).to be(false)
-      expect(FakeProducer.for_topic("test.ready")).to be_empty
+      expect(FakeProducer.for_topic("test.ready.ruby")).to be_empty
     end
 
     it "releases the lease and re-enqueues when produce to the ready topic fails" do
@@ -70,7 +68,7 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
       )
 
       expect(forwarder.forward_once).to be(false)
-      expect(FakeProducer.for_topic("test.ready")).to be_empty
+      expect(FakeProducer.for_topic("test.ready.ruby")).to be_empty
       expect(scheduler).to have_received(:abort_forward).with("slot-1", "acme")
     end
 

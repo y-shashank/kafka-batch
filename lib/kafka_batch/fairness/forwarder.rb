@@ -156,12 +156,9 @@ module KafkaBatch
 
       def ready_topic_for(data)
         cfg = KafkaBatch.config
-        if cfg.runtime_split_fair_ready?(@type)
-          runtime = KafkaBatch::HandlerRegistry.runtime_for_payload(data)
-          cfg.fairness_ready_topic(@type, runtime)
-        else
-          cfg.fairness_ready_topic(@type)
-        end
+        # Ready topics are always runtime-split (.go / .ruby) — route by handler runtime.
+        runtime = KafkaBatch::HandlerRegistry.runtime_for_payload(data)
+        cfg.fairness_ready_topic(@type, runtime)
       end
 
       # Run a full lease-reclaim sweep at most once per RECLAIM_INTERVAL, so leases

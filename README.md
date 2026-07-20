@@ -150,7 +150,7 @@ Two env vars tune what gets created (both also apply to the `:topics` dry-run):
 
 | Env var | Default | Effect |
 |---------|---------|--------|
-| `REPLICATION_FACTOR` | `config.topics_replication_factor` (**3**) | Replication factor for **every** topic. Set to `1` on a single-broker cluster (local/dev/CI) — the default `3` fails there with `NOT_ENOUGH_REPLICAS`. |
+| `REPLICATION_FACTOR` | `config.topics_replication_factor` (**1**) | Replication factor for **every** topic. Raise to `3` for a production multi-broker cluster; the default `1` suits single-broker (local/dev/CI). |
 | `PARTITIONS` | per-category [defaults](#scaling--partitions) | Forces **every** topic to exactly N partitions, overriding the per-category sizing. Omit to keep the tuned per-category defaults. |
 
 ```bash
@@ -350,7 +350,7 @@ handlers:
 
 - The YAML key (`segment.export`, `orders.process`, …) is the wire **`job_type`** — it must match `job_type` on the Ruby Worker and `kbatch.Register("…")` in kafka-batch-go.
 - Each Kafka **execution** topic belongs to **one** runtime only.
-- Fair handlers on both runtimes share the **ingest** topic per lane; the control-tier forwarder splits to `fair_*_ready.ruby` vs `fair_*_ready.go` (enabled by default).
+- Fair handlers on both runtimes share the **ingest** topic per lane; the control-tier forwarder always splits to `fair_*_ready.ruby` vs `fair_*_ready.go` by handler runtime (there is no combined `fair_*_ready` topic).
 
 ### 2. Configure every process that enqueues
 
@@ -1303,11 +1303,10 @@ Default partition targets (`KafkaBatch::Topics::DEFAULT_PARTITIONS`):
 
 | Category | Partitions | Examples |
 |---|---|---|
-| Execution | 768 | jobs, priority, fair ready |
-| Events | 48 | completion events |
-| Fair ingest | 300 | per lane |
-| Scheduled | 48 | delayed payloads |
-| Retry | 12 | per tier |
+| Fair ingest + fair ready | 64 | per lane; ready is `.go` / `.ruby` |
+| Everything else | 16 | jobs, priority, events, scheduled, retry, callbacks, DLT |
+
+Replication factor defaults to **1**. Scale execution and fair topics up for production load before first deploy (Kafka cannot shrink partitions).
 
 Autoscale execution Deployments on **consumer lag** (KEDA / HPA). Partitions are fixed — pods are elastic.
 

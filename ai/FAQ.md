@@ -261,6 +261,9 @@ Need `fairness_global_concurrency > 0` or `fairness_max_inflight_per_tenant > 0`
 ### Hybrid fair Ruby+Go without split ready topics?
 Boot `ConfigurationError` — need `.ruby` and `.go` ready topics.
 
+### Is there a combined (non-suffixed) fair ready topic?
+No. Fair ready topics are **always** runtime-split: `fair_time_ready.go` / `fair_time_ready.ruby` (and throughput). The legacy combined `fair_*_ready` topic was removed and is no longer supported, routed, or created. The Forwarder always routes to the `.go` or `.ruby` topic by handler runtime (unknown → `.ruby`); the Go worker consumes `.go`, Ruby Karafka consumes `.ruby`. Ingest stays a single topic per lane (`fair_*_ingest`), shared by both runtimes.
+
 ---
 
 ## H. Delayed jobs / schedule
@@ -473,10 +476,10 @@ Native go-sql-driver **or** `mysql2://` / `mysql://` URLs (converted at connect)
 Roughly peak_pods × (concurrency or members) × SuperFetch concurrency on each scaled execution topic. Fair ingest often hundreds for exclusive tenants.
 
 ### Default partition targets?
-**create_topics defaults only:** execution/ready 768, events 48, fair ingest 300, scheduled 48, retry 12/tier, callbacks 6, DLT 3. Live clusters often differ (Kafka cannot shrink).
+**create_topics defaults only:** every topic defaults to **16** partitions except the fairness **ingest** and **ready** lanes, which default to **64**. Replication factor defaults to **1**. Live clusters often differ (Kafka cannot shrink). Scale execution topics up before heavy load.
 
 ### How many partitions does my live topic have?
-Use the AI live config snapshot `topic_inventory` → `live_broker_partitions` for that topic name (e.g. `kafka_batch.fair_time_ready.ruby`). Do **not** answer with 768 from DEFAULT_PARTITIONS docs unless broker metadata is unavailable — then say so. Refresh: boot NX sync every 24h, or `FORCE=1 rake kafka_batch:sync_ai_knowledge`.
+Use the AI live config snapshot `topic_inventory` → `live_broker_partitions` for that topic name (e.g. `kafka_batch.fair_time_ready.ruby`). Do **not** answer with the DEFAULT_PARTITIONS number unless broker metadata is unavailable — then say so. Refresh: boot NX sync every 24h, or `FORCE=1 rake kafka_batch:sync_ai_knowledge`.
 
 ### Can I shrink partitions later?
 No — Kafka cannot shrink. Oversizing is safer than undersizing.
@@ -896,8 +899,8 @@ Requires `performance_metrics_enabled`; otherwise explains disabled.
 ### Dashboard `topic_pending`?
 `GET /api/dashboard` → sum of `Lag.pending_total` (consumer lag, excludes scheduled log-archive). Separate from `pending_jobs` (batch ledger).
 
-### AI chat partition answers wrong (always 768)?
-Docs cite create defaults. Live snapshot must include `topic_inventory` with `live_broker_partitions`. Force sync after deploy; assistant must prefer live broker counts over DEFAULT_PARTITIONS.
+### AI chat partition answers wrong (cites create defaults)?
+Docs cite create defaults (16, or 64 for fair ingest/ready). Live snapshot must include `topic_inventory` with `live_broker_partitions`. Force sync after deploy; assistant must prefer live broker counts over DEFAULT_PARTITIONS.
 
 ### Does RAG know my handlers.yml and priority queues?
 Yes — on the same 24h NX-locked config sync, `routing` embeds parsed `kafka_batch_handlers.yml` (job_type → runtime/topic/fairness) and priority YAML groups (ordered topics + consumer group). Ask “what topic does X use?” / “what’s the jobs-fast priority order?” from LIVE ROUTING, not docs examples.

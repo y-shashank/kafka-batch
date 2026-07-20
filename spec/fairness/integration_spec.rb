@@ -19,14 +19,13 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
     KafkaBatch.config.store     = :redis
     KafkaBatchSpec::RedisHelper.flush!
 
+    # Ready topics are always runtime-split; these unregistered jobs route to .ruby.
     KafkaBatch.config.fair_time_ingest_topic           = "test.time.ingest"
-    KafkaBatch.config.fair_time_ready_topic            = "test.time.ready"
-    KafkaBatch.config.fair_time_ready_go_topic         = ""
-    KafkaBatch.config.fair_time_ready_ruby_topic       = ""
+    KafkaBatch.config.fair_time_ready_go_topic         = "test.time.ready.go"
+    KafkaBatch.config.fair_time_ready_ruby_topic       = "test.time.ready"
     KafkaBatch.config.fair_throughput_ingest_topic     = "test.tp.ingest"
-    KafkaBatch.config.fair_throughput_ready_topic      = "test.tp.ready"
-    KafkaBatch.config.fair_throughput_ready_go_topic   = ""
-    KafkaBatch.config.fair_throughput_ready_ruby_topic = ""
+    KafkaBatch.config.fair_throughput_ready_go_topic   = "test.tp.ready.go"
+    KafkaBatch.config.fair_throughput_ready_ruby_topic = "test.tp.ready"
     KafkaBatch.config.fairness_global_concurrency      = 4
     KafkaBatch.config.fairness_max_inflight_per_tenant = 0    # rely on the dynamic fair share
     KafkaBatch.config.fairness_ready_window            = 100
@@ -86,12 +85,12 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
   # Run a single ready-topic message through the JobConsumer (perform + complete).
   def run_ready(produced)
     jc = build_consumer(KafkaBatch::Consumers::JobConsumer)
-    fm = FakeMessage.new(topic: KafkaBatch.config.fairness_ready_topic(fair_type), payload: produced.payload, offset: 0)
+    fm = FakeMessage.new(topic: KafkaBatch.config.fairness_ready_topic(fair_type, :ruby), payload: produced.payload, offset: 0)
     jc.send(:process_message, fm)
   end
 
   def ready_messages
-    FakeProducer.for_topic(KafkaBatch.config.fairness_ready_topic(fair_type))
+    FakeProducer.for_topic(KafkaBatch.config.fairness_ready_topic(fair_type, :ruby))
   end
 
   def tenant_of(produced)
@@ -164,7 +163,7 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
     job = scheduler.checkout
     expect(job[:payload]).to include("j-stale")
     expect(scheduler.stats[:forwarding_depth]).to eq(1)
-    expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ready_topic(:time))).to be_empty
+    expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ready_topic(:time, :ruby))).to be_empty
 
     redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
     redis.zadd(scheduler.leases, 0, job[:slot_id])
@@ -175,7 +174,7 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
     })
 
     expect(scheduler.stats[:forwarding_depth]).to eq(0)
-    expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ready_topic(:time)).size).to eq(1)
+    expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ready_topic(:time, :ruby)).size).to eq(1)
     expect(scheduler.stats[:inflight_total]).to eq(1)
 
     run_ready(ready_messages.last)

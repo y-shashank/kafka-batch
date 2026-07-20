@@ -100,12 +100,8 @@ module KafkaBatch
       lane = lane.to_sym
       return nil unless fair_handlers_for_runtime?(:ruby, lane)
 
-      cfg = config
-      if cfg.runtime_split_fair_ready?(lane)
-        cfg.fairness_ready_topic(lane, :ruby)
-      else
-        cfg.fairness_ready_topic(lane)
-      end
+      # Ruby always consumes the runtime-split .ruby ready topic.
+      config.fairness_ready_topic(lane, :ruby)
     end
 
     def manifest_fair_handlers_for_runtime?(runtime, lane)

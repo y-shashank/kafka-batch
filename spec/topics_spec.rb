@@ -45,10 +45,11 @@ RSpec.describe KafkaBatch::Topics do
 
       expect(names).to include(
         KafkaBatch.config.fairness_ingest_topic(:time),
-        KafkaBatch.config.fairness_ready_topic(:time),
         KafkaBatch.config.fairness_ready_topic(:time, :go),
         KafkaBatch.config.fairness_ready_topic(:time, :ruby)
       )
+      # Ready topics are always runtime-split — no combined fair_time_ready.
+      expect(names).not_to include("kafka_batch.fair_time_ready")
       # Only the time lane is used, so throughput-lane topics are NOT provisioned.
       expect(names).not_to include(KafkaBatch.config.fairness_ingest_topic(:throughput))
       expect(names).to include(SuccessfulWorker.kafka_topic)  # plain worker still wired
@@ -61,7 +62,6 @@ RSpec.describe KafkaBatch::Topics do
 
       expect(names).to include(
         KafkaBatch.config.fairness_ingest_topic(:throughput),
-        KafkaBatch.config.fairness_ready_topic(:throughput),
         KafkaBatch.config.fairness_ready_topic(:throughput, :go),
         KafkaBatch.config.fairness_ready_topic(:throughput, :ruby)
       )
@@ -74,7 +74,8 @@ RSpec.describe KafkaBatch::Topics do
 
       KafkaBatch::Configuration::FAIRNESS_TYPES.each do |ft|
         expect(names).not_to include(KafkaBatch.config.fairness_ingest_topic(ft))
-        expect(names).not_to include(KafkaBatch.config.fairness_ready_topic(ft))
+        expect(names).not_to include(KafkaBatch.config.fairness_ready_topic(ft, :go))
+        expect(names).not_to include(KafkaBatch.config.fairness_ready_topic(ft, :ruby))
       end
     end
 
@@ -125,7 +126,7 @@ RSpec.describe KafkaBatch::Topics do
         "cluster_info",
         topics: [
           { topic_name: jobs, partition_count: 10 },
-          { topic_name: KafkaBatch.config.events_topic, partitions: Array.new(48) },
+          { topic_name: KafkaBatch.config.events_topic, partitions: Array.new(16) },
           { topic_name: KafkaBatch.config.fair_time_ready_ruby_topic, partition_count: 12 }
         ]
       )
@@ -141,14 +142,14 @@ RSpec.describe KafkaBatch::Topics do
       expect(job_row["status"]).to eq("differs_from_default")
 
       events = inv["topics"].find { |t| t["name"] == KafkaBatch.config.events_topic }
-      expect(events["broker_partitions"]).to eq(48)
+      expect(events["broker_partitions"]).to eq(16)
       expect(events["status"]).to eq("matches_default")
 
       # Fair ready topics are inventoried even with no fair workers loaded.
       ready = inv["topics"].find { |t| t["name"] == KafkaBatch.config.fair_time_ready_ruby_topic }
       expect(ready).not_to be_nil
       expect(ready["broker_partitions"]).to eq(12)
-      expect(ready["configured_partitions"]).to eq(768)
+      expect(ready["configured_partitions"]).to eq(64)
       expect(ready["status"]).to eq("differs_from_default")
     end
 

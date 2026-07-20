@@ -595,14 +595,16 @@ ConsumptionGate prepended on consumers for pause/resume.
 ### Flow
 
 ```
-push → fair_*_ingest (tenant partition)
+push → fair_*_ingest (tenant partition; one ingest topic per lane, both runtimes)
      → Dispatcher ({CG}-dispatch-{lane})
      → ENQUEUE_LUA (bounded ready list)
      → Forwarder checkout (lease ZSETs)
-     → produce ready with _fair_slot / _fair_type / _fair_slot_id
+     → produce ready (.go / .ruby by handler runtime) with _fair_slot / _fair_type / _fair_slot_id
      → confirm forwarding HASH
-     → JobConsumer / kbatch worker
+     → JobConsumer (.ruby) / kbatch worker (.go)
 ```
+
+Ready topics are **always runtime-split** (`fair_*_ready.go` / `fair_*_ready.ruby`). There is **no combined/non-suffixed `fair_*_ready` topic** — the Forwarder routes every job to the `.go` or `.ruby` ready topic by its handler runtime (unknown → `.ruby`). Ingest stays a single topic per lane (the Dispatcher is runtime-agnostic).
 
 ### Redis per lane (`kafka_batch:fair_{time|throughput}:*`)
 
@@ -1096,15 +1098,16 @@ Kafka cannot shrink partitions; ops often create smaller topics for local/dev (e
 
 | Category | Create default |
 |----------|----------------|
-| jobs / priority / ready | 768 |
-| events | 48 |
-| callbacks | 6 |
-| retry per tier | 12 |
-| scheduled | 48 |
-| dead_letter | 3 |
-| fair ingest per lane | 300 |
+| jobs / priority | 16 |
+| events | 16 |
+| callbacks | 16 |
+| retry per tier | 16 |
+| scheduled | 16 |
+| dead_letter | 16 |
+| fair ingest per lane | 64 |
+| fair ready per lane (`.go` / `.ruby`) | 64 |
 
-Env: `REPLICATION_FACTOR` (default 3), `PARTITIONS` uniform override.
+Every category defaults to **16** partitions except the fairness **ingest** and **ready** lanes, which default to **64**. Env: `REPLICATION_FACTOR` (default **1**), `PARTITIONS` uniform override. Fair ready topics are always runtime-split (`.go` / `.ruby`) — there is no combined `fair_*_ready` topic to create.
 
 Scheduled retention ≥ `max_schedule_horizon` (+1 day buffer). DLT retention 30 days at creation. Existing topics skipped, never altered.
 

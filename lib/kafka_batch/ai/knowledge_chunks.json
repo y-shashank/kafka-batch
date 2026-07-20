@@ -1,10 +1,10 @@
 {
   "format": 1,
-  "built_at": "2026-07-20T13:36:00Z",
+  "built_at": "2026-07-20T14:16:49Z",
   "max_chars": 2800,
-  "readme_sha256": "54ad5784fc229cd6f85da54104af3de18ad276feb4397dcf709d673b8011ab43",
-  "faq_sha256": "609fdfe10dca80e8f268274085b53b6439029164141bd16e8b861052db21b5ea",
-  "chunk_count": 432,
+  "readme_sha256": "a739a72c50568d1f39a9bbdf5a81592c85c98919ac52437ad52e78544c03b21a",
+  "faq_sha256": "5ea9e16c293981279dbbda1c177b1ef5aa5a6aaeda79313987fdbad3c392eb5d",
+  "chunk_count": 433,
   "chunks": [
     {
       "id": "readme-introduction-939750e33df47b89",
@@ -667,8 +667,8 @@
         "Flow"
       ],
       "section": "13. Fairness — Dispatcher, Scheduler, Forwarder, TenantPartitions",
-      "text": "13. Fairness — Dispatcher, Scheduler, Forwarder, TenantPartitions › Flow\n\n```\npush → fair_*_ingest (tenant partition)\n     → Dispatcher ({CG}-dispatch-{lane})\n     → ENQUEUE_LUA (bounded ready list)\n     → Forwarder checkout (lease ZSETs)\n     → produce ready with _fair_slot / _fair_type / _fair_slot_id\n     → confirm forwarding HASH\n     → JobConsumer / kbatch worker\n```",
-      "char_count": 374
+      "text": "13. Fairness — Dispatcher, Scheduler, Forwarder, TenantPartitions › Flow\n\n```\npush → fair_*_ingest (tenant partition; one ingest topic per lane, both runtimes)\n     → Dispatcher ({CG}-dispatch-{lane})\n     → ENQUEUE_LUA (bounded ready list)\n     → Forwarder checkout (lease ZSETs)\n     → produce ready (.go / .ruby by handler runtime) with _fair_slot / _fair_type / _fair_slot_id\n     → confirm forwarding HASH\n     → JobConsumer (.ruby) / kbatch worker (.go)\n```\n\nReady topics are **always runtime-split** (`fair_*_ready.go` / `fair_*_ready.ruby`). There is **no combined/non-suffixed `fair_*_ready` topic** — the Forwarder routes every job to the `.go` or `.ruby` ready topic by its handler runtime (unknown → `.ruby`). Ingest stays a single topic per lane (the Dispatcher is runtime-agnostic).",
+      "char_count": 796
     },
     {
       "id": "readme-13-fairness-dispatcher-scheduler-forwarder-tenan-574e8cba95c12674",
@@ -1174,8 +1174,8 @@
         "DEFAULT_PARTITIONS (Ruby)"
       ],
       "section": "26. Topics, partitions, create_all",
-      "text": "26. Topics, partitions, create_all › DEFAULT_PARTITIONS (Ruby)\n\nThese are **create_topics defaults only** — not necessarily what exists on a live cluster.\nKafka cannot shrink partitions; ops often create smaller topics for local/dev (e.g. 10).\n\n| Category | Create default |\n|----------|----------------|\n| jobs / priority / ready | 768 |\n| events | 48 |\n| callbacks | 6 |\n| retry per tier | 12 |\n| scheduled | 48 |\n| dead_letter | 3 |\n| fair ingest per lane | 300 |\n\nEnv: `REPLICATION_FACTOR` (default 3), `PARTITIONS` uniform override.\n\nScheduled retention ≥ `max_schedule_horizon` (+1 day buffer). DLT retention 30 days at creation. Existing topics skipped, never altered.\n\n**Manifest plain Go topics** are not always auto-discovered by Ruby `create_topics` — create them explicitly or via Go topics CLI.",
-      "char_count": 807
+      "text": "26. Topics, partitions, create_all › DEFAULT_PARTITIONS (Ruby)\n\nThese are **create_topics defaults only** — not necessarily what exists on a live cluster.\nKafka cannot shrink partitions; ops often create smaller topics for local/dev (e.g. 10).\n\n| Category | Create default |\n|----------|----------------|\n| jobs / priority | 16 |\n| events | 16 |\n| callbacks | 16 |\n| retry per tier | 16 |\n| scheduled | 16 |\n| dead_letter | 16 |\n| fair ingest per lane | 64 |\n| fair ready per lane (`.go` / `.ruby`) | 64 |\n\nEvery category defaults to **16** partitions except the fairness **ingest** and **ready** lanes, which default to **64**. Env: `REPLICATION_FACTOR` (default **1**), `PARTITIONS` uniform override. Fair ready topics are always runtime-split (`.go` / `.ruby`) — there is no combined `fair_*_ready` topic to create.\n\nScheduled retention ≥ `max_schedule_horizon` (+1 day buffer). DLT retention 30 days at creation. Existing topics skipped, never altered.\n\n**Manifest plain Go topics** are not always auto-discovered by Ruby `create_topics` — create them explicitly or via Go topics CLI.",
+      "char_count": 1088
     },
     {
       "id": "readme-26-topics-partitions-create-all-live-broker-inve-54e1bc96369a3b75",
@@ -2740,8 +2740,20 @@
         "Hybrid fair Ruby+Go without split ready topics?"
       ],
       "section": "G. Fairness",
-      "text": "FAQ: Hybrid fair Ruby+Go without split ready topics?\n\nBoot `ConfigurationError` — need `.ruby` and `.go` ready topics.\n\n---",
-      "char_count": 123
+      "text": "FAQ: Hybrid fair Ruby+Go without split ready topics?\n\nBoot `ConfigurationError` — need `.ruby` and `.go` ready topics.",
+      "char_count": 118
+    },
+    {
+      "id": "faq-g-fairness-is-there-a-combined-non-suffixed-fair-01854f6420f79088",
+      "source": "faq",
+      "title": "Is there a combined (non-suffixed) fair ready topic?",
+      "heading_path": [
+        "G. Fairness",
+        "Is there a combined (non-suffixed) fair ready topic?"
+      ],
+      "section": "G. Fairness",
+      "text": "FAQ: Is there a combined (non-suffixed) fair ready topic?\n\nNo. Fair ready topics are **always** runtime-split: `fair_time_ready.go` / `fair_time_ready.ruby` (and throughput). The legacy combined `fair_*_ready` topic was removed and is no longer supported, routed, or created. The Forwarder always routes to the `.go` or `.ruby` topic by handler runtime (unknown → `.ruby`); the Go worker consumes `.go`, Ruby Karafka consumes `.ruby`. Ingest stays a single topic per lane (`fair_*_ingest`), shared by both runtimes.\n\n---",
+      "char_count": 520
     },
     {
       "id": "faq-h-delayed-jobs-schedule-why-aren-t-perform-in-en-4a1f60ded1bd064b",
@@ -3436,8 +3448,8 @@
         "Default partition targets?"
       ],
       "section": "P. Topics and partitions",
-      "text": "FAQ: Default partition targets?\n\n**create_topics defaults only:** execution/ready 768, events 48, fair ingest 300, scheduled 48, retry 12/tier, callbacks 6, DLT 3. Live clusters often differ (Kafka cannot shrink).",
-      "char_count": 213
+      "text": "FAQ: Default partition targets?\n\n**create_topics defaults only:** every topic defaults to **16** partitions except the fairness **ingest** and **ready** lanes, which default to **64**. Replication factor defaults to **1**. Live clusters often differ (Kafka cannot shrink). Scale execution topics up before heavy load.",
+      "char_count": 317
     },
     {
       "id": "faq-p-topics-and-partitions-how-many-partitions-does-7e985b875e98b524",
@@ -3448,8 +3460,8 @@
         "How many partitions does my live topic have?"
       ],
       "section": "P. Topics and partitions",
-      "text": "FAQ: How many partitions does my live topic have?\n\nUse the AI live config snapshot `topic_inventory` → `live_broker_partitions` for that topic name (e.g. `kafka_batch.fair_time_ready.ruby`). Do **not** answer with 768 from DEFAULT_PARTITIONS docs unless broker metadata is unavailable — then say so. Refresh: boot NX sync every 24h, or `FORCE=1 rake kafka_batch:sync_ai_knowledge`.",
-      "char_count": 381
+      "text": "FAQ: How many partitions does my live topic have?\n\nUse the AI live config snapshot `topic_inventory` → `live_broker_partitions` for that topic name (e.g. `kafka_batch.fair_time_ready.ruby`). Do **not** answer with the DEFAULT_PARTITIONS number unless broker metadata is unavailable — then say so. Refresh: boot NX sync every 24h, or `FORCE=1 rake kafka_batch:sync_ai_knowledge`.",
+      "char_count": 378
     },
     {
       "id": "faq-p-topics-and-partitions-can-i-shrink-partitions-c6211fe3caf31f58",
@@ -4676,16 +4688,16 @@
       "char_count": 175
     },
     {
-      "id": "faq-aj-web-api-surface-detailed-ai-chat-partition-an-8c6a1df6213dd6d8",
+      "id": "faq-aj-web-api-surface-detailed-ai-chat-partition-an-18c546a47add19e9",
       "source": "faq",
-      "title": "AI chat partition answers wrong (always 768)?",
+      "title": "AI chat partition answers wrong (cites create defaults)?",
       "heading_path": [
         "AJ. Web API surface (detailed)",
-        "AI chat partition answers wrong (always 768)?"
+        "AI chat partition answers wrong (cites create defaults)?"
       ],
       "section": "AJ. Web API surface (detailed)",
-      "text": "FAQ: AI chat partition answers wrong (always 768)?\n\nDocs cite create defaults. Live snapshot must include `topic_inventory` with `live_broker_partitions`. Force sync after deploy; assistant must prefer live broker counts over DEFAULT_PARTITIONS.",
-      "char_count": 245
+      "text": "FAQ: AI chat partition answers wrong (cites create defaults)?\n\nDocs cite create defaults (16, or 64 for fair ingest/ready). Live snapshot must include `topic_inventory` with `live_broker_partitions`. Force sync after deploy; assistant must prefer live broker counts over DEFAULT_PARTITIONS.",
+      "char_count": 290
     },
     {
       "id": "faq-aj-web-api-surface-detailed-does-rag-know-my-han-c0c4ad577995cbe7",
@@ -5156,5 +5168,5 @@
       "char_count": 58
     }
   ],
-  "corpus_version": "c1c24797275919b00c7eec60f074e199"
+  "corpus_version": "d8df9320b9fe8e9e6f874b52c9ec43e5"
 }

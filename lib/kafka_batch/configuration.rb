@@ -37,12 +37,13 @@ module KafkaBatch
       # Two independent fairness lanes — a worker picks one via `fairness_type`
       # (:time | :throughput). Each lane has its own ingest → ready topics,
       # scheduler, and tenant weights, so both run side by side.
+      # Ready topics are ALWAYS runtime-split (.go / .ruby). There is no combined
+      # (non-suffixed) fair_*_ready topic — every fair job is forwarded to the
+      # .go or .ruby ready topic by its handler runtime.
       fair_time_ingest_topic:       "kafka_batch.fair_time_ingest",       # time-fairness intake
-      fair_time_ready_topic:        "kafka_batch.fair_time_ready",        # legacy single ready (pre-v1.1)
       fair_time_ready_go_topic:     "kafka_batch.fair_time_ready.go",     # time-fairness go execution queue
       fair_time_ready_ruby_topic:   "kafka_batch.fair_time_ready.ruby",   # time-fairness ruby execution queue
       fair_throughput_ingest_topic: "kafka_batch.fair_throughput_ingest", # throughput-fairness intake
-      fair_throughput_ready_topic:  "kafka_batch.fair_throughput_ready",  # legacy single ready (pre-v1.1)
       fair_throughput_ready_go_topic:   "kafka_batch.fair_throughput_ready.go",
       fair_throughput_ready_ruby_topic: "kafka_batch.fair_throughput_ready.ruby"
     }.freeze
@@ -203,7 +204,7 @@ module KafkaBatch
     attr_accessor :max_schedule_horizon      # Integer – seconds; default 7 days
     # Replication factor passed to KafkaBatch::Topics.create_all! when the caller
     # does not override it. Use 1 for single-broker dev; 3+ for production.
-    attr_accessor :topics_replication_factor # Integer – default 3
+    attr_accessor :topics_replication_factor # Integer – default 1
 
     # ── Completion-event emission retries ────────────────────────────────────
     # After a job succeeds, the consumer produces a completion event. If that
@@ -313,23 +314,23 @@ module KafkaBatch
       type.to_sym == :throughput ? fair_throughput_ingest_topic : fair_time_ingest_topic
     end
 
-    def fairness_ready_topic(type, runtime = nil)
+    # Runtime-specific (.go / .ruby) ready topic for a fairness lane. There is no
+    # combined/non-suffixed ready topic; a runtime must always be supplied. An
+    # unrecognized runtime falls back to the .ruby topic (Ruby is the default
+    # execution runtime), never a non-suffixed name.
+    def fairness_ready_topic(type, runtime)
       ft = type.to_sym == :throughput ? :throughput : :time
-      if runtime
-        rt = runtime.to_sym
-        case ft
-        when :throughput
-          rt == :go ? fair_throughput_ready_go_topic : fair_throughput_ready_ruby_topic
-        else
-          rt == :go ? fair_time_ready_go_topic : fair_time_ready_ruby_topic
-        end
+      go = runtime.to_sym == :go
+      case ft
+      when :throughput
+        go ? fair_throughput_ready_go_topic : fair_throughput_ready_ruby_topic
       else
-        ft == :throughput ? fair_throughput_ready_topic : fair_time_ready_topic
+        go ? fair_time_ready_go_topic : fair_time_ready_ruby_topic
       end
     end
 
-    # True when per-runtime ready topics (.go / .ruby) are configured for a lane.
-    # Mirrors Go config.RuntimeSplitFairReady.
+    # True when per-runtime ready topics (.go / .ruby) are both configured for a
+    # lane (the well-configured invariant). Mirrors Go config.RuntimeSplitFairReady.
     def runtime_split_fair_ready?(type = :time)
       ft = type.to_sym == :throughput ? :throughput : :time
       go_topic, ruby_topic =
@@ -642,7 +643,7 @@ module KafkaBatch
       @recurring_heartbeat_every = env_positive_float("KAFKA_BATCH_RECURRING_HEARTBEAT_EVERY", 60.0)
       @recurring_stale_factor    = env_positive_float("KAFKA_BATCH_RECURRING_STALE_FACTOR", 2.0)
       @max_schedule_horizon     = 7 * 24 * 3600  # 7 days (match scheduled_topic retention)
-      @topics_replication_factor = 3
+      @topics_replication_factor = 1
       @event_emit_retries       = 3
       @event_emit_backoff       = 1
       @redis_url                = "redis://localhost:6379/0"

@@ -22,15 +22,15 @@ module KafkaBatch
     # PARTITIONS env in bin/create_kafka_topics.sh before first deploy — Kafka
     # cannot shrink partitions later.
     DEFAULT_PARTITIONS = {
-      jobs:        768,  # plain worker topics: pods × concurrency
-      priority:    768, # fast/slow p0+p1 (override per topic if needed)
-      events:      48,  # completion events; keep control pods small (3–6)
-      callbacks:   6,
-      retry:       12,  # per tier
-      scheduled:   48,  # perform_in/at payload store; poller reads by partition
-      dead_letter: 3,
-      ingest:      300, # fairness ingest (per lane): ≈ max unique tenants on fair lane
-      ready:       768  # fairness ready (per lane): pods × concurrency
+      jobs:        16, # plain worker topics
+      priority:    16, # fast/slow p0+p1 (override per topic if needed)
+      events:      16, # completion events
+      callbacks:   16,
+      retry:       16, # per tier
+      scheduled:   16, # perform_in/at payload store; poller reads by partition
+      dead_letter: 16,
+      ingest:      64, # fairness ingest (per lane): ≈ max unique tenants on fair lane
+      ready:       64  # fairness ready (per lane): pods × concurrency
     }.freeze
 
     # Kafka topic configs applied at creation time. Scheduled retention must
@@ -99,7 +99,7 @@ module KafkaBatch
       lane_types = fair_workers.map { |w| w.respond_to?(:fairness_type) ? w.fairness_type : :time }.uniq
       lane_types.each do |ft|
         add.call(cfg.fairness_ingest_topic(ft), :ingest)
-        add.call(cfg.fairness_ready_topic(ft), :ready)
+        # Ready topics are always runtime-split (.go / .ruby) — no combined topic.
         add.call(cfg.fairness_ready_topic(ft, :go), :ready)
         add.call(cfg.fairness_ready_topic(ft, :ruby), :ready)
       end
@@ -294,7 +294,6 @@ module KafkaBatch
 
       KafkaBatch::Configuration::FAIRNESS_TYPES.each do |ft|
         add.call(cfg.fairness_ingest_topic(ft), :ingest)
-        add.call(cfg.fairness_ready_topic(ft), :ready)
         add.call(cfg.fairness_ready_topic(ft, :go), :ready)
         add.call(cfg.fairness_ready_topic(ft, :ruby), :ready)
       end

@@ -11,10 +11,7 @@ RSpec.describe "Three-tier architecture (Ruby)" do
     KafkaBatch.configure do |c|
       c.daemon_mode = false
       c.priority_config_paths = []
-      c.fair_time_ready_go_topic = ""
-      c.fair_time_ready_ruby_topic = ""
-      c.fair_throughput_ready_go_topic = ""
-      c.fair_throughput_ready_ruby_topic = ""
+      # Ready topics are always runtime-split (.go / .ruby) — use the defaults.
     end
     [SuccessfulWorker, FairWorker].each { |w| KafkaBatch.register_worker(w) }
   end
@@ -100,7 +97,7 @@ RSpec.describe "Three-tier architecture (Ruby)" do
 
     it "registers fair ready topics with JobConsumer (not Dispatcher)" do
       capture = capture_routes
-      ready_topic = KafkaBatch.config.fairness_ready_topic(:time)
+      ready_topic = KafkaBatch.config.fairness_ready_topic(:time, :ruby)
       group = "#{cg}-jobs-fair-time"
 
       expect(capture.groups[group]).to eq([ready_topic])

@@ -100,11 +100,11 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.fairness_default_weight).to eq(1.0)
       expect(config.fairness_weighted_concurrency).to eq(true)
       expect(config.fairness_ingest_topic(:time)).to eq("kafka_batch.fair_time_ingest")
-      expect(config.fairness_ready_topic(:time)).to eq("kafka_batch.fair_time_ready")
       expect(config.fairness_ready_topic(:time, :go)).to eq("kafka_batch.fair_time_ready.go")
       expect(config.fairness_ready_topic(:time, :ruby)).to eq("kafka_batch.fair_time_ready.ruby")
       expect(config.fairness_ingest_topic(:throughput)).to eq("kafka_batch.fair_throughput_ingest")
-      expect(config.fairness_ready_topic(:throughput)).to eq("kafka_batch.fair_throughput_ready")
+      expect(config.fairness_ready_topic(:throughput, :go)).to eq("kafka_batch.fair_throughput_ready.go")
+      expect(config.fairness_ready_topic(:throughput, :ruby)).to eq("kafka_batch.fair_throughput_ready.ruby")
       expect(config.fairness_min_ingest_partitions).to eq(2)
     end
 
@@ -121,7 +121,7 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.retry_topic).to eq("myapp.kafka_batch.jobs.retry")
       expect(config.consumer_group).to eq("myapp.kafka-batch")
       expect(config.fairness_ingest_topic(:time)).to eq("myapp.kafka_batch.fair_time_ingest")
-      expect(config.fairness_ready_topic(:throughput)).to eq("myapp.kafka_batch.fair_throughput_ready")
+      expect(config.fairness_ready_topic(:throughput, :ruby)).to eq("myapp.kafka_batch.fair_throughput_ready.ruby")
       expect(config.resolve_topic("kafka_batch.jobs.p0")).to eq("myapp.kafka_batch.jobs.p0")
     end
 

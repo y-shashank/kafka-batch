@@ -197,7 +197,7 @@ module KafkaBatch
         desc "Create all KafkaBatch Kafka topics (idempotent). " \
              "Env: PARTITIONS=N forces every topic to N partitions " \
              "(default: per-category KafkaBatch::Topics::DEFAULT_PARTITIONS); " \
-             "REPLICATION_FACTOR=N (default config.topics_replication_factor, currently 3)."
+             "REPLICATION_FACTOR=N (default config.topics_replication_factor, currently 1)."
         task create_topics: :environment do
           # Topics is part of the full backend — not loaded when only
           # kafka_batch/ui is required (dashboard-only processes). Require it

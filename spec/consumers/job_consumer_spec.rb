@@ -472,7 +472,7 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
 
     def fair_message(worker:, tenant:, batch_id: nil, attempt: 0, job_id: "j1", slot_id: "lease-1")
       FakeMessage.new(
-        topic:   KafkaBatch.config.fairness_ready_topic(:time),
+        topic:   KafkaBatch.config.fairness_ready_topic(:time, :ruby),
         offset:  1,
         payload: {
           "job_id"       => job_id,
@@ -520,7 +520,7 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
     it "releases the fair slot when an expired ready message is dropped" do
       till = 1.minute.ago.iso8601
       msg = FakeMessage.new(
-        topic:   KafkaBatch.config.fairness_ready_topic(:time),
+        topic:   KafkaBatch.config.fairness_ready_topic(:time, :ruby),
         offset:  2,
         payload: {
           "job_id"       => "j-exp",

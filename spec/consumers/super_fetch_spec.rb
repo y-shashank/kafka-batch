@@ -123,7 +123,7 @@ RSpec.describe "JobConsumer SuperFetch" do
     allow(sched).to receive(:lease_ttl).and_return(1800)
 
     msg = FakeMessage.new(
-      topic: KafkaBatch.config.fairness_ready_topic(:time),
+      topic: KafkaBatch.config.fairness_ready_topic(:time, :ruby),
       payload: {
         "job_id"        => "sf-fair-r1",
         "batch_id"      => "b1",
