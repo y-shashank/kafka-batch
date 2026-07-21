@@ -71,10 +71,6 @@ module KafkaBatch
             unless defined?(KafkaBatch::Liveness) && KafkaBatch::Liveness.available?
               return [false, "Liveness backend must be :redis"]
             end
-          when "recurring"
-            unless KafkaBatch.config.recurring_scheduler_enabled
-              return [false, "Enable recurring_scheduler_enabled"]
-            end
           end
         end
         [true, nil]

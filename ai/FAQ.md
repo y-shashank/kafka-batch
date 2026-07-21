@@ -1038,7 +1038,7 @@ Dead-letter publishes in the last minute ≥ `dlt_per_minute` (50). Link `/dead_
 `sched:pending` ZCARD ≥ `schedule_pending_max` (10000). Often poller off/undersized. Link `/scheduled`.
 
 ### What is Recurring schedule stale (cron_stale)?
-Enabled cron idle longer than `recurring_stale_factor` × its interval (default factor 2). Requires `recurring_scheduler_enabled`. Link `/recurring`. Check ticker pods and MySQL ledger.
+Enabled cron idle longer than `recurring_stale_factor` × its interval (default factor 2). Evaluates Redis `cron.stale` markers from ticker pods — does **not** require `recurring_scheduler_enabled` on the UI/evaluator pod. Link `/recurring`. Check ticker pods and MySQL ledger.
 
 ### How do I configure Slack?
 Set salt → `/alerts` → Slack → paste Incoming Webhook URL → enable → Save → Send test. URL stored encrypted; API shows masked preview.

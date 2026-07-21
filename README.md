@@ -1525,7 +1525,7 @@ Shared hysteresis: `interval`, `for_ticks`, `resolve_ticks`, `cooldown_seconds`.
 | `fairness_ingest_backed_up` | warning | — | `fairness_ingest_lag` (5000), `fairness_ready_max_when_stuck` (10) | High ingest lag + near-zero ready (forwarder stuck). → `/fairness/*` |
 | `dlt_rate_high` | warning | — | `dlt_per_minute` (50) | Dead-letter publishes in last minute ≥ threshold. → `/dead_letter` |
 | `schedule_depth_high` | warning | — | `schedule_pending_max` (10000) | `sched:pending` ZCARD too high. → `/scheduled` |
-| `cron_stale` | warning | `recurring_scheduler_enabled` | (uses `recurring_stale_factor` × interval) | Enabled cron idle beyond staleness window. → `/recurring` |
+| `cron_stale` | warning | — | (uses `recurring_stale_factor` × interval) | Enabled cron idle beyond staleness window (`cron.stale` Redis markers). → `/recurring` |
 
 Disable a noisy rule on `/alerts` (per-rule toggle) without turning the whole system off.
 

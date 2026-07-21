@@ -1890,7 +1890,7 @@ Unavailable channels show a one-line reason in the UI (“Add Slack webhook URL�
 | `fairness_ingest_backed_up` | Fairness ingest backed up | — | `fairness_ingest_lag` (5000), `fairness_ready_max_when_stuck` (10) | High ingest + ready ≤ max (forwarder stuck) | `/fairness/{lane}` |
 | `dlt_rate_high` | Dead-letter rate high | — | `dlt_per_minute` (50) | DLT publishes last minute ≥ threshold | `/dead_letter` |
 | `schedule_depth_high` | Delayed-job schedule depth high | — | `schedule_pending_max` (10000) | `sched:pending` ZCARD ≥ max | `/scheduled` |
-| `cron_stale` | Recurring schedule stale | `recurring_scheduler_enabled` | uses `recurring_stale_factor` × interval | Enabled cron idle beyond stale window (`cron.stale` events) | `/recurring` |
+| `cron_stale` | Recurring schedule stale | — | uses `recurring_stale_factor` × interval | Enabled cron idle beyond stale window (`cron.stale` Redis markers; ticker pods emit them) | `/recurring` |
 
 ### Operator enable checklist (tell users this)
 
@@ -1899,7 +1899,7 @@ Unavailable channels show a one-line reason in the UI (“Add Slack webhook URL�
 3. Open `/alerts` → enable master switch → Save.
 4. Enable a channel + paste secrets → Send test.
 5. Ensure a **Karafka** (or `alerts_run_on_ui`) process runs so the evaluator ticks.
-6. For RTT rule: `performance_metrics_enabled = true`. For cron rule: recurring scheduler on. For live consumers: liveness redis backend.
+6. For RTT rule: `performance_metrics_enabled = true`. For cron rule: ticker pods must emit `cron.stale` (scheduler need not be on the UI/evaluator pod). For live consumers: liveness redis backend.
 
 ### Example answers
 

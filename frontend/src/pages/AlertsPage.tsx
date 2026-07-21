@@ -521,26 +521,81 @@ export function AlertsPage() {
                     opacity: rule.available ? 1 : 0.65,
                   }}
                 >
-                  <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap" useFlexGap>
-                    <AlignedToggle
+                  <Box
+                    sx={{
+                      display: 'grid',
+                      gridTemplateColumns: {
+                        xs: 'auto minmax(0, 1fr)',
+                        md: 'auto minmax(0, 1fr) 88px 88px 128px',
+                      },
+                      alignItems: 'center',
+                      columnGap: 1.25,
+                      rowGap: 0.75,
+                      minHeight: 32,
+                      '& > *': {
+                        display: 'flex',
+                        alignItems: 'center',
+                        minHeight: 28,
+                        lineHeight: 1.25,
+                      },
+                    }}
+                  >
+                    <Switch
+                      size="small"
                       checked={!!conf.enabled && rule.available}
                       disabled={!rule.available}
-                      onChange={(v) => setRule(rule.id, { enabled: v })}
-                      label={rule.title}
+                      onChange={(e) => setRule(rule.id, { enabled: e.target.checked })}
+                      sx={{ m: 0 }}
                     />
-                    {!rule.available ? (
-                      <Tooltip title={rule.unavailable_reason || 'Unavailable'}>
-                        <Chip size="small" label="unavailable" variant="outlined" />
-                      </Tooltip>
-                    ) : null}
-                    <Chip size="small" label={conf.severity} variant="outlined" />
+                    <Typography variant="body2" noWrap title={rule.title} sx={{ fontWeight: 500 }}>
+                      {rule.title}
+                    </Typography>
+                    <Stack
+                      direction="row"
+                      alignItems="center"
+                      spacing={0.75}
+                      sx={{ gridColumn: { xs: '1 / -1', md: 'auto' } }}
+                    >
+                      {!rule.available ? (
+                        <Tooltip title={rule.unavailable_reason || 'Unavailable'}>
+                          <Chip size="small" label="unavailable" variant="outlined" sx={{ height: 24 }} />
+                        </Tooltip>
+                      ) : null}
+                      <Chip size="small" label={conf.severity} variant="outlined" sx={{ height: 24 }} />
+                    </Stack>
                     {rule.link ? (
-                      <Link component={RouterLink} to={rule.link} variant="body2">
+                      <Button
+                        component={RouterLink}
+                        to={rule.link}
+                        size="small"
+                        variant="text"
+                        sx={{
+                          px: 0.5,
+                          minWidth: 0,
+                          minHeight: 28,
+                          py: 0,
+                          justifyContent: 'flex-start',
+                          whiteSpace: 'nowrap',
+                          textTransform: 'none',
+                        }}
+                      >
                         Open page
-                      </Link>
-                    ) : null}
+                      </Button>
+                    ) : (
+                      <Box sx={{ display: { xs: 'none', md: 'flex' } }} />
+                    )}
                     <Button
                       size="small"
+                      variant="text"
+                      sx={{
+                        px: 0.5,
+                        minWidth: 0,
+                        minHeight: 28,
+                        py: 0,
+                        justifyContent: 'flex-start',
+                        whiteSpace: 'nowrap',
+                        textTransform: 'none',
+                      }}
                       onClick={() =>
                         setRule(rule.id, {
                           severity: conf.severity === 'critical' ? 'warning' : 'critical',
@@ -549,7 +604,7 @@ export function AlertsPage() {
                     >
                       Toggle severity
                     </Button>
-                  </Stack>
+                  </Box>
                   <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                     {rule.description}
                   </Typography>
@@ -704,7 +759,14 @@ function AlignedToggle({
         m: 0,
         alignItems: 'center',
         gap: 0.5,
-        '& .MuiFormControlLabel-label': { lineHeight: 1.25 },
+        minWidth: 0,
+        '& .MuiSwitch-root': { m: 0 },
+        '& .MuiFormControlLabel-label': {
+          lineHeight: 1.25,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        },
       }}
       control={
         <Switch size="small" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />

@@ -1,9 +1,9 @@
 {
   "format": 1,
-  "built_at": "2026-07-20T15:25:42Z",
+  "built_at": "2026-07-21T05:34:28Z",
   "max_chars": 2800,
-  "readme_sha256": "13eb2988364594c60263954e9d4fd0a1f50c48532cb630f13b2f9ab3a9de5eb7",
-  "faq_sha256": "ebb301c6c968b1ee3651e6d0dc6cd5fc6da9c145833581625765b808d26b8f53",
+  "readme_sha256": "44b79a7ad821512b14c2b1ec82d737768a6ff082cc9df4ba73df2bc6013d7aa7",
+  "faq_sha256": "ad7db1184ee6bc86eb78441e7559b53d7149be319002901a656b2156d2092cb2",
   "chunk_count": 472,
   "chunks": [
     {
@@ -1911,8 +1911,8 @@
         "Rules catalog (assistants: use this when helping configure)"
       ],
       "section": "46. Health alerts",
-      "text": "46. Health alerts › Rules catalog (assistants: use this when helping configure)\n\n| id | Title | Requires | Settings | Fires when | UI link |\n|----|-------|----------|----------|------------|---------|\n| `lag_stuck_growing` | Lag growing without consumption | — | `lag_threshold` (1000), `lag_growth_min` (100) | Lag ≥ threshold, committed stuck across ticks, lag/end still growing; skips paused partitions | `/lag` |\n| `redis_rtt_high` | Redis RTT elevated | `performance_metrics_enabled` | `rtt_avg_ms` (50), `rtt_max_ms` (200), `rtt_error_rate` (0.25) | Probe avg/max/error rate above thresholds | `/performance` |\n| `no_live_consumers` | No live consumers with lag | liveness `:redis` | — | pending > 0 and live_consumers = 0 | `/live` |\n| `reconciler_stale` | Reconciler stale or failing | — | `reconciler_max_age` (900) | Missing summary, age > max, or produce_failed / found_stale ≥ 10 | `/reconciler` |\n| `fairness_ingest_backed_up` | Fairness ingest backed up | — | `fairness_ingest_lag` (5000), `fairness_ready_max_when_stuck` (10) | High ingest + ready ≤ max (forwarder stuck) | `/fairness/{lane}` |\n| `dlt_rate_high` | Dead-letter rate high | — | `dlt_per_minute` (50) | DLT publishes last minute ≥ threshold | `/dead_letter` |\n| `schedule_depth_high` | Delayed-job schedule depth high | — | `schedule_pending_max` (10000) | `sched:pending` ZCARD ≥ max | `/scheduled` |\n| `cron_stale` | Recurring schedule stale | `recurring_scheduler_enabled` | uses `recurring_stale_factor` × interval | Enabled cron idle beyond stale window (`cron.stale` events) | `/recurring` |",
-      "char_count": 1576
+      "text": "46. Health alerts › Rules catalog (assistants: use this when helping configure)\n\n| id | Title | Requires | Settings | Fires when | UI link |\n|----|-------|----------|----------|------------|---------|\n| `lag_stuck_growing` | Lag growing without consumption | — | `lag_threshold` (1000), `lag_growth_min` (100) | Lag ≥ threshold, committed stuck across ticks, lag/end still growing; skips paused partitions | `/lag` |\n| `redis_rtt_high` | Redis RTT elevated | `performance_metrics_enabled` | `rtt_avg_ms` (50), `rtt_max_ms` (200), `rtt_error_rate` (0.25) | Probe avg/max/error rate above thresholds | `/performance` |\n| `no_live_consumers` | No live consumers with lag | liveness `:redis` | — | pending > 0 and live_consumers = 0 | `/live` |\n| `reconciler_stale` | Reconciler stale or failing | — | `reconciler_max_age` (900) | Missing summary, age > max, or produce_failed / found_stale ≥ 10 | `/reconciler` |\n| `fairness_ingest_backed_up` | Fairness ingest backed up | — | `fairness_ingest_lag` (5000), `fairness_ready_max_when_stuck` (10) | High ingest + ready ≤ max (forwarder stuck) | `/fairness/{lane}` |\n| `dlt_rate_high` | Dead-letter rate high | — | `dlt_per_minute` (50) | DLT publishes last minute ≥ threshold | `/dead_letter` |\n| `schedule_depth_high` | Delayed-job schedule depth high | — | `schedule_pending_max` (10000) | `sched:pending` ZCARD ≥ max | `/scheduled` |\n| `cron_stale` | Recurring schedule stale | — | uses `recurring_stale_factor` × interval | Enabled cron idle beyond stale window (`cron.stale` Redis markers; ticker pods emit them) | `/recurring` |",
+      "char_count": 1578
     },
     {
       "id": "readme-46-health-alerts-operator-enable-checklist-tell-abd148102850804b",
@@ -1923,8 +1923,8 @@
         "Operator enable checklist (tell users this)"
       ],
       "section": "46. Health alerts",
-      "text": "46. Health alerts › Operator enable checklist (tell users this)\n\n1. Redis reachable (`config.redis_url`).\n2. For Slack/webhook/email secrets: set `ai_encryption_salt`.\n3. Open `/alerts` → enable master switch → Save.\n4. Enable a channel + paste secrets → Send test.\n5. Ensure a **Karafka** (or `alerts_run_on_ui`) process runs so the evaluator ticks.\n6. For RTT rule: `performance_metrics_enabled = true`. For cron rule: recurring scheduler on. For live consumers: liveness redis backend.",
-      "char_count": 488
+      "text": "46. Health alerts › Operator enable checklist (tell users this)\n\n1. Redis reachable (`config.redis_url`).\n2. For Slack/webhook/email secrets: set `ai_encryption_salt`.\n3. Open `/alerts` → enable master switch → Save.\n4. Enable a channel + paste secrets → Send test.\n5. Ensure a **Karafka** (or `alerts_run_on_ui`) process runs so the evaluator ticks.\n6. For RTT rule: `performance_metrics_enabled = true`. For cron rule: ticker pods must emit `cron.stale` (scheduler need not be on the UI/evaluator pod). For live consumers: liveness redis backend.",
+      "char_count": 548
     },
     {
       "id": "readme-46-health-alerts-example-answers-c888a7747b86cc2d",
@@ -5175,8 +5175,8 @@
         "Which process runs the evaluator?"
       ],
       "section": "AS. Health alerts",
-      "text": "FAQ: Which process runs the evaluator?\n\nKarafka processes when effective enabled is true. UI-only: set `alerts_run_on_ui` / `KAFKA_BATCH_ALERTS_RUN_ON_UI`. Go daemon does **not** run this Ruby evaluator (v1).",
-      "char_count": 208
+      "text": "FAQ: Which process runs the evaluator?\n\n**Control plane only:** Ruby Karafka with `-control` / `-dispatch-*` groups, or Go `kbatch daemon`. Not execution-only Karafka jobs pods, not `kbatch worker`, not UI (unless `alerts_run_on_ui`). Ruby and Go share Redis NX lock + open/notify dedupe — Slack fires once.",
+      "char_count": 307
     },
     {
       "id": "faq-as-health-alerts-what-is-hysteresis-for-ticks-re-5b53867bfbc789de",
@@ -5283,8 +5283,8 @@
         "What is Recurring schedule stale (cron_stale)?"
       ],
       "section": "AS. Health alerts",
-      "text": "FAQ: What is Recurring schedule stale (cron_stale)?\n\nEnabled cron idle longer than `recurring_stale_factor` × its interval (default factor 2). Requires `recurring_scheduler_enabled`. Link `/recurring`. Check ticker pods and MySQL ledger.",
-      "char_count": 237
+      "text": "FAQ: What is Recurring schedule stale (cron_stale)?\n\nEnabled cron idle longer than `recurring_stale_factor` × its interval (default factor 2). Evaluates Redis `cron.stale` markers from ticker pods — does **not** require `recurring_scheduler_enabled` on the UI/evaluator pod. Link `/recurring`. Check ticker pods and MySQL ledger.",
+      "char_count": 329
     },
     {
       "id": "faq-as-health-alerts-how-do-i-configure-slack-6b0556c6e737921e",
@@ -5635,5 +5635,5 @@
       "char_count": 86
     }
   ],
-  "corpus_version": "aa1f7d45f736ec72c22d0fe8be6f76eb"
+  "corpus_version": "a6e29b64825ac33c7389a71ba267c95b"
 }

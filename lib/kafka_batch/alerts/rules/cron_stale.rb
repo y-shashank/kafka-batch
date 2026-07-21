@@ -13,12 +13,13 @@ module KafkaBatch
         self.detail =
           "The recurring ticker’s heartbeat marks enabled schedules stale when idle_seconds > " \
           "stale_threshold (default recurring_stale_factor=2.0 × cron interval) and emits cron.stale. " \
-          "The alerts evaluator opens an incident per schedule name. Requires recurring_scheduler_enabled."
+          "The alerts evaluator opens an incident per schedule name from Redis markers " \
+          "(does not require recurring_scheduler_enabled on the UI/evaluator pod)."
         self.remediation =
           "Open /recurring; confirm ticker pods (rake kafka_batch:recurring:run or control with " \
           "recurring_scheduler_enabled); check MySQL ledger/leader lock and enqueue errors."
         self.default_severity = "warning"
-        self.requires = [:recurring]
+        self.requires = []
         self.link = "/recurring"
         self.settings = []
 
