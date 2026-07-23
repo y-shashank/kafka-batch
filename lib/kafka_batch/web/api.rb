@@ -26,6 +26,8 @@ module KafkaBatch
           dashboard
         elsif method == "GET" && path == "/api/batches"
           batches_index(params)
+        elsif method == "GET" && path == "/api/tenant/batches"
+          tenant_batches(params)
         elsif method == "GET" && (m = path.match(%r{\A/api/batches/([^/]+)\z}))
           batches_show(m[1], params)
         elsif method == "POST" && (m = path.match(%r{\A/api/batches/([^/]+)/cancel\z}))
@@ -167,6 +169,42 @@ module KafkaBatch
           q: search,
           batches: batches.map { |b| serialize_batch(b) }
         )
+      end
+
+      # Host-facing read-only lookup. No cancel/delete. The host must ensure the
+      # caller is allowed to see the requested tenant_id / batch_id.
+      #
+      #   GET /api/tenant/batches?batch_id=…           → that batch
+      #   GET /api/tenant/batches?tenant_id=…          → up to tenant_batches_limit newest
+      #   GET /api/tenant/batches?tenant_id=…&batch_id=… → batch only if it belongs to tenant
+      def tenant_batches(params)
+        tenant_id = @web.non_empty(params["tenant_id"])
+        batch_id  = @web.non_empty(params["batch_id"])
+        return Json.error(400, "tenant_id or batch_id required") if tenant_id.nil? && batch_id.nil?
+
+        if batch_id
+          batch = KafkaBatch.store.find_batch(batch_id)
+          return Json.error(404, "Batch not found") unless batch
+          if tenant_id && batch[:tenant_id].to_s != tenant_id
+            return Json.error(404, "Batch not found")
+          end
+
+          return Json.ok(ok: true, batch: serialize_batch(batch, detail: true))
+        end
+
+        limit = tenant_batches_limit
+        batches = KafkaBatch.store.list_batches(tenant_id: tenant_id, limit: limit, offset: 0)
+        Json.ok(
+          ok: true,
+          tenant_id: tenant_id,
+          limit: limit,
+          batches: batches.map { |b| serialize_batch(b) }
+        )
+      end
+
+      def tenant_batches_limit
+        n = KafkaBatch.config.tenant_batches_limit.to_i
+        n.positive? ? n : 50
       end
 
       def batches_show(id, params)

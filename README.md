@@ -1375,6 +1375,7 @@ All mutating calls require the `_kb_csrf` cookie **and** a matching `X-CSRF-Toke
 | Method | Path |
 |---|---|
 | GET | `/api/bootstrap`, `/api/dashboard`, `/api/batches`, `/api/batches/:id` |
+| GET | `/api/tenant/batches` — host-facing read-only; `tenant_id` and/or `batch_id` (at least one required). `batch_id` → that batch; `tenant_id` → up to `config.tenant_batches_limit` newest (default 50, no pagination); both → batch only if it belongs to the tenant. **Host must enforce tenant isolation.** |
 | POST / DELETE | `/api/batches/:id/cancel`, `/api/batches/:id`, `/api/batches/bulk` |
 | GET | `/api/failures`, `/api/live`, `/api/lag`, `/api/scheduled`, `/api/system`, `/api/reconciler`, `/api/dead_letter`, `/api/audit`, `/api/alerts`, `/api/alerts/settings` |
 | PUT / POST | `/api/alerts/settings`, `/api/alerts/test` |

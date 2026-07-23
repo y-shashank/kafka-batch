@@ -629,11 +629,12 @@ module KafkaBatch
 
       # Bug #5 fix: pipeline all hgetall calls into a single round-trip instead
       # of calling find_batch (one HGETALL each) per ID in a Ruby loop.
-      def list_batches(status: nil, limit: 50, offset: 0, search: nil)
+      def list_batches(status: nil, limit: 50, offset: 0, search: nil, tenant_id: nil)
         ids = with_redis { |r| r.zrevrange(ALL_INDEX, 0, -1) }
         return [] if ids.empty?
 
         q = presence(search)&.downcase
+        tid = presence(tenant_id)&.to_s
 
         raw_batches = with_redis do |r|
           r.pipelined do |pipe|
@@ -652,6 +653,7 @@ module KafkaBatch
           end
           batch = hash_to_batch(h)
           next if status && batch[:status] != status
+          next if tid && batch[:tenant_id].to_s != tid
           next if q && !batch_matches?(batch, q)
 
           if skipped < offset

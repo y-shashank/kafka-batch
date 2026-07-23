@@ -164,7 +164,8 @@ module KafkaBatch
       # @return [Array<Hash>]
       # @param search [String, nil] optional case-insensitive filter matching the
       #   batch id or description.
-      def list_batches(status: nil, limit: 50, offset: 0, search: nil)
+      # @param tenant_id [String, nil] optional exact tenant filter
+      def list_batches(status: nil, limit: 50, offset: 0, search: nil, tenant_id: nil)
         raise NotImplementedError, "#{self.class}#list_batches"
       end
 

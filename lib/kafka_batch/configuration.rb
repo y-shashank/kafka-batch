@@ -568,6 +568,10 @@ module KafkaBatch
     #   }
     attr_accessor :web_authenticator
 
+    # Max batches returned by GET /api/tenant/batches when filtering by tenant_id
+    # (newest-first, no pagination). Host apps must enforce tenant isolation.
+    attr_accessor :tenant_batches_limit  # Integer – default 50
+
     # ── AI knowledge index (RAG corpus in Redis) ─────────────────────────────
     # Prebuilt chunks from ai/README.md + ai/FAQ.md are loaded into Redis at
     # boot (see KafkaBatch::Ai::KnowledgeIndex). Many UI pods may call sync!;
@@ -756,6 +760,7 @@ module KafkaBatch
       @validate_topics_on_boot  = false
       @extra_job_topics         = []
       @web_authenticator        = nil
+      @tenant_batches_limit     = env_positive_int("KAFKA_BATCH_TENANT_BATCHES_LIMIT", 50)
       @daemon_mode              = truthy_env?("KAFKA_BATCH_DAEMON_MODE")
       @handler_manifest_path    = ENV["KAFKA_BATCH_HANDLER_MANIFEST"].to_s.strip
       @jobs_topics              = []

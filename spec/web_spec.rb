@@ -172,6 +172,55 @@ RSpec.describe KafkaBatch::Web do
     end
   end
 
+  describe "GET /api/tenant/batches" do
+    it "requires tenant_id or batch_id" do
+      status, = get("/api/tenant/batches")
+      expect(status).to eq(400)
+    end
+
+    it "returns a single batch by batch_id" do
+      id = seed(total: 2, tenant_id: "acme", description: "tenant job")
+      payload = json_body(get("/api/tenant/batches", query: "batch_id=#{id}"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["batch"]["id"]).to eq(id)
+      expect(payload["batch"]["tenant_id"]).to eq("acme")
+      expect(payload["batch"]["description"]).to eq("tenant job")
+      expect(payload).not_to have_key("batches")
+    end
+
+    it "lists newest batches for a tenant up to the configured limit" do
+      allow(KafkaBatch.config).to receive(:tenant_batches_limit).and_return(2)
+      seed(tenant_id: "acme")
+      keep_a = seed(tenant_id: "acme")
+      keep_b = seed(tenant_id: "acme")
+      seed(tenant_id: "other")
+
+      payload = json_body(get("/api/tenant/batches", query: "tenant_id=acme"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["tenant_id"]).to eq("acme")
+      expect(payload["limit"]).to eq(2)
+      ids = payload["batches"].map { |b| b["id"] }
+      expect(ids).to eq([keep_b, keep_a])
+      expect(payload["batches"].map { |b| b["tenant_id"] }.uniq).to eq(["acme"])
+    end
+
+    it "returns the batch only when batch_id belongs to tenant_id" do
+      mine = seed(tenant_id: "acme")
+      other = seed(tenant_id: "other")
+
+      ok = json_body(get("/api/tenant/batches", query: "tenant_id=acme&batch_id=#{mine}"))
+      expect(ok["batch"]["id"]).to eq(mine)
+
+      status, = get("/api/tenant/batches", query: "tenant_id=acme&batch_id=#{other}")
+      expect(status).to eq(404)
+    end
+
+    it "returns 404 for unknown batch_id" do
+      status, = get("/api/tenant/batches", query: "batch_id=#{SecureRandom.uuid}")
+      expect(status).to eq(404)
+    end
+  end
+
   describe "GET /api/batches/:id" do
     it "returns batch detail" do
       id = seed(description: "Detail me")

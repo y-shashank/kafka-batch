@@ -111,6 +111,17 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
       expect(store.list_batches(search: "nightly").map { |x| x[:id] }).not_to include(b)
       expect(store.list_batches(search: a[0, 8]).map { |x| x[:id] }).to include(a)
     end
+
+    it "list_batches filters by tenant_id" do
+      a = SecureRandom.uuid
+      store.create_batch(id: a, total_jobs: 0, tenant_id: "acme")
+      b = SecureRandom.uuid
+      store.create_batch(id: b, total_jobs: 0, tenant_id: "other")
+
+      ids = store.list_batches(tenant_id: "acme").map { |x| x[:id] }
+      expect(ids).to include(a)
+      expect(ids).not_to include(b)
+    end
   end
 
   describe "#claim_callback dispatched_by" do
