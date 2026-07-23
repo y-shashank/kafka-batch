@@ -27,6 +27,7 @@ Built on [Karafka](https://karafka.io) (WaterDrop + consumers). **Go runtime:** 
 - [Retries & dead letter](#retries--dead-letter)
 - [Scaling & partitions](#scaling--partitions)
 - [Web UI & reconciler](#web-ui--reconciler)
+  - [Tenant batches API (host-facing)](#tenant-batches-api-host-facing)
 - [Health alerts](#health-alerts)
 - [Instrumentation](#instrumentation)
 - [Migrating from Sidekiq Pro](#migrating-from-sidekiq-pro)
@@ -1375,13 +1376,46 @@ All mutating calls require the `_kb_csrf` cookie **and** a matching `X-CSRF-Toke
 | Method | Path |
 |---|---|
 | GET | `/api/bootstrap`, `/api/dashboard`, `/api/batches`, `/api/batches/:id` |
-| GET | `/api/tenant/batches` — host-facing read-only; `tenant_id` and/or `batch_id` (at least one required). `batch_id` → that batch; `tenant_id` → up to `config.tenant_batches_limit` newest (default 50, no pagination); both → batch only if it belongs to the tenant. **Host must enforce tenant isolation.** |
+| GET | `/api/tenant/batches` — see [Tenant batches API](#tenant-batches-api-host-facing) |
 | POST / DELETE | `/api/batches/:id/cancel`, `/api/batches/:id`, `/api/batches/bulk` |
 | GET | `/api/failures`, `/api/live`, `/api/lag`, `/api/scheduled`, `/api/system`, `/api/reconciler`, `/api/dead_letter`, `/api/audit`, `/api/alerts`, `/api/alerts/settings` |
 | PUT / POST | `/api/alerts/settings`, `/api/alerts/test` |
 | GET | `/api/fairness/:type`, `/api/weights/:type` (`time` \| `throughput`) |
 | POST | `/api/lag/pause`, `/api/lag/resume` |
 | PUT / DELETE | `/api/weights/:type`, `/api/weights/:type/:tenant_id` |
+
+### Tenant batches API (host-facing)
+
+Read-only helper for **host apps** that need to show a tenant their own batches without opening the full admin dashboard (no cancel/delete, no other pages). Kafka-batch does **not** authenticate tenants — the host must bind `tenant_id` / `batch_id` to the caller’s session before proxying.
+
+```http
+GET /kafka_batch/api/tenant/batches?tenant_id=acme
+GET /kafka_batch/api/tenant/batches?batch_id=<uuid>
+GET /kafka_batch/api/tenant/batches?tenant_id=acme&batch_id=<uuid>
+```
+
+| Query | Behavior |
+|---|---|
+| `batch_id` only | That batch (detail fields), or `404` |
+| `tenant_id` only | Up to **N** newest batches for that tenant (no pagination) |
+| both | That batch only if `batch.tenant_id` matches; otherwise `404` |
+| neither | `400` |
+
+**Limit:** `config.tenant_batches_limit` (default **50**), or env `KAFKA_BATCH_TENANT_BATCHES_LIMIT`.
+
+Example host proxy (sketch):
+
+```ruby
+# In your app — never accept tenant_id from the client blindly.
+get "/my/batches" do
+  tenant = current_user.tenant_id
+  upstream = "#{kafka_batch_mount}/api/tenant/batches?tenant_id=#{CGI.escape(tenant)}"
+  # forward cookies / web_authenticator as needed for the mount
+  proxy_get(upstream)
+end
+```
+
+Same mount security as the rest of `KafkaBatch::Web` (host auth wrap + optional `web_authenticator`). Prefer keeping the admin UI behind a separate admin-only constraint so tenants never reach cancel/delete routes.
 
 ### Securing the dashboard
 
