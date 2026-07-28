@@ -37,6 +37,7 @@ module KafkaBatch
               KafkaBatch::Alerts.start!
             end
           end
+          KafkaBatch::TenantGuard.install_recorder! if defined?(KafkaBatch::TenantGuard)
         rescue => e
           KafkaBatch.logger.warn("[KafkaBatch] alerts init skipped: #{e.message}")
         end
@@ -125,6 +126,10 @@ module KafkaBatch
                 KafkaBatch::Alerts.start!
               end
             end
+            # Record per-tenant error rates on execution pods (where job events
+            # fire). No-op unless the guard is enabled and the job carries a
+            # tenant_id (fairness lanes).
+            KafkaBatch::TenantGuard.install_recorder! if defined?(KafkaBatch::TenantGuard)
           rescue => e
             KafkaBatch.logger.warn("[KafkaBatch] alerts evaluator start skipped: #{e.message}")
           end

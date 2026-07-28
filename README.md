@@ -1662,7 +1662,8 @@ sync every tick (auto-release on `until`, and repair of operator-initiated drift
 | `kafka_batch:tenant_guard:settings` | HASH — runtime thresholds/mitigation (page-edited; layered over config defaults) |
 | `kafka_batch:tenant_guard:settings:version` | Monotonic stamp; readers reload when changed |
 | `kafka_batch:tenant_guard:lock` | NX single-flight lock for evaluator + reconciler |
-| `kafka_batch:tenant_errors:{tenant_id}:{yyyymmddHHmm}` | HASH `{ok, fail}` per minute bucket (TTL = window + skew) |
+| `kafka_batch:tenant_errors:{tenant_id}:{yyyymmddHHmm}` | HASH `{ok, fail, retry}` per minute bucket (TTL = window + skew); `{yyyymmddHHmm}` is the minute floor in UTC |
+| `kafka_batch:tenant_errors:active` | ZSET of tenants scored by last-seen epoch (cheap enumeration for the evaluator; pruned to the window) |
 
 Alert findings use fingerprint `tenant_error_rate:{tenant_id}` and plug into the
 existing alerts hysteresis (`for_ticks` / `resolve_ticks` / open-claim single-fire).
