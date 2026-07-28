@@ -303,7 +303,8 @@ module KafkaBatch
             job_id:       job_id,
             batch_id:     batch_id,
             worker_class: worker_name,
-            duration:     duration
+            duration:     duration,
+            tenant_id:    data["tenant_id"]
           )
 
           release_uniq_lock(data)
@@ -483,7 +484,8 @@ module KafkaBatch
           worker_class: worker_class || data["worker_class"],
           attempt:      next_attempt - 1,
           next_attempt: next_attempt,
-          retry_after:  retry_after
+          retry_after:  retry_after,
+          tenant_id:    data["tenant_id"]
         )
 
         commit_offset!(message)
@@ -511,7 +513,8 @@ module KafkaBatch
           batch_id:     batch_id,
           worker_class: worker_class,
           attempt:      attempt || data["attempt"].to_i,
-          error:        error
+          error:        error,
+          tenant_id:    data["tenant_id"]
         )
 
         invoke_retries_exhausted(

@@ -624,6 +624,24 @@ module KafkaBatch
     attr_accessor :alerts_fairness_ingest_lag
     attr_accessor :alerts_fairness_ready_max_when_stuck
 
+    # ── Tenant guard (per-tenant error-rate pause/throttle) ────────────────────
+    # A control plane that watches a sliding per-tenant error-rate window and can
+    # auto-mitigate a misbehaving tenant by throttling its fairness weight and/or
+    # pausing its dedicated ingest partition. Fairness lanes only (plain jobs have
+    # no per-tenant partition or weight to act on). These values are DEFAULTS; the
+    # effective values are layered from the runtime settings page
+    # (kafka_batch:tenant_guard:settings) over these.
+    attr_accessor :tenant_guard_enabled              # Boolean – default false
+    attr_accessor :tenant_guard_window_seconds       # Integer – sliding lookback; default 300
+    attr_accessor :tenant_guard_min_samples          # Integer – min ok+fail before acting; default 50
+    attr_accessor :tenant_guard_error_rate_pct       # Float   – fail/(ok+fail)*100 threshold; default 25.0
+    attr_accessor :tenant_guard_include_retries      # Boolean – count retries as fail; default false
+    attr_accessor :tenant_guard_mitigation           # Symbol  – :none|:throttle|:pause|:throttle_then_pause
+    attr_accessor :tenant_guard_throttle_weight      # Float   – weight applied on throttle; default 0.1
+    attr_accessor :tenant_guard_auto_release_seconds # Integer|nil – auto-disengage after N sec; nil = manual
+    attr_accessor :tenant_guard_grace_ticks          # Integer – warn ticks before acting; default 0
+    attr_accessor :tenant_guard_reconcile_interval   # Integer – reconciler tick seconds; default 15
+
     # ── Logging ──────────────────────────────────────────────────────────────
     attr_accessor :logger
 
@@ -798,6 +816,19 @@ module KafkaBatch
       @alerts_dlt_per_minute = env_positive_int("KAFKA_BATCH_ALERTS_DLT_PER_MINUTE", 50)
       @alerts_fairness_ingest_lag = env_positive_int("KAFKA_BATCH_ALERTS_FAIRNESS_INGEST_LAG", 5000)
       @alerts_fairness_ready_max_when_stuck = env_positive_int("KAFKA_BATCH_ALERTS_FAIRNESS_READY_MAX_WHEN_STUCK", 10)
+
+      @tenant_guard_enabled              = truthy_env?("KAFKA_BATCH_TENANT_GUARD_ENABLED")
+      @tenant_guard_window_seconds       = env_positive_int("KAFKA_BATCH_TENANT_GUARD_WINDOW_SECONDS", 300)
+      @tenant_guard_min_samples          = env_positive_int("KAFKA_BATCH_TENANT_GUARD_MIN_SAMPLES", 50)
+      @tenant_guard_error_rate_pct       = env_positive_float("KAFKA_BATCH_TENANT_GUARD_ERROR_RATE_PCT", 25.0)
+      @tenant_guard_include_retries      = truthy_env?("KAFKA_BATCH_TENANT_GUARD_INCLUDE_RETRIES")
+      @tenant_guard_mitigation           = tenant_guard_mitigation_env("KAFKA_BATCH_TENANT_GUARD_MITIGATION", :throttle)
+      @tenant_guard_throttle_weight      = env_positive_float("KAFKA_BATCH_TENANT_GUARD_THROTTLE_WEIGHT", 0.1)
+      # 0 or unset ⇒ 900s default; set the ENV to a negative to mean "manual only" (nil).
+      @tenant_guard_auto_release_seconds = tenant_guard_auto_release_env("KAFKA_BATCH_TENANT_GUARD_AUTO_RELEASE_SECONDS", 900)
+      @tenant_guard_grace_ticks          = env_non_negative_int("KAFKA_BATCH_TENANT_GUARD_GRACE_TICKS", 0)
+      @tenant_guard_reconcile_interval   = env_positive_int("KAFKA_BATCH_TENANT_GUARD_RECONCILE_INTERVAL", 15)
+
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
 
@@ -1002,6 +1033,41 @@ module KafkaBatch
       return default if v.empty?
 
       n = Float(v)
+      n.positive? ? n : default
+    rescue ArgumentError, TypeError
+      default
+    end
+
+    def env_non_negative_int(key, default)
+      v = ENV[key].to_s.strip
+      return default if v.empty?
+
+      n = Integer(v, 10)
+      n.negative? ? default : n
+    rescue ArgumentError, TypeError
+      default
+    end
+
+    # Parse the tenant-guard mitigation mode from ENV into one of the allowed
+    # symbols, falling back to the default on anything unrecognized.
+    def tenant_guard_mitigation_env(key, default)
+      v = ENV[key].to_s.strip.downcase
+      return default if v.empty?
+
+      allowed = %i[none throttle pause throttle_then_pause]
+      sym = v.to_sym
+      allowed.include?(sym) ? sym : default
+    end
+
+    # Auto-release seconds: a positive integer sets the window; a negative value
+    # explicitly means "manual only" (nil, no auto-disengage); unset uses default.
+    def tenant_guard_auto_release_env(key, default)
+      v = ENV[key].to_s.strip
+      return default if v.empty?
+
+      n = Integer(v, 10)
+      return nil if n.negative?
+
       n.positive? ? n : default
     rescue ArgumentError, TypeError
       default

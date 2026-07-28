@@ -46,34 +46,39 @@ module KafkaBatch
     class << self
       # ── Job events ─────────────────────────────────────────────────────
 
-      def job_processed(job_id:, batch_id:, worker_class:, duration: nil)
+      # tenant_id is only meaningful for fairness jobs; plain jobs pass nil and the
+      # per-tenant error-rate window (tenant guard) simply ignores those events.
+      def job_processed(job_id:, batch_id:, worker_class:, duration: nil, tenant_id: nil)
         instrument("job.processed", {
           job_id:       job_id,
           batch_id:     batch_id,
           worker_class: worker_class.to_s,
-          duration:     duration
+          duration:     duration,
+          tenant_id:    tenant_id
         })
       end
 
-      def job_retried(job_id:, batch_id:, worker_class:, attempt:, next_attempt:, retry_after: nil)
+      def job_retried(job_id:, batch_id:, worker_class:, attempt:, next_attempt:, retry_after: nil, tenant_id: nil)
         instrument("job.retried", {
           job_id:       job_id,
           batch_id:     batch_id,
           worker_class: worker_class.to_s,
           attempt:      attempt,
           next_attempt: next_attempt,
-          retry_after:  retry_after
+          retry_after:  retry_after,
+          tenant_id:    tenant_id
         })
       end
 
-      def job_failed(job_id:, batch_id:, worker_class:, attempt:, error:)
+      def job_failed(job_id:, batch_id:, worker_class:, attempt:, error:, tenant_id: nil)
         instrument("job.failed", {
           job_id:        job_id,
           batch_id:      batch_id,
           worker_class:  worker_class.to_s,
           attempt:       attempt,
           error_class:   error.class.name,
-          error_message: error.message
+          error_message: error.message,
+          tenant_id:     tenant_id
         })
       end
 

@@ -224,6 +224,23 @@ KafkaBatch.configure do |config|
   # config.alerts_reconciler_max_age = 900
   # config.alerts_fairness_ingest_lag = 5000
 
+  # ── Tenant guard (per-tenant error-rate pause/throttle; fairness lanes only) ─
+  # Watches a sliding per-tenant error-rate window and can auto-mitigate a
+  # misbehaving tenant by throttling its fairness weight and/or pausing its
+  # dedicated ingest partition (drain-safe; batch counting untouched). Manage the
+  # live thresholds and see/reset actions on the dashboard "Tenant guard" page.
+  # These are only DEFAULTS — the page overrides them at runtime.
+  # config.tenant_guard_enabled = false
+  # config.tenant_guard_window_seconds = 300         # sliding lookback
+  # config.tenant_guard_min_samples = 50             # min ok+fail before acting
+  # config.tenant_guard_error_rate_pct = 25.0        # fail/(ok+fail)*100 threshold
+  # config.tenant_guard_include_retries = false      # count retries as failures
+  # config.tenant_guard_mitigation = :throttle       # :none | :throttle | :pause | :throttle_then_pause
+  # config.tenant_guard_throttle_weight = 0.1        # fairness weight applied on throttle
+  # config.tenant_guard_auto_release_seconds = 900   # auto-disengage after N sec; nil = manual reset only
+  # config.tenant_guard_grace_ticks = 0              # >0 = warn ticks before acting
+  # config.tenant_guard_reconcile_interval = 15      # reconciler tick (auto-release + drift repair)
+
   # ── Metrics (StatsD / Datadog / custom proc) ────────────────────────────────
   # config.metrics_enabled = true
   # config.metrics_adapter = :statsd   # :datadog or :proc

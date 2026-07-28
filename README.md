@@ -1616,6 +1616,81 @@ All mutations need CSRF (`_kb_csrf` + `X-CSRF-Token`).
 - **Go control plane:** `kbatch daemon` runs the same evaluator (shared Redis settings + NX lock). `kbatch worker` does not. UI Send-test stays Ruby-only.
 - For deeper operator Q&A, see `ai/FAQ.md` section **AS. Health alerts** and `ai/README.md` §46.
 
+## Tenant guard (per-tenant error-rate pause / throttle)
+
+> Status: rolling out. This section is the **shared Redis contract** — `kafka-batch`
+> (Ruby) and `kafka-batch-go` (Go) both read/write these exact keys. Change it in
+> lock-step across both repos.
+
+A control plane that watches a **sliding per-tenant error-rate window** and can
+**auto-mitigate** a misbehaving tenant — while always recording the action and
+firing a host callback so the app can page, open a ticket, or throttle further.
+It is a *sibling* to consumption pause and the alerts evaluator, not a rival: it
+reuses their patterns (Redis + cached snapshot, NX-locked evaluator, hysteresis).
+
+### Scope: fairness lanes only
+
+The guard acts **only on fairness jobs**, because its two levers are fairness-only
+and it deliberately touches nothing in the job/batch execution path:
+
+| Lever | Mechanism (reused, not new) | Effect |
+|-------|-----------------------------|--------|
+| **Pause** | The tenant's dedicated **ingest partition** via `ConsumptionControl.pause_partition` (same Redis SET as the `/lag` pause button) | Stops *new admission*; in-flight + already-admitted (Redis ready list / ready topic) drain normally |
+| **Throttle** | The tenant's **fairness weight** via `Scheduler#set_weight` | Lowers dispatch share; `original_weight` is saved so resume restores it |
+
+Plain (non-fair) jobs have no per-tenant partition or weight, so the guard cannot
+and does not affect them. Because pause = partition-pause and throttle = weight,
+**batch counting / completion (`on_success` / `on_complete`) is never touched** —
+no job is dropped, fail-counted, or dequeued by a guard action.
+
+### State model
+
+Per-tenant control is `active` (normal), `throttled` (weight override active), or
+`paused` (ingest partition paused). Enforcement state (is the partition in the
+pause SET / what is the weight) is **authoritative**; the guard record is *intent +
+metadata* (source, reason, `until`, `original_weight`). A reconciler keeps them in
+sync every tick (auto-release on `until`, and repair of operator-initiated drift).
+
+### Shared Redis keys (contract)
+
+| Key | Role |
+|-----|------|
+| `kafka_batch:tenant_guard:{tenant_id}` | HASH — `state`, `lane`, `action`, `source` (`manual`\|`error_rate_guard`), `reason`, `group`, `topic`, `partition`, `original_weight`, `effective_weight`, `created_at`, `until`, `created_by` |
+| `kafka_batch:tenant_guard:index` | SET of tenants with an active control (UI listing + reconciler scan) |
+| `kafka_batch:tenant_guard:actions` | ZSET (scored by `created_at`) of action ids → audit log |
+| `kafka_batch:tenant_guard:action:{id}` | HASH per action — same fields + `outcome` (`active`\|`expired`\|`manual_reset`\|`released_externally`\|`superseded`\|`escalated`), `released_at`, `released_by` |
+| `kafka_batch:tenant_guard:settings` | HASH — runtime thresholds/mitigation (page-edited; layered over config defaults) |
+| `kafka_batch:tenant_guard:settings:version` | Monotonic stamp; readers reload when changed |
+| `kafka_batch:tenant_guard:lock` | NX single-flight lock for evaluator + reconciler |
+| `kafka_batch:tenant_errors:{tenant_id}:{yyyymmddHHmm}` | HASH `{ok, fail}` per minute bucket (TTL = window + skew) |
+
+Alert findings use fingerprint `tenant_error_rate:{tenant_id}` and plug into the
+existing alerts hysteresis (`for_ticks` / `resolve_ticks` / open-claim single-fire).
+
+### Error classification (both runtimes must agree)
+
+`ok` = job success. `fail` = terminal failure + DLT. Retries count as `fail` only
+when `tenant_guard_include_retries` is true. Cancelled / expired / uniq-skipped are
+**excluded** from the denominator (they are not the tenant's fault and must not
+inflate the rate that would pause them). Rate = `fail / (ok + fail) * 100`, evaluated
+only once `ok + fail >= tenant_guard_min_samples`.
+
+### Config
+
+Bootstrap defaults live in the initializer (`config.tenant_guard_*`) / daemon YAML
+(`tenant_guard_*`); the **effective** values are layered from
+`kafka_batch:tenant_guard:settings` (edited on the dashboard page) over those.
+See the initializer template for the full list. All default off / conservative
+(`tenant_guard_enabled = false`, `mitigation = :throttle`).
+
+### Cross-runtime split
+
+Both runtimes feed the error window (they thread `tenant_id` onto `job.processed` /
+`job.failed` / `job.retried`) and both honor enforcement (partition pause + weight,
+which they already read). The evaluator + reconciler run on whichever control plane
+is up, guarded by `kafka_batch:tenant_guard:lock`. The dashboard page + settings
+editing stay Ruby-only (like alerts Send-test).
+
 ## Instrumentation
 
 Events publish via `ActiveSupport::Notifications` when Rails/AS is loaded:
@@ -1640,6 +1715,10 @@ Events publish via `ActiveSupport::Notifications` when Rails/AS is loaded:
 | `dlt.published.kafka_batch` | Dead letter (all paths via `KafkaBatch::Dlt`) |
 | `consumer.priority_yielded.kafka_batch` | Priority gate paused |
 | `reconciler.ran.kafka_batch` | Sweep finished |
+
+`job.processed`, `job.retried`, and `job.failed` carry a `tenant_id` field
+(present for fairness jobs, `nil` otherwise) — this is what feeds the per-tenant
+error-rate window used by the [Tenant guard](#tenant-guard-per-tenant-error-rate-pause--throttle).
 
 These events are the integration point for the built-in metrics bridge below.
 
