@@ -23,6 +23,7 @@ module KafkaBatch
           "schedule_inflight" => schedule_zcard("kafka_batch:sched:inflight"),
           "dlt_per_minute" => State.dlt_count_last_minute,
           "cron_stale" => State.cron_stale_entries,
+          "tenant_error_rates" => tenant_error_rates,
           "sampled_at" => Time.now.utc.iso8601
         }
       end
@@ -67,6 +68,19 @@ module KafkaBatch
         KafkaBatch::Lag.pending_total.to_i
       rescue StandardError
         0
+      end
+
+      # Per-tenant error-rate rows for the tenant_error_rate_high rule. Empty
+      # unless the guard is enabled; each row already meets min_samples so the
+      # rule only compares against the rate threshold. One Redis read per active
+      # tenant per tick.
+      def tenant_error_rates
+        return [] unless defined?(KafkaBatch::TenantGuard)
+
+        KafkaBatch::TenantGuard.error_rate_samples
+      rescue StandardError => e
+        KafkaBatch.logger.debug("[KafkaBatch][Alerts::Sampler] tenant_error_rates failed: #{e.message}")
+        []
       end
 
       def paused_topic_keys

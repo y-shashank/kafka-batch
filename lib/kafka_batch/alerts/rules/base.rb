@@ -81,7 +81,8 @@ module KafkaBatch
           FairnessIngestBackedUp,
           DltRateHigh,
           ScheduleDepthHigh,
-          CronStale
+          CronStale,
+          TenantErrorRateHigh
         ]
       end
 

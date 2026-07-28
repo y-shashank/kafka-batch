@@ -41,6 +41,54 @@ module KafkaBatch
         nil
       end
 
+      # Per-tenant error-rate rows for active tenants that meet the minimum
+      # sample count, using the effective guard thresholds. Consumed by the
+      # alerts Sampler → tenant_error_rate_high rule. Returns [] when disabled.
+      def error_rate_samples(at: Time.now)
+        return [] unless enabled?
+
+        win  = effective_window_seconds
+        min  = effective_min_samples
+        incl = effective_include_retries
+
+        Recorder.active_tenants(within_seconds: win, at: at).filter_map do |tid|
+          r = Recorder.error_rate(
+            tid, window_seconds: win, min_samples: min, include_retries: incl, at: at
+          )
+          next unless r
+
+          {
+            "tenant_id" => tid,
+            "rate"      => r[:rate],
+            "samples"   => r[:samples],
+            "ok"        => r[:ok],
+            "fail"      => r[:fail],
+            "retry"     => r[:retry]
+          }
+        end
+      rescue StandardError
+        []
+      end
+
+      # Effective thresholds. In this phase these read the static config; a later
+      # phase layers the runtime settings page over them. Kept as one method each
+      # so callers never branch on config vs settings.
+      def effective_error_rate_pct
+        KafkaBatch.config.tenant_guard_error_rate_pct.to_f
+      end
+
+      def effective_window_seconds
+        KafkaBatch.config.tenant_guard_window_seconds.to_i
+      end
+
+      def effective_min_samples
+        KafkaBatch.config.tenant_guard_min_samples.to_i
+      end
+
+      def effective_include_retries
+        !!KafkaBatch.config.tenant_guard_include_retries
+      end
+
       # Testing / reset hook.
       def reset!
         @recorder_installed = false

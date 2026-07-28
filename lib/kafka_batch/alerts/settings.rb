@@ -42,6 +42,7 @@ module KafkaBatch
       RULE_IDS = %w[
         lag_stuck_growing redis_rtt_high no_live_consumers reconciler_stale
         fairness_ingest_backed_up dlt_rate_high schedule_depth_high cron_stale
+        tenant_error_rate_high
       ].freeze
 
       class << self
