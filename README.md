@@ -7,6 +7,10 @@
 
 Built on [Karafka](https://karafka.io) (WaterDrop + consumers). **Go runtime:** [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go).
 
+![KafkaBatch operations console — Batches](docs/screenshots/dashboard-batches.png)
+
+*The built-in operations console: batch progress + counters, retries, dead-letter, Kafka lag, multi-tenant fairness & weights, health alerts, and the per-tenant guard — all in one React dashboard mounted in your app.*
+
 ---
 
 ## Table of contents
@@ -1124,6 +1128,11 @@ bundle exec karafka server --include-consumer-groups myapp.kafka-batch-jobs-fast
 
 Opt in per worker with `fairness_type :time` or `:throughput`. Two independent lanes run simultaneously:
 
+![Time fairness — ingest partitions and ready topics per runtime](docs/screenshots/fairness-time.png)
+
+*The fairness page shows each tenant's dedicated ingest partition and the ready-topic lag split by runtime (Ruby vs Go) — the same WFQ lane consumed by both.*
+
+
 | Lane | `fairness_type` | Shares |
 |---|---|---|
 | Time | `:time` (default) | Weighted **wall-clock** execution time |
@@ -1546,6 +1555,10 @@ The `/lag` page shows a tooltip on Pause/Resume buttons explaining the delay. Pa
 
 Opt-in control-plane evaluator that samples health signals, applies hysteresis in Redis, and notifies Slack / webhook / email / metrics. Configure from the dashboard at **`/alerts`** (settings hot-reload on the next tick). Default **off**.
 
+![Health alerts — channels and rule thresholds](docs/screenshots/alerts.png)
+
+*Channels (Slack / webhook / email / metrics) and per-rule thresholds, including the `tenant_error_rate_high` rule that links straight to the Tenant guard page.*
+
 ### How it works
 
 ```
@@ -1682,6 +1695,10 @@ A control plane that watches a **sliding per-tenant error-rate window** and can
 firing a host callback so the app can page, open a ticket, or throttle further.
 It is a *sibling* to consumption pause and the alerts evaluator, not a rival: it
 reuses their patterns (Redis + cached snapshot, NX-locked evaluator, hysteresis).
+
+![Tenant guard — global triggers, active controls with auto-reset countdown, audit log](docs/screenshots/tenant-guard.png)
+
+*The Tenant guard page: global triggers (thresholds + mitigation mode), live active controls with an auto-reset countdown and per-tenant / all reset, and an audit log of every manual and automatic action.*
 
 ### Scope: fairness lanes only
 

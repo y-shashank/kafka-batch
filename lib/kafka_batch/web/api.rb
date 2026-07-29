@@ -141,7 +141,7 @@ module KafkaBatch
           ai_enabled: KafkaBatch.config.ai_knowledge_enabled,
           ai_live_data_enabled: KafkaBatch.config.ai_knowledge_enabled && KafkaBatch.config.ai_live_data_enabled,
           alerts_ui_enabled: true,
-          tenant_guard_ui_enabled: defined?(KafkaBatch::TenantGuard),
+          tenant_guard_ui_enabled: !defined?(KafkaBatch::TenantGuard).nil?,
           ai_suggested_prompts: (
             if KafkaBatch.config.ai_knowledge_enabled && defined?(KafkaBatch::Ai::LiveData)
               KafkaBatch::Ai::LiveData.suggested_prompts
