@@ -25,6 +25,7 @@ import { AuditPage } from './pages/AuditPage'
 import { PerformancePage } from './pages/PerformancePage'
 import { AiSettingsPage } from './pages/AiSettingsPage'
 import { AlertsPage } from './pages/AlertsPage'
+import { TenantGuardPage } from './pages/TenantGuardPage'
 
 const LIVE_KEY = 'kafka_batch_live'
 
@@ -73,6 +74,7 @@ function AppRoutes({
         <Route path="performance" element={<PerformancePage />} />
         <Route path="ai" element={<AiSettingsPage />} />
         <Route path="alerts" element={<AlertsPage />} />
+        <Route path="tenant_guard" element={<TenantGuardPage />} />
         <Route path="fairness/:type" element={<FairnessPage />} />
         <Route path="fairness" element={<Navigate to="/fairness/time" replace />} />
         <Route path="weights/:type" element={<WeightsPage />} />

@@ -36,6 +36,7 @@ import TuneOutlinedIcon from '@mui/icons-material/TuneOutlined'
 import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined'
 import SmartToyOutlinedIcon from '@mui/icons-material/SmartToyOutlined'
 import NotificationsActiveOutlinedIcon from '@mui/icons-material/NotificationsActiveOutlined'
+import ShieldOutlinedIcon from '@mui/icons-material/ShieldOutlined'
 import FiberManualRecordIcon from '@mui/icons-material/FiberManualRecord'
 import DarkModeOutlinedIcon from '@mui/icons-material/DarkModeOutlined'
 import LightModeOutlinedIcon from '@mui/icons-material/LightModeOutlined'
@@ -56,6 +57,7 @@ type NavItem = {
   auditOnly?: boolean
   performanceOnly?: boolean
   aiOnly?: boolean
+  guardOnly?: boolean
 }
 
 function readCollapsed(): boolean {
@@ -129,6 +131,7 @@ export function AppLayout({
         items: [
           { to: '/reconciler', label: 'Reconciler', icon: <SyncOutlinedIcon fontSize="small" /> },
           { to: '/alerts', label: 'Alerts', icon: <NotificationsActiveOutlinedIcon fontSize="small" /> },
+          { to: '/tenant_guard', label: 'Tenant guard', icon: <ShieldOutlinedIcon fontSize="small" />, guardOnly: true },
           { to: '/audit', label: 'Audit log', icon: <HistoryOutlinedIcon fontSize="small" />, auditOnly: true },
           { to: '/ai', label: 'AI Settings', icon: <SmartToyOutlinedIcon fontSize="small" />, aiOnly: true },
           { to: '/system', label: 'System', icon: <SettingsOutlinedIcon fontSize="small" /> },
@@ -171,7 +174,8 @@ export function AppLayout({
             (n) =>
               (!n.auditOnly || bootstrap?.audit_enabled) &&
               (!n.performanceOnly || bootstrap?.performance_metrics_enabled) &&
-              (!n.aiOnly || bootstrap?.ai_enabled),
+              (!n.aiOnly || bootstrap?.ai_enabled) &&
+              (!n.guardOnly || bootstrap?.tenant_guard_ui_enabled),
           )
           if (!items.length) return null
           return (

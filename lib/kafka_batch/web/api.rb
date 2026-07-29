@@ -106,6 +106,18 @@ module KafkaBatch
           alerts_test(env)
         elsif method == "DELETE" && path == "/api/alerts/settings/secrets"
           alerts_clear_secret(env)
+        elsif method == "GET" && path == "/api/tenant_guard"
+          tenant_guard_status
+        elsif method == "PUT" && path == "/api/tenant_guard/settings"
+          tenant_guard_settings_update(env)
+        elsif method == "POST" && path == "/api/tenant_guard/pause"
+          tenant_guard_apply(:pause, env, params)
+        elsif method == "POST" && path == "/api/tenant_guard/throttle"
+          tenant_guard_apply(:throttle, env, params)
+        elsif method == "POST" && path == "/api/tenant_guard/reset"
+          tenant_guard_reset(env, params)
+        elsif method == "POST" && path == "/api/tenant_guard/reset_all"
+          tenant_guard_reset_all(env)
         else
           Json.error(404, "Not found")
         end
@@ -129,6 +141,7 @@ module KafkaBatch
           ai_enabled: KafkaBatch.config.ai_knowledge_enabled,
           ai_live_data_enabled: KafkaBatch.config.ai_knowledge_enabled && KafkaBatch.config.ai_live_data_enabled,
           alerts_ui_enabled: true,
+          tenant_guard_ui_enabled: defined?(KafkaBatch::TenantGuard),
           ai_suggested_prompts: (
             if KafkaBatch.config.ai_knowledge_enabled && defined?(KafkaBatch::Ai::LiveData)
               KafkaBatch::Ai::LiveData.suggested_prompts
@@ -1426,6 +1439,123 @@ module KafkaBatch
 
       def alerts_redis_required_message
         "Alerts require Redis. Set config.redis_url (or REDIS_URL) and ensure Redis is reachable, then reload."
+      end
+
+      # ── Tenant guard ─────────────────────────────────────────────────────
+      def tenant_guard_redis_required_message
+        "Tenant guard requires Redis. Set config.redis_url (or REDIS_URL) and ensure Redis is reachable, then reload."
+      end
+
+      def tenant_guard_status
+        return Json.error(503, "Tenant guard not loaded") unless defined?(KafkaBatch::TenantGuard)
+
+        unless KafkaBatch.config.redis_configured?
+          return Json.ok(
+            ok: true, available: false, enabled: false,
+            message: tenant_guard_redis_required_message,
+            settings: KafkaBatch::TenantGuard.settings, active: [], actions: [],
+            server_time: Time.now.to_i
+          )
+        end
+
+        data = KafkaBatch::TenantGuard.list
+        Json.ok(
+          ok: true, available: true,
+          enabled: KafkaBatch::TenantGuard.enabled?,
+          settings: KafkaBatch::TenantGuard.settings,
+          active: data[:active], actions: data[:actions],
+          # server_time lets the UI render the auto-reset countdown without
+          # depending on the client clock.
+          server_time: Time.now.to_i
+        )
+      end
+
+      def tenant_guard_settings_update(env)
+        return Json.error(503, "Tenant guard not loaded") unless defined?(KafkaBatch::TenantGuard)
+        return Json.error(503, tenant_guard_redis_required_message) unless KafkaBatch.config.redis_configured?
+
+        body = json_body(env).merge(@web.body_params(env))
+        begin
+          settings = KafkaBatch::TenantGuard.update_settings(body)
+          # Hot-apply: start the control loop on control-plane processes when the
+          # guard has just been enabled (idempotent, NX-locked).
+          if settings["enabled"] && KafkaBatch::TenantGuard.control_plane_process?
+            KafkaBatch::TenantGuard.start_reconciler!
+          end
+          Json.ok(ok: true, available: true, settings: settings)
+        rescue ArgumentError => e
+          Json.error(400, e.message)
+        rescue StandardError => e
+          KafkaBatch.logger.error("[KafkaBatch::Web] tenant_guard_settings_update: #{e.class}: #{e.message}")
+          Json.error(500, e.message)
+        end
+      end
+
+      def tenant_guard_apply(action, env, params)
+        return Json.error(503, "Tenant guard not loaded") unless defined?(KafkaBatch::TenantGuard)
+        return Json.error(503, tenant_guard_redis_required_message) unless KafkaBatch.config.redis_configured?
+
+        body = params.merge(json_body(env)).merge(@web.body_params(env))
+        tid  = @web.non_empty(body["tenant_id"])
+        return Json.error(400, "tenant_id required") if tid.nil?
+
+        lane = tenant_guard_lane(body["lane"])
+        reason = @web.non_empty(body["reason"])
+        until_ts = tenant_guard_until(body["until_seconds"])
+
+        begin
+          record =
+            if action == :pause
+              KafkaBatch::TenantGuard.pause!(tid, lane: lane, reason: reason, source: "api", until_ts: until_ts)
+            else
+              w = @web.non_empty(body["weight"])
+              KafkaBatch::TenantGuard.throttle!(
+                tid, lane: lane, weight: (w && w.to_f), reason: reason, source: "api", until_ts: until_ts
+              )
+            end
+          Json.ok(ok: true, record: record)
+        rescue KafkaBatch::TenantGuard::Control::Unavailable => e
+          Json.error(503, e.message)
+        rescue KafkaBatch::TenantGuard::Control::Unresolvable => e
+          Json.error(422, e.message)
+        rescue KafkaBatch::TenantGuard::Control::Error, ArgumentError => e
+          Json.error(400, e.message)
+        end
+      end
+
+      def tenant_guard_reset(env, params)
+        return Json.error(503, "Tenant guard not loaded") unless defined?(KafkaBatch::TenantGuard)
+        return Json.error(503, tenant_guard_redis_required_message) unless KafkaBatch.config.redis_configured?
+
+        body = params.merge(json_body(env)).merge(@web.body_params(env))
+        tid  = @web.non_empty(body["tenant_id"])
+        return Json.error(400, "tenant_id required") if tid.nil?
+
+        KafkaBatch::TenantGuard.release!(tid, source: "api")
+        Json.ok(ok: true, tenant_id: tid)
+      end
+
+      def tenant_guard_reset_all(_env)
+        return Json.error(503, "Tenant guard not loaded") unless defined?(KafkaBatch::TenantGuard)
+        return Json.error(503, tenant_guard_redis_required_message) unless KafkaBatch.config.redis_configured?
+
+        n = KafkaBatch::TenantGuard.release_all!(source: "api")
+        Json.ok(ok: true, reset: n)
+      end
+
+      def tenant_guard_lane(v)
+        l = v.to_s.strip
+        %w[time throughput].include?(l) ? l.to_sym : :time
+      end
+
+      # Convert a UI-supplied duration (seconds) into an absolute `until` epoch.
+      # Blank / non-positive ⇒ nil (manual — no auto-release).
+      def tenant_guard_until(v)
+        s = v.to_s.strip
+        return nil if s.empty?
+
+        n = s.to_i
+        n.positive? ? (Time.now.to_i + n) : nil
       end
 
       def performance_range(params)
