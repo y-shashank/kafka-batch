@@ -136,8 +136,21 @@ module KafkaBatch
         end
 
         def normalized_window(window_seconds)
-          win = (window_seconds || KafkaBatch.config.tenant_guard_window_seconds).to_i
+          win = (window_seconds || default_window).to_i
           win < 60 ? 60 : win
+        end
+
+        # Prefer the effective (runtime settings) window so bucket TTLs track a
+        # window an operator raised on the dashboard; fall back to config.
+        def default_window
+          if defined?(KafkaBatch::TenantGuard) &&
+             KafkaBatch::TenantGuard.respond_to?(:effective_window_seconds)
+            KafkaBatch::TenantGuard.effective_window_seconds
+          else
+            KafkaBatch.config.tenant_guard_window_seconds
+          end
+        rescue StandardError
+          KafkaBatch.config.tenant_guard_window_seconds
         end
 
         def zero_counts

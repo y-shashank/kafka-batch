@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "tenant_guard/recorder"
+require_relative "tenant_guard/settings"
 require_relative "tenant_guard/state"
 require_relative "tenant_guard/control"
 require_relative "tenant_guard/reconciler"
@@ -18,12 +19,11 @@ module KafkaBatch
   # Nothing here ever raises into the job hot path.
   module TenantGuard
     class << self
-      # Whether the guard is active. In this phase this reads the static config
-      # flag; a later phase layers the runtime settings page over it (effective
-      # = Redis settings ← config). Kept as a single method so callers never
-      # branch on config vs settings directly.
+      # Whether the guard is active. Effective value = runtime settings page
+      # (Redis) layered over the static config default; cached per-process so the
+      # hot job-event path stays cheap.
       def enabled?
-        KafkaBatch.config.tenant_guard_enabled
+        !!Settings.effective["enabled"]
       rescue StandardError
         false
       end
@@ -73,23 +73,30 @@ module KafkaBatch
         []
       end
 
-      # Effective thresholds. In this phase these read the static config; a later
-      # phase layers the runtime settings page over them. Kept as one method each
-      # so callers never branch on config vs settings.
+      # Effective thresholds = runtime settings layered over config defaults.
       def effective_error_rate_pct
-        KafkaBatch.config.tenant_guard_error_rate_pct.to_f
+        Settings.effective["error_rate_pct"].to_f
       end
 
       def effective_window_seconds
-        KafkaBatch.config.tenant_guard_window_seconds.to_i
+        Settings.effective["window_seconds"].to_i
       end
 
       def effective_min_samples
-        KafkaBatch.config.tenant_guard_min_samples.to_i
+        Settings.effective["min_samples"].to_i
       end
 
       def effective_include_retries
-        !!KafkaBatch.config.tenant_guard_include_retries
+        !!Settings.effective["include_retries"]
+      end
+
+      # Full effective settings hash (dashboard + mitigation policy).
+      def settings(refresh: false)
+        Settings.effective(refresh: refresh)
+      end
+
+      def update_settings(partial)
+        Settings.update(partial)
       end
 
       # ── Control surface (delegates to Control; used by API/UI + mitigation) ──
