@@ -840,6 +840,23 @@ module KafkaBatch
         nil
       end
 
+      # Raw stored weight override for a tenant on THIS lane, or nil when the
+      # tenant has no explicit override (running at the default). Unlike
+      # #weight_for this does NOT coerce a missing/zero entry to the default —
+      # the tenant guard needs to know whether to restore a specific value or
+      # simply remove the override when it releases a throttle. Reads through the
+      # backend (not the process-local cache) so it reflects a just-written value.
+      # PUBLIC: called by TenantGuard::Control.
+      def weight_override(tenant_id)
+        raw = with { |r| r.hget(@weight, tenant_id.to_s) }
+        return nil if raw.nil?
+
+        f = raw.to_f
+        f.positive? ? f : nil
+      rescue StandardError
+        nil
+      end
+
       # Register tenant IDs as "seen" without touching WFQ mechanics (HSETNX so
       # existing accumulated vtime is never overwritten). Called by the Dispatcher
       # so tenants appear on the weights page on their first job.
@@ -977,22 +994,6 @@ module KafkaBatch
       def weight_for(tenant_id)
         w = cached_weights[tenant_id.to_s]
         (w && w > 0) ? w : @default_weight
-      end
-
-      # Raw stored weight override for a tenant on THIS lane, or nil when the
-      # tenant has no explicit override (running at the default). Unlike
-      # #weight_for this does NOT coerce a missing/zero entry to the default —
-      # the tenant guard needs to know whether to restore a specific value or
-      # simply remove the override when it releases a throttle. Reads through the
-      # backend (not the process-local cache) so it reflects a just-written value.
-      def weight_override(tenant_id)
-        raw = with { |r| r.hget(@weight, tenant_id.to_s) }
-        return nil if raw.nil?
-
-        f = raw.to_f
-        f.positive? ? f : nil
-      rescue StandardError
-        nil
       end
 
       def bust_weight_cache!
