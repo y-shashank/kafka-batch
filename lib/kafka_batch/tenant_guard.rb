@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require_relative "tenant_guard/recorder"
+require_relative "tenant_guard/state"
+require_relative "tenant_guard/control"
 
 module KafkaBatch
   # Per-tenant error-rate guard (fairness lanes only). Watches a sliding
@@ -89,10 +91,37 @@ module KafkaBatch
         !!KafkaBatch.config.tenant_guard_include_retries
       end
 
-      # Testing / reset hook.
+      # ── Control surface (delegates to Control; used by API/UI + mitigation) ──
+      def pause!(tenant_id, **kw)
+        Control.pause!(tenant_id, **kw)
+      end
+
+      def throttle!(tenant_id, **kw)
+        Control.throttle!(tenant_id, **kw)
+      end
+
+      # Release a single tenant's active control (resume/restore + audit close).
+      def release!(tenant_id, **kw)
+        Control.reset!(tenant_id, **kw)
+      end
+
+      def release_all!(**kw)
+        Control.reset_all!(**kw)
+      end
+
+      def status(tenant_id)
+        Control.status(tenant_id)
+      end
+
+      def list(**kw)
+        Control.list(**kw)
+      end
+
+      # Testing hook: clears process-local caches (does NOT touch Redis state).
       def reset!
         @recorder_installed = false
         Recorder.reset!
+        State.reset!
       end
 
       private
