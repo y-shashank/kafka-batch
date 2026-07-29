@@ -24,13 +24,9 @@ module KafkaBatch
           s = TenantGuard.settings
           mode = s["mitigation"].to_s
           return empty_summary if mode == "none"
-          return empty_summary unless State.try_lock!(ttl: lock_ttl)
 
-          begin
-            evaluate_and_act(s, mode, at: at)
-          ensure
-            State.unlock!
-          end
+          result = State.with_lock(ttl: lock_ttl) { evaluate_and_act(s, mode, at: at) }
+          result == :busy ? empty_summary : result
         end
 
         private
@@ -125,12 +121,13 @@ module KafkaBatch
 
         def apply_action(tid, action, throttle_w:, until_ts:, rate:, threshold:)
           reason = "error_rate_guard: rate #{rate[:rate].round(1)}% >= #{threshold}% over #{rate[:samples]} samples"
+          # lock: false — run_once! already holds the shared lock for this pass.
           case action
           when "throttle"
             Control.throttle!(tid, weight: throttle_w, reason: reason,
-                              source: GUARD_SOURCE, until_ts: until_ts)
+                              source: GUARD_SOURCE, until_ts: until_ts, lock: false)
           when "pause"
-            Control.pause!(tid, reason: reason, source: GUARD_SOURCE, until_ts: until_ts)
+            Control.pause!(tid, reason: reason, source: GUARD_SOURCE, until_ts: until_ts, lock: false)
           end
         end
 

@@ -126,15 +126,48 @@ module KafkaBatch
           redis_with { |r| r.get("#{BREACH_PREFIX}#{tenant_id}") }.to_i
         end
 
-        # ── Locking (shared with the reconciler; NX single-flight) ──────────
+        # ── Locking (shared by mitigation, reconciler, and API control ops) ──
+        # Token-based NX single-flight so a pass that overruns its TTL cannot
+        # DEL a lock another control plane has since acquired. try_lock! returns
+        # the token (truthy) or nil; unlock! releases only if the token matches
+        # (Lua compare-and-delete).
+        RELEASE_LUA = <<~LUA
+          if redis.call('get', KEYS[1]) == ARGV[1] then
+            return redis.call('del', KEYS[1])
+          else
+            return 0
+          end
+        LUA
+
         def try_lock!(ttl:)
-          won = redis_with { |r| r.set(LOCK_KEY, "1", nx: true, ex: [ttl.to_i, 2].max) }
-          won == true || won == "OK"
+          token = SecureRandom.hex(16)
+          won = redis_with { |r| r.set(LOCK_KEY, token, nx: true, ex: [ttl.to_i, 2].max) }
+          (won == true || won == "OK") ? token : nil
         end
 
-        def unlock!
-          redis_with { |r| r.del(LOCK_KEY) }
+        def unlock!(token)
+          return if token.nil? || token.to_s.empty?
+
+          redis_with { |r| r.eval(RELEASE_LUA, keys: [LOCK_KEY], argv: [token.to_s]) }
           nil
+        rescue StandardError
+          nil
+        end
+
+        # Run a block under the shared lock. `wait` (seconds) bounds how long to
+        # retry acquiring before giving up (API ops set this so they queue behind
+        # an in-progress control-plane pass instead of racing it). Yields and
+        # returns the block's value when the lock is held; returns :busy if the
+        # lock could not be acquired within `wait`.
+        def with_lock(ttl:, wait: 0.0)
+          token = acquire(ttl: ttl, wait: wait)
+          return :busy unless token
+
+          begin
+            yield
+          ensure
+            unlock!(token)
+          end
         end
 
         def reset!
@@ -142,6 +175,22 @@ module KafkaBatch
         end
 
         private
+
+        # Try to acquire the lock, retrying (small backoff) up to `wait` seconds.
+        def acquire(ttl:, wait:)
+          deadline = monotonic + [wait.to_f, 0.0].max
+          loop do
+            token = try_lock!(ttl: ttl)
+            return token if token
+            return nil if monotonic >= deadline
+
+            sleep(0.05)
+          end
+        end
+
+        def monotonic
+          Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        end
 
         def record_key(tenant_id)
           "#{RECORD_PREFIX}#{tenant_id}"

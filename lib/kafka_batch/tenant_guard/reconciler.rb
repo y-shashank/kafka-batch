@@ -25,10 +25,9 @@ module KafkaBatch
         # (tests) or from the loop. NX-locked so only one control plane acts.
         def reconcile_once!(at: Time.now)
           return empty_summary unless State.available?
-          return empty_summary unless State.try_lock!(ttl: lock_ttl)
 
-          summary = empty_summary
-          begin
+          result = State.with_lock(ttl: lock_ttl) do
+            summary = empty_summary
             State.index_members.each do |tid|
               record = State.get_record(tid)
               next if record.nil?
@@ -40,10 +39,9 @@ module KafkaBatch
             rescue StandardError => e
               KafkaBatch.logger.warn("[KafkaBatch][TenantGuard::Reconciler] tenant=#{tid}: #{e.message}")
             end
-          ensure
-            State.unlock!
+            summary
           end
-          summary
+          result == :busy ? empty_summary : result
         end
 
         def start!(interval: nil)

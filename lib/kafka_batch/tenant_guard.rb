@@ -165,13 +165,16 @@ module KafkaBatch
 
       def subscribe_job_event(event)
         ActiveSupport::Notifications.subscribe(/#{Regexp.escape(event)}\.kafka_batch\z/) do |*args|
-          next unless enabled?
-
-          payload = ActiveSupport::Notifications::Event.new(*args).payload || {}
-          tid = payload[:tenant_id] || payload["tenant_id"]
-          next if tid.nil? || tid.to_s.empty?
-
+          # Whole body guarded: AS::Notifications does not rescue subscriber
+          # exceptions, and this runs on the job thread — recording must never
+          # raise into the hot path (payload parse included).
           begin
+            next unless enabled?
+
+            payload = ActiveSupport::Notifications::Event.new(*args).payload || {}
+            tid = payload[:tenant_id] || payload["tenant_id"]
+            next if tid.nil? || tid.to_s.empty?
+
             yield tid.to_s
           rescue StandardError
             nil

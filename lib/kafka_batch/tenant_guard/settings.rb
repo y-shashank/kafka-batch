@@ -9,8 +9,10 @@ module KafkaBatch
     # Runtime-editable guard settings, layered over the static config defaults —
     # the same pattern as Alerts::Settings. Stored in a versioned Redis hash so a
     # change on the dashboard page takes effect everywhere without a redeploy.
-    # `effective` is cached per-process (short TTL + version check) so the hot
-    # `enabled?` path does not hit Redis on every job event.
+    # `effective` is cached per-process for a short TTL so the hot `enabled?`
+    # path does not hit Redis on every job event; a change made elsewhere
+    # therefore propagates within CACHE_TTL. The writer busts its own cache
+    # immediately. (`version` is tracked for observability, not cache keying.)
     module Settings
       KEY         = "kafka_batch:tenant_guard:settings"
       VERSION_KEY = "kafka_batch:tenant_guard:settings:version"
@@ -52,7 +54,7 @@ module KafkaBatch
         end
 
         # Effective values = Redis overrides layered over config defaults.
-        # Cached for CACHE_TTL and invalidated when the version key changes.
+        # Cached per-process for CACHE_TTL (see class docs).
         def effective(refresh: false)
           if !refresh && @cache && (Time.now.to_f - @cache_at.to_f) < CACHE_TTL
             return @cache
