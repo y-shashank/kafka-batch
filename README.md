@@ -1914,7 +1914,7 @@ Workers use `include KafkaBatch::Worker` and run under Karafka instead of Sideki
 | `kafka_batch:b:{id}` | Batch hash (counters, status, callbacks) |
 | `kafka_batch:b:bitmap:{id}` | Completion dedup (~1 bit / `batch_seq`) |
 | `kafka_batch:b:seq:{id}` | Monotonic `batch_seq` allocator |
-| `kafka_batch:uniq:{digest}` | Uniqueness lock (8-byte binary suffix) |
+| `kb:uniq:{digest}` | Uniqueness lock (16-byte binary suffix; short prefix to save RAM) |
 | `kafka_batch:index:running` | Reconciler — stuck batches |
 | `kafka_batch:index:done` | Reconciler — lost callbacks |
 | `kafka_batch:sched:pending` | Delayed-job pointers (ZSET) |

@@ -16,7 +16,11 @@ module KafkaBatch
   # Jobs carry `_uniq_fp` (hex) on the wire so release uses the same material
   # as claim even after JSON round-trip.
   module Uniqueness
-    KEY_PREFIX = "kafka_batch:uniq:"
+    # Short prefix to minimise RAM per lock (~16 bytes/key vs the old
+    # "kafka_batch:uniq:"). MUST stay byte-identical to kafka-batch-go's
+    # uniq.KeyPrefix — both runtimes share this keyspace, so a mismatch would
+    # break cross-runtime dedup/release. Change the two in lock-step.
+    KEY_PREFIX = "kb:uniq:"
 
     RELEASE_LUA = <<~LUA
       if redis.call('GET', KEYS[1]) == ARGV[1] then

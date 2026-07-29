@@ -671,7 +671,7 @@ Idle vtime reset: `fairness_reset_vtime_when_idle` (default true, both runtimes;
 
 `uniq true` on Worker / manifest (`uniq_enabled` master switch default true).
 
-- Key: `kafka_batch:uniq:` + XXHash64 digest (16-byte dual hash; legacy 8-byte also released)
+- Key: `kb:uniq:` + XXHash64 digest (16-byte dual hash; legacy 8-byte also released). Prefix shortened from `kafka_batch:uniq:` to save ~16 bytes RAM per lock; MUST match kafka-batch-go `uniq.KeyPrefix`
 - Material: `worker_class + "\x00" + canonical JSON payload` (deep-sorted keys; HTML escape disabled for Oj/Go parity)
 - Wire: `_uniq_fp` hex for release without re-hash
 - Claim SETNX; release compare-and-delete Lua
@@ -1226,7 +1226,7 @@ Optional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets maske
 | `kafka_batch:index:all` | UI listing ZSET |
 | `kafka_batch:index:cancelled` | Cancelled ZSET |
 | `kafka_batch:counts` | Status counters HASH |
-| `kafka_batch:uniq:{digest}` | Uniqueness locks |
+| `kb:uniq:{digest}` | Uniqueness locks |
 | `kafka_batch:sched:pending` | Schedule index |
 | `kafka_batch:sched:inflight` | Schedule leases |
 | `kafka_batch:sched:read_miss` | Schedule read failures |
