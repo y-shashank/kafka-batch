@@ -129,7 +129,14 @@ module KafkaBatch
             # Record per-tenant error rates on execution pods (where job events
             # fire). No-op unless the guard is enabled and the job carries a
             # tenant_id (fairness lanes).
-            KafkaBatch::TenantGuard.install_recorder! if defined?(KafkaBatch::TenantGuard)
+            if defined?(KafkaBatch::TenantGuard)
+              KafkaBatch::TenantGuard.install_recorder!
+              # Auto-disengage + drift-repair loop runs on the control plane only
+              # (NX-locked). Started when the guard is enabled.
+              if KafkaBatch::TenantGuard.enabled? && KafkaBatch::TenantGuard.control_plane_process?
+                KafkaBatch::TenantGuard.start_reconciler!
+              end
+            end
           rescue => e
             KafkaBatch.logger.warn("[KafkaBatch] alerts evaluator start skipped: #{e.message}")
           end

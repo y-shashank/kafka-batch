@@ -3,6 +3,7 @@
 require_relative "tenant_guard/recorder"
 require_relative "tenant_guard/state"
 require_relative "tenant_guard/control"
+require_relative "tenant_guard/reconciler"
 
 module KafkaBatch
   # Per-tenant error-rate guard (fairness lanes only). Watches a sliding
@@ -117,9 +118,31 @@ module KafkaBatch
         Control.list(**kw)
       end
 
+      # ── Reconciler (auto-disengage + drift repair; control plane only) ──────
+      # Start the background loop. Idempotent. Call on the control plane when the
+      # guard is enabled; the loop is NX-locked so multiple replicas are safe.
+      def start_reconciler!(**kw)
+        Reconciler.start!(**kw)
+      end
+
+      def reconcile_once!(**kw)
+        Reconciler.reconcile_once!(**kw)
+      end
+
+      # Whether this process should host the guard control loop. Reuses the
+      # alerts control-plane detection so the guard runs where alerts run.
+      def control_plane_process?
+        if defined?(KafkaBatch::Alerts) && KafkaBatch::Alerts.respond_to?(:control_plane_process?)
+          KafkaBatch::Alerts.control_plane_process?
+        else
+          true
+        end
+      end
+
       # Testing hook: clears process-local caches (does NOT touch Redis state).
       def reset!
         @recorder_installed = false
+        Reconciler.stop!
         Recorder.reset!
         State.reset!
       end

@@ -1686,11 +1686,19 @@ See the initializer template for the full list. All default off / conservative
 
 ### Cross-runtime split
 
-Both runtimes feed the error window (they thread `tenant_id` onto `job.processed` /
-`job.failed` / `job.retried`) and both honor enforcement (partition pause + weight,
-which they already read). The evaluator + reconciler run on whichever control plane
-is up, guarded by `kafka_batch:tenant_guard:lock`. The dashboard page + settings
-editing stay Ruby-only (like alerts Send-test).
+Both runtimes **feed the error window** (they thread `tenant_id` onto
+`job.processed` / `job.failed` / `job.retried`) and both **fire the
+`tenant_error_rate_high` alert** (shared alerts evaluator + NX single-fire) and
+**honor enforcement** (a paused ingest partition and a throttled weight are both
+things the Go daemon already reads).
+
+The **action side is Ruby-owned**: the control service (pause / throttle /
+reset), the reconciler (auto-disengage + drift repair, NX-locked via
+`kafka_batch:tenant_guard:lock`), the auto-mitigation policy, and the dashboard +
+settings editing all run on the Ruby control plane — the same runtime that hosts
+the web UI. A Go-only control plane therefore still records rates and alerts, but
+does not auto-mitigate or auto-release; run a Ruby control-plane replica to get
+those. (This mirrors how the alerts dashboard "Send test" is Ruby-only.)
 
 ## Instrumentation
 
