@@ -1225,6 +1225,61 @@ Set `scheduled` topic retention ≥ `max_schedule_horizon` (default 7 days).
 
 ---
 
+## Recurring (cron) schedules
+
+Fire a registered handler on a repeating **cron schedule** (the sidekiq-cron /
+`whenever` equivalent). Unlike delayed jobs (a one-shot `perform_at`), a recurring
+schedule is a durable row that keeps firing on its cron expression until paused or
+deleted. It is **cross-runtime**: the Ruby ticker
+([`lib/kafka_batch/recurring/ticker.rb`](lib/kafka_batch/recurring/ticker.rb)) and
+the Go daemon (`pkg/cron`) are twins that share the same MySQL tables and Redis
+leader lock, so a Ruby control plane, a Go `kbatch daemon`, or both together run
+the same schedules safely.
+
+### How it works
+
+- **Definitions** live in MySQL `kafka_batch_recurring_schedules` (cron expression,
+  `job_type`, payload, `next_run_at`, enabled flag). Register / pause / resume /
+  delete them from the dashboard `/recurring` page (or the Go daemon).
+- **Exactly-once firing** rests on the `kafka_batch_recurring_fires` ledger, whose
+  `(schedule_id, fire_at)` primary key makes a duplicate emit an `INSERT IGNORE`
+  no-op — whether the duplicate comes from a leader flap, a retried tick, or the
+  Ruby ticker and Go daemon running concurrently. The Redis leader lock (shared
+  `SET NX EX` key with `pkg/cron/lock.go`) is only an optimization; correctness
+  comes from the ledger.
+- Each tick, the elected leader claims due schedules (`FOR UPDATE SKIP LOCKED`),
+  plans fire instants with **misfire policy** (`recurring_misfire_grace`,
+  `recurring_max_backfill`), enqueues each fire via the normal `enqueue_job`
+  routing (so fair / plain / priority handlers all work), advances `next_run_at`,
+  and periodically recovers pending fires and prunes the ledger.
+- It never runs arbitrary code — only a `job_type` already in your handler manifest.
+
+### Enable
+
+```ruby
+# On the pods that should run the ticker (like the schedule poller — usually the
+# control plane, NOT execution-only pods):
+config.recurring_scheduler_enabled = true
+# config.recurring_window          = 30    # resolution / poll seconds
+# config.recurring_lock_ttl        = 60    # leader-lease TTL seconds
+# config.recurring_misfire_grace   = 60    # instants within this of now always fire
+# config.recurring_max_backfill    = 1000  # cap fires per schedule per tick (backfill)
+```
+
+Run the migrations that create the two tables first (installer, or the Go daemon's
+`--recurring` migration copy). The `/recurring` page reports "feature not
+installed" until the tables exist.
+
+### Monitoring
+
+The [`cron_stale`](lib/kafka_batch/alerts/rules/cron_stale.rb) health-alert rule
+fires when an enabled schedule has been idle longer than `stale_factor × its cron
+interval` (via `cron.stale` Redis markers the ticker emits), so a wedged leader or
+a schedule that stopped firing pages you. See the [Health alerts](#health-alerts)
+section.
+
+---
+
 ## Unique jobs & expiration
 
 ### Uniqueness (`uniq true`)
