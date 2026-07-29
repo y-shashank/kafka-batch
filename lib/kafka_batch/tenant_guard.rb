@@ -4,6 +4,7 @@ require_relative "tenant_guard/recorder"
 require_relative "tenant_guard/settings"
 require_relative "tenant_guard/state"
 require_relative "tenant_guard/control"
+require_relative "tenant_guard/mitigation"
 require_relative "tenant_guard/reconciler"
 
 module KafkaBatch
@@ -134,6 +135,12 @@ module KafkaBatch
 
       def reconcile_once!(**kw)
         Reconciler.reconcile_once!(**kw)
+      end
+
+      # One auto-mitigation pass (breach → action). Normally driven by the
+      # reconciler loop; exposed for tests and manual triggering.
+      def mitigate_once!(**kw)
+        Mitigation.run_once!(**kw)
       end
 
       # Whether this process should host the guard control loop. Reuses the

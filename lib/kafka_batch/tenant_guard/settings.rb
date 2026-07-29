@@ -16,7 +16,7 @@ module KafkaBatch
       VERSION_KEY = "kafka_batch:tenant_guard:settings:version"
       CACHE_TTL   = 5 # seconds
 
-      BOOL_FIELDS  = %w[enabled include_retries].freeze
+      BOOL_FIELDS  = %w[enabled include_retries dry_run].freeze
       INT_FIELDS   = %w[window_seconds min_samples grace_ticks reconcile_interval].freeze
       FLOAT_FIELDS = %w[error_rate_pct throttle_weight].freeze
       STR_FIELDS   = %w[mitigation].freeze
@@ -38,6 +38,7 @@ module KafkaBatch
           c = KafkaBatch.config
           {
             "enabled"              => !!c.tenant_guard_enabled,
+            "dry_run"              => !!c.tenant_guard_dry_run,
             "window_seconds"       => c.tenant_guard_window_seconds.to_i,
             "min_samples"          => c.tenant_guard_min_samples.to_i,
             "error_rate_pct"       => c.tenant_guard_error_rate_pct.to_f,

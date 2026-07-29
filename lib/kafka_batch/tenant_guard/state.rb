@@ -18,6 +18,7 @@ module KafkaBatch
       INDEX_KEY     = "kafka_batch:tenant_guard:index"
       ACTIONS_ZSET  = "kafka_batch:tenant_guard:actions"
       ACTION_PREFIX = "kafka_batch:tenant_guard:action:" # + {id}
+      BREACH_PREFIX = "kafka_batch:tenant_guard:breach:" # + {tenant_id}
       LOCK_KEY      = "kafka_batch:tenant_guard:lock"
 
       # Cap the audit log so it cannot grow without bound.
@@ -103,6 +104,26 @@ module KafkaBatch
           redis_with do |r|
             ids.map { |id| r.hgetall(action_key(id)) }
           end.reject { |h| h.nil? || h.empty? }
+        end
+
+        # ── Grace-tick breach counters (for tenant_guard_grace_ticks) ───────
+        # Returns the new count. TTL so a tenant that stops breaching decays.
+        def incr_breach!(tenant_id, ttl:)
+          key = "#{BREACH_PREFIX}#{tenant_id}"
+          redis_with do |r|
+            n = r.incr(key)
+            r.expire(key, [ttl.to_i, 60].max)
+            n
+          end.to_i
+        end
+
+        def reset_breach!(tenant_id)
+          redis_with { |r| r.del("#{BREACH_PREFIX}#{tenant_id}") }
+          nil
+        end
+
+        def breach_count(tenant_id)
+          redis_with { |r| r.get("#{BREACH_PREFIX}#{tenant_id}") }.to_i
         end
 
         # ── Locking (shared with the reconciler; NX single-flight) ──────────

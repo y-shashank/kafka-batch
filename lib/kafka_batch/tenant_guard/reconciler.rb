@@ -3,6 +3,7 @@
 require "time"
 require_relative "state"
 require_relative "control"
+require_relative "mitigation"
 
 module KafkaBatch
   module TenantGuard
@@ -54,6 +55,14 @@ module KafkaBatch
           @thread = Thread.new do
             Thread.current.name = "kb-tenant-guard-reconciler" if Thread.current.respond_to?(:name=)
             loop do
+              # Auto-mitigation first (breach → action), then reconcile (auto-
+              # release + drift). Both are NX-locked and independently rescued so
+              # one failing does not stop the other or the loop.
+              begin
+                Mitigation.run_once!
+              rescue StandardError => e
+                KafkaBatch.logger.warn("[KafkaBatch][TenantGuard::Mitigation] tick failed: #{e.message}")
+              end
               begin
                 reconcile_once!
               rescue StandardError => e

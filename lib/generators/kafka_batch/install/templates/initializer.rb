@@ -240,6 +240,14 @@ KafkaBatch.configure do |config|
   # config.tenant_guard_auto_release_seconds = 900   # auto-disengage after N sec; nil = manual reset only
   # config.tenant_guard_grace_ticks = 0              # >0 = warn ticks before acting
   # config.tenant_guard_reconcile_interval = 15      # reconciler tick (auto-release + drift repair)
+  # config.tenant_guard_dry_run = false             # evaluate + fire callback but take NO action
+  # Host callback on every guard action (real or dry-run) — page, ticket, or
+  # throttle further. Also emitted as the tenant_guard.action instrumentation event.
+  # config.tenant_guard_callback = ->(payload) {
+  #   # payload: { event:, tenant_id:, lane:, action:, mode:, source:, rate:,
+  #   #            threshold:, samples:, until:, dry_run:, at: }
+  #   MyPager.notify("tenant #{payload[:tenant_id]} #{payload[:action]} by guard")
+  # }
 
   # ── Metrics (StatsD / Datadog / custom proc) ────────────────────────────────
   # config.metrics_enabled = true

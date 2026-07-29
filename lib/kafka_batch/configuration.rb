@@ -641,6 +641,13 @@ module KafkaBatch
     attr_accessor :tenant_guard_auto_release_seconds # Integer|nil – auto-disengage after N sec; nil = manual
     attr_accessor :tenant_guard_grace_ticks          # Integer – warn ticks before acting; default 0
     attr_accessor :tenant_guard_reconcile_interval   # Integer – reconciler tick seconds; default 15
+    attr_accessor :tenant_guard_dry_run              # Boolean – evaluate + callback but take no action; default false
+    # Host callback fired on every guard action (real or dry-run) so the app can
+    # page on-call, open a ticket, or throttle further. Receives a Hash payload:
+    #   { event:, tenant_id:, lane:, action:, mode:, source:, rate:, threshold:,
+    #     samples:, until:, dry_run: }. Errors are swallowed. Also emitted as the
+    #   tenant_guard.action instrumentation event.
+    attr_accessor :tenant_guard_callback             # #call(payload) or nil
 
     # ── Logging ──────────────────────────────────────────────────────────────
     attr_accessor :logger
@@ -828,6 +835,8 @@ module KafkaBatch
       @tenant_guard_auto_release_seconds = tenant_guard_auto_release_env("KAFKA_BATCH_TENANT_GUARD_AUTO_RELEASE_SECONDS", 900)
       @tenant_guard_grace_ticks          = env_non_negative_int("KAFKA_BATCH_TENANT_GUARD_GRACE_TICKS", 0)
       @tenant_guard_reconcile_interval   = env_positive_int("KAFKA_BATCH_TENANT_GUARD_RECONCILE_INTERVAL", 15)
+      @tenant_guard_dry_run              = truthy_env?("KAFKA_BATCH_TENANT_GUARD_DRY_RUN")
+      @tenant_guard_callback             = nil
 
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end

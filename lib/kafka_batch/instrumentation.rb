@@ -260,6 +260,13 @@ module KafkaBatch
 
       # ── DLT events ─────────────────────────────────────────────────────
 
+      # Fired when the tenant guard takes (or, in dry-run, would take) an action
+      # on a tenant. Payload mirrors the host callback so subscribers and the
+      # callback see the same data.
+      def tenant_guard_action(payload)
+        instrument("tenant_guard.action", payload.is_a?(Hash) ? payload : { payload: payload })
+      end
+
       # Fired whenever a message is published to the dead-letter topic.
       # All DLT paths go through KafkaBatch::Dlt.publish so this always fires
       # on successful produce. dlt_type labels the publish path, e.g.:
