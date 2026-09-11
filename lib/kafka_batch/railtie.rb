@@ -33,9 +33,12 @@ module KafkaBatch
         begin
           if defined?(KafkaBatch::Alerts)
             KafkaBatch::Alerts.install_subscriptions!
-            if KafkaBatch.config.alerts_run_on_ui && KafkaBatch::Alerts.enabled?
-              KafkaBatch::Alerts.start!
-            end
+            # Start the loop whenever this process may evaluate — NOT only when
+            # alerts are currently enabled. The tick body re-reads the Redis
+            # settings every pass, so the /alerts toggle turns evaluation on and
+            # off at runtime without a redeploy. Gating thread start on the boot
+            # value is what used to strand the UI toggle. start! self-gates.
+            KafkaBatch::Alerts.start! if KafkaBatch.config.alerts_run_on_ui
           end
           KafkaBatch::TenantGuard.install_recorder! if defined?(KafkaBatch::TenantGuard)
         rescue => e
@@ -122,20 +125,23 @@ module KafkaBatch
           begin
             if defined?(KafkaBatch::Alerts)
               KafkaBatch::Alerts.install_subscriptions!
-              if KafkaBatch::Alerts.enabled? && KafkaBatch::Alerts.control_plane_process?
-                KafkaBatch::Alerts.start!
-              end
+              # Start unconditionally: start! self-gates on Redis + control
+              # plane, and the tick body re-reads `enabled` from Redis every
+              # pass. Do NOT gate on enabled? here — that pins the feature to
+              # its boot value and strands the /alerts toggle.
+              KafkaBatch::Alerts.start!
             end
             # Record per-tenant error rates on execution pods (where job events
             # fire). No-op unless the guard is enabled and the job carries a
             # tenant_id (fairness lanes).
             if defined?(KafkaBatch::TenantGuard)
               KafkaBatch::TenantGuard.install_recorder!
-              # Auto-disengage + drift-repair loop runs on the control plane only
-              # (NX-locked). Started when the guard is enabled.
-              if KafkaBatch::TenantGuard.enabled? && KafkaBatch::TenantGuard.control_plane_process?
-                KafkaBatch::TenantGuard.start_reconciler!
-              end
+              # Auto-disengage + drift-repair loop runs on the control plane
+              # only (NX-locked). Same rule as alerts: start it regardless of
+              # the current toggle so /tenant_guard can enable the guard at
+              # runtime. Mitigation no-ops while disabled; reconciliation still
+              # runs so controls left behind by a disable still auto-release.
+              KafkaBatch::TenantGuard.start_reconciler!
             end
           rescue => e
             KafkaBatch.logger.warn("[KafkaBatch] alerts evaluator start skipped: #{e.message}")

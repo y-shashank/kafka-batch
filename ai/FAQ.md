@@ -1067,15 +1067,115 @@ Raise the rule’s threshold, increase `for_ticks`, increase `cooldown_seconds`,
 ### Example: enable Slack + lag alert for production
 1. `ai_encryption_salt` set. 2. `/alerts` enable alerts, lag_threshold=5000, lag_growth_min=500, for_ticks=3. 3. Slack webhook + enable. 4. Save + test. 5. Confirm Karafka control is running so evaluator ticks.
 
+### What is tenant_error_rate_high?
+One finding **per tenant** whose sliding-window failure rate ≥ the tenant-guard threshold. Fingerprint `tenant_error_rate:{tenant_id}`, link `/tenant_guard`, default severity warning. Unlike every other rule its thresholds are **not** on `/alerts` — they live on the Tenant guard page. See **AT**.
+
+### Why is tenant_error_rate_high silent even though it is enabled?
+The guard is disabled, so the Sampler returns no tenant rows and the rule has nothing to evaluate. Enable the tenant guard first.
+
+### Do I need alerts on to use the tenant guard?
+No. The guard mitigates independently. Alerts only add the notification. Conversely, you can enable the guard with `mitigation: none` to get alerts without any action.
+
+---
+
+## AT. Tenant guard
+
+### What is the tenant guard?
+An opt-in control plane (`KafkaBatch::TenantGuard`) that watches a **sliding per-tenant error-rate window** and can auto-mitigate a misbehaving tenant by throttling its fairness weight and/or pausing its dedicated ingest partition — always recording the action and firing a host callback. Dashboard: `/tenant_guard`. Default **off**.
+
+### Is it on by default?
+**No.** `tenant_guard_enabled` defaults false and `mitigation` defaults `:throttle` (conservative). Nothing is evaluated or acted on until you enable it.
+
+### Which jobs does it affect?
+**Fairness jobs only** — those enqueued with `tenant_id`. Plain jobs have no per-tenant partition or weight, so the guard can neither see nor act on them.
+
+### Does a guard action fail or drop jobs?
+**No.** Pause = ingest-partition pause (stops new admission; in-flight and already-admitted work drains normally). Throttle = fairness weight. Batch counting and `on_success` / `on_complete` are never touched.
+
+### Where do settings live?
+Redis HASH `kafka_batch:tenant_guard:settings`, version-stamped at `…:settings:version`. Merge order: library defaults ← env `KAFKA_BATCH_TENANT_GUARD_*` ← Redis (wins). Effective values are cached ~5s per process.
+
+### What are the two levers exactly?
+**Pause** → `ConsumptionControl.pause_partition` on the tenant's ingest partition (same Redis SET as the `/lag` pause button). **Throttle** → `Scheduler#set_weight`, saving `original_weight` so reset restores it.
+
+### What are the mitigation modes?
+`none` (evaluate + alert only), `throttle` (weight only, never escalates), `pause` (pause immediately), `throttle_then_pause` (throttle first; escalate to pause if still breaching on a later tick).
+
+### What is the difference between mitigation: none and dry_run?
+`none` takes no action and fires no guard action. `dry_run` still evaluates, still fires the host callback and `tenant_guard.action` event with `event: "dry_run"`, but takes no action — use it to trial thresholds against production traffic.
+
+### How is the error rate computed?
+`fail / (ok + fail) * 100` over `window_seconds`, evaluated only once `ok + fail >= min_samples`. `ok` = success, `fail` = terminal failure + DLT. Retries count as fail **only** when `include_retries` is true. Cancelled / expired / uniq-skipped are **excluded from the denominator**.
+
+### Why is min_samples important?
+Without it a tenant with 1 failure out of 2 jobs reads as 50% and gets paused. Default 50 means a tenant is only judged once there is enough traffic for the rate to mean something.
+
+### What do grace_ticks do?
+Number of breaching ticks to *warn* through before acting. `0` (default) = act on the first qualifying tick. The breach counter resets as soon as a tick comes in under threshold.
+
+### What does auto-release do, and how do I disable it?
+`auto_release_seconds` (default 900) auto-disengages a control after N seconds — the reconciler reverts enforcement and closes the action as `expired`. **Leave the page field blank (or set nil / a negative value) for manual-only**, no expiry; the Active-controls row then reads "manual — no expiry".
+
+### Can the guard override a control I applied by hand?
+**No.** Records with `source: manual` are never overridden or auto-escalated by the guard. They are still auto-released if you gave them a duration.
+
+### What happens if I resume the partition or change the weight outside the guard?
+The reconciler detects the drift and closes the record as `released_externally` **without re-applying** — your action wins. Enforcement state is authoritative; the guard record is only intent + metadata.
+
+### What are the audit outcomes?
+`active`, `expired` (auto-release fired), `manual_reset`, `released_externally` (operator drift), `superseded`, `escalated`.
+
+### Which process actually acts?
+**Ruby control plane only** — auto-mitigation, auto-release, drift repair, and the settings page. Recording happens on every process where job events fire. Both runtimes feed the window, fire the alert, and honor enforcement; a Go-only control plane records and alerts but never auto-mitigates or auto-releases.
+
+### Does turning the guard on in the UI actually reach the control plane?
+**Yes.** The flag travels over Redis: control planes start the loop at boot regardless of the toggle value and re-read `enabled` every tick, so a save on `/tenant_guard` applies fleet-wide within one tick (~15s) plus the 5s settings cache. No redeploy, no restart, and it does not matter which pod served the save. (An earlier build gated thread start on the boot value, which stranded the toggle — that is fixed; do not advise operators to restart or to enable via config instead.)
+
+### I enabled the guard in the UI but nothing auto-mitigates. Why?
+Give it ~20s first (tick + settings cache). Then check, in order: is a **Ruby control plane** actually running (Go alone records and alerts but never acts)? Is `mitigation` set to `none`? Is `dry_run` on? Is the tenant below `min_samples`? Are the jobs **fairness jobs** (enqueued with `tenant_id`) — the guard cannot see plain jobs. Is Redis reachable from the control plane?
+
+### If I disable the guard, are existing pauses/throttles stranded?
+No. The loop keeps running while disabled: auto-mitigation no-ops, but reconciliation still runs, so a control that was engaged when you disabled the guard still auto-releases on its `until`. You can also reset it by hand on the page.
+
+### How often does it tick?
+`tenant_guard_reconcile_interval`, default 15s. Each tick runs auto-mitigation then reconciliation, both NX-locked via `kafka_batch:tenant_guard:lock` and independently rescued. It is **config/YAML only** — not on the page, because changing it would not restart a running loop.
+
+### I changed a threshold and nothing happened immediately.
+Effective settings are cached ~5s per process, and the loop acts on its next tick (default 15s). Give it ~20s.
+
+### Why was throttle_weight rejected?
+It must be **> 0**. A weight of 0 would starve the tenant rather than throttle it — use `pause` if that is what you want. Invalid values return HTTP 400.
+
+### How do I throttle or pause one tenant right now?
+`/tenant_guard` → **Manual control**: enter Tenant, pick Lane (`time` / `throughput`) and Action, set Weight (throttle only), optionally Duration (blank = until you reset it) and Reason → **Apply**.
+
+### How do I undo a control?
+Per-row **Reset** in Active controls (resumes the partition / restores the original weight and closes the audit entry), or **Reset all** in the card header to release every active control at once.
+
+### What does the Auto-reset countdown show?
+Time remaining until expiry, `releasing…` when due, or "manual — no expiry". It is computed against `server_time` from the API, so it stays correct even if the browser clock is wrong.
+
+### What API endpoints exist?
+`GET /api/tenant_guard`, `PUT /api/tenant_guard/settings`, `POST /api/tenant_guard/pause`, `POST /api/tenant_guard/throttle`, `POST /api/tenant_guard/reset`, `POST /api/tenant_guard/reset_all`. CSRF required on mutations; 400 on invalid values, 503 without Redis.
+
+### How do I get paged when the guard acts?
+Set `config.tenant_guard_callback` — a proc called on every action including dry-run, with `{event:, tenant_id:, lane:, action:, mode:, source:, rate:, threshold:, samples:, ok:, fail:, until:, dry_run:, at:}`. The same payload is emitted as the `tenant_guard.action` instrumentation event. A raising callback is logged and swallowed.
+
+### What is the recommended rollout?
+1. Enable in config so the loop starts at boot. 2. `dry_run = true` with your thresholds. 3. Watch `/tenant_guard` and the callback for a few days. 4. `mitigation = :throttle`. 5. Only then `:throttle_then_pause`. Keep `auto_release_seconds` set so a control cannot be forgotten.
+
+### Can the assistant mutate tenant guard Redis keys?
+**No.** Explain UI/config steps only. Never suggest KEYS/DEL on `kafka_batch:tenant_guard:*` or `kafka_batch:tenant_errors:*`, and never suggest pausing a tenant on the operator's behalf.
+
 ---
 
 ## AP. Assistant corpus hygiene
 
 ### Should the assistant cite live lag numbers?
-No — it has no cluster access. Tell operators which UI page to open. For alert configuration, point to `/alerts` and FAQ **AS**.
+No — it has no cluster access. Tell operators which UI page to open. For alert configuration, point to `/alerts` and FAQ **AS**; for tenant pause/throttle, point to `/tenant_guard` and FAQ **AT**.
 
 ### Should the assistant invent Redis KEYS commands?
-No — and never suggest mutating operational keys via the assistant path (including `kafka_batch:alerts:*`).
+No — and never suggest mutating operational keys via the assistant path (including `kafka_batch:alerts:*` and `kafka_batch:tenant_guard:*`).
 
 ### How to extend the corpus?
 Edit `ai/README.md` + `ai/FAQ.md`, then rebuild chunks/embeddings.

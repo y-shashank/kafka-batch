@@ -127,10 +127,27 @@ module KafkaBatch
       end
 
       # ── Reconciler (auto-disengage + drift repair; control plane only) ──────
-      # Start the background loop. Idempotent. Call on the control plane when the
-      # guard is enabled; the loop is NX-locked so multiple replicas are safe.
+      # Start the background loop. Idempotent, self-gating, and NX-locked so
+      # multiple replicas are safe — call it unconditionally on boot.
+      #
+      # Deliberately NOT gated on `enabled?`: the loop re-reads the Redis-backed
+      # settings every tick, which is what lets the /tenant_guard page turn the
+      # guard on and off at runtime. Gating thread start on the boot value is
+      # what used to strand the UI toggle on a control plane that booted with
+      # the guard off. While disabled, mitigation no-ops each tick and only
+      # reconciliation runs, so a control left behind by a disable still
+      # auto-releases.
       def start_reconciler!(**kw)
+        return unless should_run_reconciler?
+
         Reconciler.start!(**kw)
+      end
+
+      # Redis + control plane. Mirrors Alerts.should_run_evaluator?.
+      def should_run_reconciler?
+        return false unless KafkaBatch.config.redis_configured?
+
+        control_plane_process?
       end
 
       def reconcile_once!(**kw)
@@ -154,11 +171,15 @@ module KafkaBatch
       end
 
       # Testing hook: clears process-local caches (does NOT touch Redis state).
+      # Settings is included because its 5s `effective` cache is process-local
+      # too — leaving it behind leaks `enabled` (and every threshold) into the
+      # next test, which then reads a guard that Redis says is off as on.
       def reset!
         @recorder_installed = false
         Reconciler.stop!
         Recorder.reset!
         State.reset!
+        Settings.reset!
       end
 
       private

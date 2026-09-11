@@ -84,13 +84,32 @@ module KafkaBatch
         local ttl = tonumber(ARGV[3])
         local now = ARGV[4]
         local score = tonumber(ARGV[5])
+        -- finished_ttl: retention applied to the hash/bitmaps/seq once the batch
+        -- is terminal. Defaults to ttl when absent (older callers).
+        local finished_ttl = tonumber(ARGV[6]) or ttl
+        if not finished_ttl or finished_ttl < 1 then finished_ttl = ttl end
+
+        -- LATE-EVENT GUARD (must precede every bitmap read). Once a batch is
+        -- terminal its bitmaps may already have been released by the shorter
+        -- finished-batch retention. A late duplicate event would then see
+        -- GETBIT==0, RE-CREATE the bitmap and INFLATE counters on a finished
+        -- batch. Terminal + missing touch bitmap ⇒ duplicate by definition.
+        if (status == 'success' or status == 'complete') and redis.call('EXISTS', KEYS[2]) == 0 then
+          return {0, 'duplicate'}
+        end
+
+        -- Never re-arm the full running-batch TTL after the batch finished: the
+        -- old script restarted the clock at the last event, so a trickle of late
+        -- duplicates kept dead ledgers alive indefinitely.
+        local eff_ttl = ttl
+        if status == 'success' or status == 'complete' then eff_ttl = finished_ttl end
         local touched_new = 0
         local success_new = 0
         local failed_new = 0
 
         if redis.call('GETBIT', KEYS[2], bit) == 0 then
           redis.call('SETBIT', KEYS[2], bit, 1)
-          redis.call('EXPIRE', KEYS[2], ttl)
+          redis.call('EXPIRE', KEYS[2], eff_ttl)
           redis.call('HINCRBY', KEYS[1], 'touched_count', 1)
           touched_new = 1
         elseif op == 'executed' then
@@ -100,16 +119,24 @@ module KafkaBatch
         if op == 'success' then
           if redis.call('GETBIT', KEYS[6], bit) == 0 then
             redis.call('SETBIT', KEYS[6], bit, 1)
-            redis.call('EXPIRE', KEYS[6], ttl)
+            redis.call('EXPIRE', KEYS[6], eff_ttl)
             redis.call('HINCRBY', KEYS[1], 'completed_count', 1)
             success_new = 1
+            -- A seq counted terminal-failed can later succeed (a zombie consumer
+            -- whose retry pipeline already emitted the terminal failure). Swap
+            -- the count instead of double-counting, so completed+failed never
+            -- exceeds touched (double-counting fired callbacks early).
+            if redis.call('GETBIT', KEYS[7], bit) == 1 then
+              redis.call('SETBIT', KEYS[7], bit, 0)
+              redis.call('HINCRBY', KEYS[1], 'failed_count', -1)
+            end
           elseif touched_new == 0 then
             return {0, 'duplicate'}
           end
         elseif op == 'failed' then
           if redis.call('GETBIT', KEYS[7], bit) == 0 and redis.call('GETBIT', KEYS[6], bit) == 0 then
             redis.call('SETBIT', KEYS[7], bit, 1)
-            redis.call('EXPIRE', KEYS[7], ttl)
+            redis.call('EXPIRE', KEYS[7], eff_ttl)
             redis.call('HINCRBY', KEYS[1], 'failed_count', 1)
             failed_new = 1
           elseif touched_new == 0 then
@@ -123,7 +150,7 @@ module KafkaBatch
           end
         end
 
-        redis.call('EXPIRE', KEYS[1], ttl)
+        redis.call('EXPIRE', KEYS[1], eff_ttl)
 
         local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))      or 0
         local touched   = tonumber(redis.call('HGET', KEYS[1], 'touched_count'))   or 0
@@ -149,7 +176,6 @@ module KafkaBatch
           if cur == 'running' then
             redis.call('HSET', KEYS[1], 'status', terminal)
             redis.call('HSET', KEYS[1], 'finished_at', now)
-            redis.call('EXPIRE', KEYS[1], ttl)
             local batch_id = redis.call('HGET', KEYS[1], 'id')
             if batch_id then
               redis.call('ZREM', KEYS[3], batch_id)
@@ -157,6 +183,17 @@ module KafkaBatch
             end
             redis.call('HINCRBY', KEYS[5], 'running', -1)
             redis.call('HINCRBY', KEYS[5], terminal, 1)
+            -- Terminal retention: a FINISHED batch only needs to outlive result
+            -- reads and late-duplicate suppression. Expiring the hash, the three
+            -- bitmaps and the seq allocator together is the single largest
+            -- ledger RAM lever (bitmaps are 3 x total_jobs/8 bytes per batch).
+            -- Safe because the late-event guard above turns a post-expiry event
+            -- into a duplicate instead of re-creating bitmaps.
+            redis.call('EXPIRE', KEYS[1], finished_ttl)
+            redis.call('EXPIRE', KEYS[2], finished_ttl)
+            redis.call('EXPIRE', KEYS[6], finished_ttl)
+            redis.call('EXPIRE', KEYS[7], finished_ttl)
+            if KEYS[8] and KEYS[8] ~= '' then redis.call('EXPIRE', KEYS[8], finished_ttl) end
           end
           if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', now) == 1 then
             redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', now)
@@ -336,9 +373,14 @@ module KafkaBatch
             if terminal == 'success' and redis.call('HSETNX', KEYS[1], 'success_callback_dispatched_at', ARGV[1]) == 1 then
               fire_success = 1
             end
-            if fire_success == 1 then return {1, 'success'} end
-            if fire_complete == 1 then return {1, terminal} end
-            return {1, terminal}
+            -- Mirror BATCH_DONE_JOB_LUA's claim-based outcomes exactly. A claim
+            -- this call did NOT win was already dispatched by a concurrent
+            -- completion (or the early-complete path) — returning {1, ...} for
+            -- it would fire the same callback twice.
+            if fire_success == 1 and fire_complete == 1 then return {1, 'success'} end
+            if fire_success == 1 then return {1, 'success_only'} end
+            if fire_complete == 1 then return {1, 'complete'} end
+            return {2, 'sealed'}
           end
           if touched >= total and total > 0 then
             if redis.call('HSETNX', KEYS[1], 'complete_callback_dispatched_at', ARGV[1]) == 1 then
@@ -583,21 +625,35 @@ module KafkaBatch
         end
       end
 
+      # Atomic status transition (wire-compatible with Go updateStatusLua). The
+      # old read-check-write ran in separate round trips: two concurrent cancels
+      # (or a cancel racing a terminal completion) both observed 'running' and
+      # double-decremented COUNTS_KEY — and a cancel could clobber a just-set
+      # terminal status. Transitions FROM a terminal status are rejected
+      # (idempotent no-op).
+      UPDATE_STATUS_LUA = <<~LUA
+        if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+        local old = redis.call('HGET', KEYS[1], 'status') or ''
+        local new = ARGV[1]
+        if old == new then return 2 end
+        if old == 'success' or old == 'complete' or old == 'cancelled' then return 3 end
+        redis.call('HSET', KEYS[1], 'status', new)
+        if new == 'success' or new == 'complete' or new == 'cancelled' then
+          redis.call('ZREM', KEYS[3], ARGV[2])
+        end
+        if old ~= '' then redis.call('HINCRBY', KEYS[2], old, -1) end
+        redis.call('HINCRBY', KEYS[2], new, 1)
+        if new == 'cancelled' then
+          redis.call('ZADD', KEYS[4], tonumber(ARGV[3]), ARGV[2])
+        end
+        return 1
+      LUA
+
       def update_batch_status(id, status)
         with_redis do |r|
-          # Bug #2: read old status so COUNTS_KEY can be adjusted correctly.
-          old_status = r.hget(batch_key(id), "status")
-          r.hset(batch_key(id), "status", status)
-          # Terminal/cancelled batches drop out of the running index.
-          r.zrem(RUNNING_INDEX, id) if %w[success complete cancelled].include?(status)
-          # Bug #2: maintain COUNTS_KEY.  old_status may be nil if the key expired.
-          if old_status && old_status != status
-            r.hincrby(COUNTS_KEY, old_status, -1)
-            r.hincrby(COUNTS_KEY, status,     1)
-          end
-          # Bug #6: CANCELLED_INDEX is now a ZSET (scored by timestamp) so old
-          # entries can be pruned cheaply with ZREMRANGEBYSCORE.
-          zadd_cancelled(r, id) if status == "cancelled"
+          r.eval(UPDATE_STATUS_LUA,
+            keys: [batch_key(id), COUNTS_KEY, RUNNING_INDEX, CANCELLED_INDEX],
+            argv: [status.to_s, id, Time.now.to_f.to_s])
         end
       end
 
@@ -739,8 +795,17 @@ module KafkaBatch
 
           expired.each { |id| drop_expired_batch_from_indexes(r, id) }
 
-          r.del(COUNTS_KEY)
-          counts.each { |k, v| r.hset(COUNTS_KEY, k, v) if v.positive? }
+          # Atomic swap via temp-key RENAME: the old DEL→HSET left a window
+          # where readers saw an empty hash (triggering full fallback scans)
+          # and concurrent Lua HINCRBYs landed between DEL and HSET were lost.
+          tmp = "#{COUNTS_KEY}:rebuild"
+          r.del(tmp)
+          counts.each { |k, v| r.hset(tmp, k, v) if v.positive? }
+          if counts.values.any?(&:positive?)
+            r.rename(tmp, COUNTS_KEY)
+          else
+            r.del(COUNTS_KEY)
+          end
           counts
         end
       end

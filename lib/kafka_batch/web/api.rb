@@ -1379,10 +1379,12 @@ module KafkaBatch
         body = json_body(env).merge(@web.body_params(env))
         begin
           settings = KafkaBatch::Alerts::Settings.update!(body)
-          # Hot-apply only on control-plane processes (not UI/execution).
-          if settings["enabled"] && KafkaBatch::Alerts.control_plane_process?
-            KafkaBatch::Alerts.start!
-          end
+          # The toggle itself travels via Redis — control planes re-read it each
+          # tick, so nothing here is needed to apply it. This call is only a
+          # recovery path for a process whose boot-time start! no-oped (e.g.
+          # Redis was unreachable then). Self-gating and idempotent, so it is
+          # safe to call on every save regardless of the toggle value.
+          KafkaBatch::Alerts.start!
           Json.ok(
             ok: true,
             available: true,
@@ -1477,11 +1479,10 @@ module KafkaBatch
         body = json_body(env).merge(@web.body_params(env))
         begin
           settings = KafkaBatch::TenantGuard.update_settings(body)
-          # Hot-apply: start the control loop on control-plane processes when the
-          # guard has just been enabled (idempotent, NX-locked).
-          if settings["enabled"] && KafkaBatch::TenantGuard.control_plane_process?
-            KafkaBatch::TenantGuard.start_reconciler!
-          end
+          # As with alerts: the enabled flag reaches control planes through
+          # Redis (re-read every tick), so this is only a recovery path for a
+          # process whose boot-time start no-oped. Self-gating + idempotent.
+          KafkaBatch::TenantGuard.start_reconciler!
           Json.ok(ok: true, available: true, settings: settings)
         rescue ArgumentError => e
           Json.error(400, e.message)

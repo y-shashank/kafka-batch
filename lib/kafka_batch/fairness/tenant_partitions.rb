@@ -40,6 +40,58 @@ module KafkaBatch
         return p
       LUA
 
+      # Reconciles a lane's free-partition set from the tenant→partition map
+      # ATOMICALLY (wire-identical to Go warmLua). The previous version computed
+      # `free` from an HGETALL snapshot and then SADD'd missing members in
+      # separate round trips: a checkout (SPOP + HSET) landing in that window
+      # put the just-taken partition back into the free set, so a second tenant
+      # could be assigned the same partition — breaking per-tenant isolation.
+      #
+      # KEYS[1]=map hash KEYS[2]=free set KEYS[3]=meta (partition count)
+      # ARGV[1]=live partition count. Returns the free-set size.
+      WARM_LUA = <<~LUA.freeze
+        local count = tonumber(ARGV[1])
+        if not count or count < 1 then return -1 end
+
+        local taken = {}
+        local raw = redis.call('HGETALL', KEYS[1])
+        for i = 1, #raw, 2 do
+          local tenant = raw[i]
+          local p = tonumber(raw[i + 1])
+          if p and p >= 0 and p < count then
+            taken[p] = true
+          else
+            redis.call('HDEL', KEYS[1], tenant)
+          end
+        end
+
+        local stored = tonumber(redis.call('GET', KEYS[3]) or '-1')
+        if stored ~= count then
+          redis.call('DEL', KEYS[2])
+          for p = 0, count - 1 do
+            if not taken[p] then redis.call('SADD', KEYS[2], p) end
+          end
+          redis.call('SET', KEYS[3], count)
+          return redis.call('SCARD', KEYS[2])
+        end
+
+        local cur = {}
+        for _, s in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+          local p = tonumber(s)
+          if not p or p < 0 or p >= count then
+            redis.call('SREM', KEYS[2], s)
+          else
+            cur[p] = true
+          end
+        end
+        for p = 0, count - 1 do
+          if not taken[p] and not cur[p] then
+            redis.call('SADD', KEYS[2], p)
+          end
+        end
+        return redis.call('SCARD', KEYS[2])
+      LUA
+
       class << self
         def resolve(tenant_id, type = :time)
           return nil if tenant_id.nil?
@@ -77,35 +129,9 @@ module KafkaBatch
           return unless count&.positive?
 
           with_redis do |r|
-            map_key  = map_key(lane)
-            free_key = free_key(lane)
-
-            raw = r.hgetall(map_key)
-            valid = {}
-            raw.each do |tenant, part|
-              p = part.to_i
-              if p >= 0 && p < count
-                valid[tenant] = p
-              else
-                r.hdel(map_key, tenant)
-              end
-            end
-
-            taken = valid.values.uniq
-            all   = (0...count).to_a
-            free  = all - taken
-
-            stored_count = r.get(meta_key(lane))&.to_i
-            if stored_count != count
-              r.del(free_key)
-              r.sadd(free_key, free) if free.any?
-              r.set(meta_key(lane), count)
-            else
-              current = r.smembers(free_key).map(&:to_i)
-              missing = free - current
-              r.sadd(free_key, missing) if missing.any?
-              current.each { |p| r.srem(free_key, p) if p < 0 || p >= count }
-            end
+            r.eval(WARM_LUA,
+              keys: [map_key(lane), free_key(lane), meta_key(lane)],
+              argv: [count])
           end
         rescue StandardError => e
           KafkaBatch.logger.warn(

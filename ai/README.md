@@ -1891,6 +1891,13 @@ Unavailable channels show a one-line reason in the UI (“Add Slack webhook URL�
 | `dlt_rate_high` | Dead-letter rate high | — | `dlt_per_minute` (50) | DLT publishes last minute ≥ threshold | `/dead_letter` |
 | `schedule_depth_high` | Delayed-job schedule depth high | — | `schedule_pending_max` (10000) | `sched:pending` ZCARD ≥ max | `/scheduled` |
 | `cron_stale` | Recurring schedule stale | — | uses `recurring_stale_factor` × interval | Enabled cron idle beyond stale window (`cron.stale` Redis markers; ticker pods emit them) | `/recurring` |
+| `tenant_error_rate_high` | Tenant error rate high | `tenant_guard_enabled` | **none in alerts settings** — thresholds live on `/tenant_guard` | A tenant's sliding-window fail rate ≥ `tenant_guard_error_rate_pct` once `tenant_guard_min_samples` seen. One finding per tenant, fingerprint `tenant_error_rate:{tenant_id}` | `/tenant_guard` |
+
+**`tenant_error_rate_high` is the exception to "thresholds live on /alerts".** Window /
+min samples / rate / include-retries are owned by the **Tenant guard** settings page
+(`kafka_batch:tenant_guard:settings`); the alerts toggle only controls whether a breach
+is *notified*. When the guard is disabled the Sampler returns no rows, so the rule is
+silent regardless of its toggle. See §47.
 
 ### Operator enable checklist (tell users this)
 
@@ -1910,4 +1917,209 @@ Unavailable channels show a one-line reason in the UI (“Add Slack webhook URL�
 
 ### Out of scope (v1)
 
-MySQL settings store, auto-remediation, Go-side evaluator, per-user mutes (disable rule globally instead).
+MySQL settings store, per-user mutes (disable the rule globally instead). Auto-remediation
+exists only as the **Tenant guard** (§47), not as a general per-rule action. The Go
+`kbatch daemon` runs the same evaluator (shared Redis settings + NX lock); `kbatch worker`
+does not, and UI **Send test** is Ruby-only.
+
+---
+
+## 47. Tenant guard (per-tenant error-rate pause / throttle)
+
+In-gem control plane (`KafkaBatch::TenantGuard`) that watches a **sliding per-tenant
+error-rate window** and can auto-mitigate a misbehaving tenant. Opt-in (default off).
+Dashboard: **`/tenant_guard`**. Persistence: **Redis only**. Sibling to Alerts (§46) —
+same patterns: cached settings snapshot, NX-locked loop, hysteresis, audit trail.
+
+### Scope: fairness lanes only
+
+Acts **only on fairness jobs** (those enqueued with `tenant_id`), because both levers are
+fairness-only:
+
+| Lever | Mechanism (reused, not new) | Effect |
+|-------|-----------------------------|--------|
+| **Pause** | Tenant's dedicated ingest partition via `ConsumptionControl.pause_partition` — the same Redis SET as the `/lag` pause button | Stops *new admission*; in-flight + already-admitted work drains normally |
+| **Throttle** | Tenant's fairness weight via `Scheduler#set_weight` | Lowers dispatch share; `original_weight` saved for restore |
+
+Plain (non-fair) jobs have no per-tenant partition or weight, so the guard cannot and does
+not affect them. **Batch counting / completion (`on_success` / `on_complete`) is never
+touched** — no job is dropped, fail-counted, or dequeued by a guard action.
+
+### Effective config merge
+
+```
+library Configuration defaults ← env (KAFKA_BATCH_TENANT_GUARD_*) ← Redis HASH kafka_batch:tenant_guard:settings (wins)
+```
+
+UI Save bumps `kafka_batch:tenant_guard:settings:version`. The effective hash is cached
+**per process for 5 seconds** (so the hot `enabled?` job-event path does not hit Redis);
+a change made elsewhere therefore propagates within ~5s. The writer busts its own cache
+immediately.
+
+### Settings catalog (assistants: use this when helping configure)
+
+| Key | Config / env | Default | Page label | Meaning |
+|-----|--------------|---------|-----------|---------|
+| `enabled` | `tenant_guard_enabled` | `false` | Guard enabled | Master switch; off = no evaluation/auto-action (manual controls still work) |
+| `dry_run` | `tenant_guard_dry_run` | `false` | Dry-run | Evaluate + fire callback, take **no** action |
+| `mitigation` | `tenant_guard_mitigation` | `throttle` | Mitigation | `none` \| `throttle` \| `pause` \| `throttle_then_pause` |
+| `error_rate_pct` | `tenant_guard_error_rate_pct` | `25.0` | Error rate threshold (%) | Act at `fail/(ok+fail)*100 ≥ this` |
+| `window_seconds` | `tenant_guard_window_seconds` | `300` | Window (seconds) | Sliding lookback |
+| `min_samples` | `tenant_guard_min_samples` | `50` | Min samples | Min `ok+fail` before judging a tenant |
+| `include_retries` | `tenant_guard_include_retries` | `false` | Count retries as failures | Retries count on the `fail` side |
+| `throttle_weight` | `tenant_guard_throttle_weight` | `0.1` | Throttle weight | Weight applied on throttle; **must be > 0** (validation rejects ≤ 0) |
+| `auto_release_seconds` | `tenant_guard_auto_release_seconds` | `900` | Auto-release (seconds) | Blank/nil/negative = **manual only, no expiry** |
+| `grace_ticks` | `tenant_guard_grace_ticks` | `0` | Grace ticks | Warn for N breaching ticks before acting |
+| `reconcile_interval` | `tenant_guard_reconcile_interval` | `15` | *(not on page)* | Loop tick seconds (mitigate + reconcile) |
+| — | `tenant_guard_callback` | `nil` | *(not on page)* | Host proc fired on every action incl. dry-run |
+
+Nullable rule: for `auto_release_seconds`, empty string means "manual only" — a *meaningful
+setting*, distinct from "unset / use default". Invalid mitigation or `throttle_weight ≤ 0`
+raises `ArgumentError` → HTTP `400`.
+
+### Error classification (both runtimes must agree)
+
+`ok` = job success. `fail` = terminal failure + DLT. Retries count as `fail` **only** when
+`include_retries` is true. Cancelled / expired / uniq-skipped are **excluded from the
+denominator** (not the tenant's fault; must not inflate the rate that would pause them).
+Rate = `fail / (ok + fail) * 100`, evaluated only once `ok + fail >= min_samples`.
+
+Fed by `job.processed` / `job.failed` / `job.retried` instrumentation events, which carry a
+`tenant_id` field (present for fairness jobs, `nil` otherwise).
+
+### Mitigation policy (per tick)
+
+| Mode | Fresh breach | Already guard-throttled and still breaching | Already guard-paused |
+|------|--------------|---------------------------------------------|----------------------|
+| `none` | nothing (alert only) | — | — |
+| `throttle` | throttle | skip (terminal) | — |
+| `pause` | pause | — | skip (terminal) |
+| `throttle_then_pause` | throttle | **escalate to pause** | skip (terminal) |
+
+Rules the assistant should state confidently:
+
+- **A manual control is never overridden by the guard** (`source != error_rate_guard` ⇒ skipped).
+- Idempotent per tick — a tenant already at the mode's terminal state is not re-actioned.
+- `grace_ticks` counts breaching ticks; the action happens on tick `grace + 1`. A tick where the rate drops below threshold resets the breach counter.
+- Dry-run still fires the callback with `event: "dry_run"`; `mitigation: none` evaluates and alerts but fires no guard action.
+
+### Reconciler (auto-disengage + drift repair)
+
+Loop on the control plane, NX-locked, every `reconcile_interval` seconds. Each tick runs
+`Mitigation.run_once!` then `reconcile_once!`; both are independently rescued so one failing
+never stops the loop. For each tenant with an active control:
+
+1. **Auto-release** — `until` has passed → revert enforcement + close action `expired`.
+2. **External drift** — operator resumed the partition / changed the weight outside the guard → close the record **without** re-applying, honouring the operator (`released_externally`).
+
+Enforcement state (is the partition in the pause SET / what is the weight) is
+**authoritative**; the guard record is *intent + metadata*.
+
+### Where it runs (critical for split deployments)
+
+| Concern | Runs where |
+|---------|-----------|
+| Recording ok/fail/retry | Every process where job events fire (execution pods); installed via Railtie + Karafka `app.running` |
+| `tenant_error_rate_high` alert | Shared alerts evaluator (Ruby control plane **or** Go `kbatch daemon`), NX single-fire |
+| Honoring enforcement (paused partition / weight) | **Both** runtimes |
+| Auto-mitigation, auto-release, drift repair, settings page | **Ruby control plane only** |
+
+**The on/off flag travels over Redis, not over the process that served the save.** Every
+control-plane process starts the loop at boot via `start_reconciler!` (self-gating on
+`redis_configured? && control_plane_process?`) **regardless of the current toggle value**,
+and each tick re-reads `enabled` from `kafka_batch:tenant_guard:settings`. So the page's
+Guard-enabled switch takes effect fleet-wide within one tick (default 15s) plus the 5s
+settings cache — no redeploy, no restart, and it does not matter which pod served the `PUT`.
+
+Assistants: do **not** tell operators they must enable via config/env or restart the
+control plane for the toggle to apply. That was true of an earlier build (thread start was
+gated on the boot value, which stranded the UI toggle) and is no longer correct.
+
+While disabled the loop stays running but idle: `Mitigation.run_once!` returns early, and
+only reconciliation runs — deliberately, so a control still engaged when the guard was
+turned off still auto-releases instead of being stranded.
+
+Same rule for alerts (§46): `Alerts.start!` self-gates on `should_run_evaluator?` and the
+loop body does `evaluate_once! if enabled?`, so the `/alerts` master switch is likewise
+Redis-driven.
+
+### Redis keys
+
+| Key | Role |
+|-----|------|
+| `kafka_batch:tenant_guard:{tenant_id}` | HASH — `state`, `lane`, `action`, `source` (`manual`\|`error_rate_guard`), `reason`, `group`, `topic`, `partition`, `original_weight`, `effective_weight`, `created_at`, `until`, `created_by` |
+| `kafka_batch:tenant_guard:index` | SET of tenants with an active control (UI listing + reconciler scan) |
+| `kafka_batch:tenant_guard:actions` | ZSET scored by `created_at` → action ids (audit log) |
+| `kafka_batch:tenant_guard:action:{id}` | HASH per action + `outcome`, `released_at`, `released_by` |
+| `kafka_batch:tenant_guard:settings` | HASH — runtime thresholds/mitigation |
+| `kafka_batch:tenant_guard:settings:version` | Monotonic stamp |
+| `kafka_batch:tenant_guard:lock` | NX single-flight lock (evaluator + reconciler) |
+| `kafka_batch:tenant_errors:{tenant_id}:{yyyymmddHHmm}` | HASH `{ok, fail, retry}` per UTC minute bucket (TTL = window + skew) |
+| `kafka_batch:tenant_errors:active` | ZSET of tenants scored by last-seen epoch (cheap enumeration; pruned to window) |
+
+Action outcomes: `active`, `expired`, `manual_reset`, `released_externally`, `superseded`,
+`escalated`.
+
+### Dashboard page (`/tenant_guard`)
+
+Cards: metric strip (Active controls / Paused / Throttled / Guard on-off) → **Global
+triggers** (the settings above; nothing applies until **Save settings**) → **Active
+controls** (Tenant, State, Lane, Source `auto`\|`manual`, Detail, Since, live **Auto-reset**
+countdown, per-row **Reset**, header **Reset all**) → **Manual control** (Tenant, Lane,
+Action, Weight — only enabled for throttle, Duration blank = manual-only, Reason) →
+**Recent actions** audit log. Header **Live** switch auto-refreshes.
+
+The countdown uses `server_time` from the API to compute clock skew, so it is correct even
+if the browser clock is wrong.
+
+### API
+
+| Method | Path | Role |
+|--------|------|------|
+| GET | `/api/tenant_guard` | settings + active + actions + `server_time` |
+| PUT | `/api/tenant_guard/settings` | partial update; validate, bump version. Control planes pick the change up on their next tick; the call also re-arms the local loop as a recovery path (idempotent, self-gating) |
+| POST | `/api/tenant_guard/pause` | `{tenant_id, lane, until_seconds, reason}` |
+| POST | `/api/tenant_guard/throttle` | `{tenant_id, lane, weight, until_seconds, reason}` |
+| POST | `/api/tenant_guard/reset` | `{tenant_id}` |
+| POST | `/api/tenant_guard/reset_all` | releases all; returns count |
+
+CSRF on all mutations. `400` on invalid values, `503` when Redis is not configured or the
+guard is not loaded.
+
+### Host callback / instrumentation
+
+`config.tenant_guard_callback` is called on every action (real or dry-run), and the same
+payload is emitted as the `tenant_guard.action` instrumentation event. Both are best-effort
+— a raising callback is logged and swallowed, never propagated into the job path.
+
+```ruby
+# payload
+{ event: "action" | "dry_run", tenant_id:, lane:, action: "throttle"|"pause",
+  mode:, source: "error_rate_guard", rate:, threshold:, samples:, ok:, fail:,
+  until:, dry_run:, at: }
+```
+
+### Operator enable checklist (tell users this)
+
+1. Redis reachable, and the tenant's jobs are **fairness jobs** (enqueued with `tenant_id`) — the guard cannot see or act on plain jobs.
+2. Turn the guard on — either the **Guard enabled** switch on `/tenant_guard` (applies within ~20s, no restart) or `config.tenant_guard_enabled` / `KAFKA_BATCH_TENANT_GUARD_ENABLED=true` as the bootstrap default. A Ruby control plane must be running for anything to act.
+3. Start with `tenant_guard_dry_run = true` and your thresholds; watch `/tenant_guard` + the callback.
+4. Move to `mitigation = :throttle`, then `:throttle_then_pause` only once you trust the thresholds.
+5. Set `auto_release_seconds` (default 900) so a control cannot be forgotten; blank means manual-only.
+6. To get notified, also enable Alerts (§46) with the `tenant_error_rate_high` rule.
+
+### Example answers
+
+- "Why is nothing being throttled?" → Guard disabled, `mitigation: none`, dry-run on, under `min_samples`, jobs are not fairness jobs, or no Ruby control plane is running the loop.
+- "Why did a tenant get paused when I set throttle?" → `mitigation: throttle_then_pause` escalates a still-breaching guard-throttled tenant to pause.
+- "The guard did not undo my manual pause" → By design: manual controls (`source: manual`) are never overridden or auto-escalated; they still auto-release if given a duration.
+- "A control disappeared without me resetting it" → Either `until` expired (`expired`) or an operator changed the enforcement directly (`released_externally`).
+- "Did pausing a tenant fail its jobs?" → No. Pause holds the ingest partition; admitted work drains and batch counting is untouched.
+- "Rate looks wrong" → Cancelled / expired / uniq-skipped are excluded from the denominator; retries only count when `include_retries` is on.
+- "Changed a setting, nothing happened" → Effective settings are cached ~5s per process; the loop acts on its next `reconcile_interval` tick (default 15s).
+
+### Out of scope
+
+Go-side auto-mitigation (Go records rates, alerts, and honors enforcement, but does not act
+or auto-release), MySQL settings store, per-tenant notification routing, acting on plain
+(non-fair) jobs.
